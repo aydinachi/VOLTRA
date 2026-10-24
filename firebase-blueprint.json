@@ -1,0 +1,892 @@
+{
+  "entities": {
+    "Admin": {
+      "title": "Admin",
+      "description": "System administrator privilege record keyed by user UID.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Firebase Auth UID of the administrator."
+        },
+        "grantedBy": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "UID of the bootstrap administrator who granted access."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of creation."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of last update."
+        }
+      },
+      "required": ["uid", "grantedBy", "createdAt", "updatedAt"]
+    },
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Public academic identity profile without PII.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Unique user identifier."
+        },
+        "fullName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100,
+          "description": "Full display name of student or professor."
+        },
+        "studentIndex": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 20,
+          "pattern": "^[a-zA-Z0-9_\\-]*$",
+          "description": "ETF student index number (broj indeksa), empty for professors."
+        },
+        "department": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80,
+          "description": "ETF Sarajevo department (odsjek)."
+        },
+        "role": {
+          "type": "string",
+          "enum": ["student", "professor", "admin"],
+          "description": "Assigned portal role."
+        },
+        "academicYear": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 20,
+          "description": "Active academic year, e.g. 2026/2027."
+        },
+        "redeemedInviteId": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 128,
+          "description": "Invitation code redeemed when upgrading to professor, or empty string."
+        },
+        "isSeed": {
+          "type": "boolean",
+          "description": "Marks development seed data separately from production records."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of creation."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of last update."
+        }
+      },
+      "required": [
+        "uid",
+        "fullName",
+        "studentIndex",
+        "department",
+        "role",
+        "academicYear",
+        "redeemedInviteId",
+        "isSeed",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "UserPrivate": {
+      "title": "UserPrivate",
+      "description": "Isolated private PII data accessible only to the owner and administrators.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Owner user UID."
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "minLength": 3,
+          "maxLength": 254,
+          "description": "Private email address."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of creation."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of last update."
+        }
+      },
+      "required": ["uid", "email", "createdAt", "updatedAt"]
+    },
+    "StudentDirectoryEntry": {
+      "title": "StudentDirectoryEntry",
+      "description": "Non-PII lookup record keyed by student index number for course enrollment.",
+      "type": "object",
+      "properties": {
+        "studentIndex": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 20,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Student index number (broj indeksa)."
+        },
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Student UID."
+        },
+        "fullName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100,
+          "description": "Student full name."
+        },
+        "department": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80,
+          "description": "Student department."
+        },
+        "isSeed": {
+          "type": "boolean",
+          "description": "Development seed indicator."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "studentIndex",
+        "uid",
+        "fullName",
+        "department",
+        "isSeed",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "Invitation": {
+      "title": "Invitation",
+      "description": "Controlled invitation granting professor privileges to a verified email.",
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string",
+          "minLength": 6,
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Unique invitation code."
+        },
+        "targetEmail": {
+          "type": "string",
+          "format": "email",
+          "minLength": 3,
+          "maxLength": 254,
+          "description": "Target professor email."
+        },
+        "role": {
+          "type": "string",
+          "enum": ["professor"],
+          "description": "Role granted upon acceptance."
+        },
+        "status": {
+          "type": "string",
+          "enum": ["pending", "accepted", "revoked"],
+          "description": "Lifecycle status of the invitation."
+        },
+        "createdBy": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Admin UID who issued the invitation."
+        },
+        "acceptedBy": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 128,
+          "description": "UID of the user who redeemed the invitation, or empty string."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "code",
+        "targetEmail",
+        "role",
+        "status",
+        "createdBy",
+        "acceptedBy",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "Course": {
+      "title": "Course",
+      "description": "ETF Sarajevo course configuration, assigned professors, attendance settings, and grade thresholds.",
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 20,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "semester": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 60
+        },
+        "academicYear": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 20
+        },
+        "ects": {
+          "type": "number"
+        },
+        "leadProfessorId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "leadProfessorName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "professorIds": {
+          "type": "array",
+          "description": "Bounded list (max 10) of assigned professor UIDs."
+        },
+        "categoryIds": {
+          "type": "array",
+          "description": "Bounded list (max 20) of grading category IDs."
+        },
+        "itemIds": {
+          "type": "array",
+          "description": "Bounded list (max 60) of grading item IDs."
+        },
+        "sessionIds": {
+          "type": "array",
+          "description": "Bounded list (max 60) of attendance session IDs."
+        },
+        "attendanceEnabled": {
+          "type": "boolean"
+        },
+        "attendanceMaxPoints": {
+          "type": "number"
+        },
+        "allowBonusPoints": {
+          "type": "boolean"
+        },
+        "grade6Threshold": {
+          "type": "number"
+        },
+        "grade7Threshold": {
+          "type": "number"
+        },
+        "grade8Threshold": {
+          "type": "number"
+        },
+        "grade9Threshold": {
+          "type": "number"
+        },
+        "grade10Threshold": {
+          "type": "number"
+        },
+        "isSeed": {
+          "type": "boolean"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "code",
+        "name",
+        "semester",
+        "academicYear",
+        "ects",
+        "leadProfessorId",
+        "leadProfessorName",
+        "professorIds",
+        "categoryIds",
+        "itemIds",
+        "sessionIds",
+        "attendanceEnabled",
+        "attendanceMaxPoints",
+        "allowBonusPoints",
+        "grade6Threshold",
+        "grade7Threshold",
+        "grade8Threshold",
+        "grade9Threshold",
+        "grade10Threshold",
+        "isSeed",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "Enrollment": {
+      "title": "Enrollment",
+      "description": "Student enrollment in a course with deterministic ID courseId_studentId.",
+      "type": "object",
+      "properties": {
+        "courseId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 60,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "courseCode": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 20
+        },
+        "courseName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "leadProfessorName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "academicYear": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 20
+        },
+        "studentId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "studentName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "studentIndex": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 20
+        },
+        "studentDepartment": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "professorIds": {
+          "type": "array",
+          "description": "Bounded list (max 10) of assigned professor UIDs."
+        },
+        "isSeed": {
+          "type": "boolean"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "courseId",
+        "courseCode",
+        "courseName",
+        "leadProfessorName",
+        "academicYear",
+        "studentId",
+        "studentName",
+        "studentIndex",
+        "studentDepartment",
+        "professorIds",
+        "isSeed",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "GradingCategory": {
+      "title": "GradingCategory",
+      "description": "Configurable course grading category (e.g., Zadaci, Vjezbe, I parcijalni ispit).",
+      "type": "object",
+      "properties": {
+        "courseId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 60,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "maxPoints": {
+          "type": "number"
+        },
+        "order": {
+          "type": "number"
+        },
+        "professorIds": {
+          "type": "array"
+        },
+        "isSeed": {
+          "type": "boolean"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "courseId",
+        "name",
+        "maxPoints",
+        "order",
+        "professorIds",
+        "isSeed",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "GradingItem": {
+      "title": "GradingItem",
+      "description": "Individual assignment, exercise, or exam within a grading category.",
+      "type": "object",
+      "properties": {
+        "courseId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 60,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "categoryId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 60,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "maxPoints": {
+          "type": "number"
+        },
+        "date": {
+          "type": "string",
+          "minLength": 10,
+          "maxLength": 10,
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+        },
+        "description": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 500
+        },
+        "order": {
+          "type": "number"
+        },
+        "professorIds": {
+          "type": "array"
+        },
+        "isSeed": {
+          "type": "boolean"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "courseId",
+        "categoryId",
+        "name",
+        "maxPoints",
+        "date",
+        "description",
+        "order",
+        "professorIds",
+        "isSeed",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "Score": {
+      "title": "Score",
+      "description": "Student score and optional feedback for a specific grading item.",
+      "type": "object",
+      "properties": {
+        "courseId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 60,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "categoryId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 60,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "itemId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 60,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "studentId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "points": {
+          "type": "number"
+        },
+        "feedback": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 500
+        },
+        "gradedBy": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "professorIds": {
+          "type": "array"
+        },
+        "isSeed": {
+          "type": "boolean"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "courseId",
+        "categoryId",
+        "itemId",
+        "studentId",
+        "points",
+        "feedback",
+        "gradedBy",
+        "professorIds",
+        "isSeed",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "AttendanceSession": {
+      "title": "AttendanceSession",
+      "description": "Held, future, or cancelled class session for attendance tracking.",
+      "type": "object",
+      "properties": {
+        "courseId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 60,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "date": {
+          "type": "string",
+          "minLength": 10,
+          "maxLength": 10,
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+        },
+        "time": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 20
+        },
+        "topic": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 150
+        },
+        "isCancelled": {
+          "type": "boolean"
+        },
+        "professorIds": {
+          "type": "array"
+        },
+        "isSeed": {
+          "type": "boolean"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "courseId",
+        "date",
+        "time",
+        "topic",
+        "isCancelled",
+        "professorIds",
+        "isSeed",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "AttendanceRecord": {
+      "title": "AttendanceRecord",
+      "description": "Individual student attendance mark for a specific session.",
+      "type": "object",
+      "properties": {
+        "courseId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 60,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "sessionId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 60,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "studentId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "present": {
+          "type": "boolean"
+        },
+        "note": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 200
+        },
+        "markedBy": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "professorIds": {
+          "type": "array"
+        },
+        "isSeed": {
+          "type": "boolean"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "courseId",
+        "sessionId",
+        "studentId",
+        "present",
+        "note",
+        "markedBy",
+        "professorIds",
+        "isSeed",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "FinalGrade": {
+      "title": "FinalGrade",
+      "description": "Draft or finalized official course grade for a student.",
+      "type": "object",
+      "properties": {
+        "courseId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 60,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "studentId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "totalPoints": {
+          "type": "number"
+        },
+        "finalGrade": {
+          "type": "number"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["draft", "finalized"]
+        },
+        "finalizedBy": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "comment": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 300
+        },
+        "professorIds": {
+          "type": "array"
+        },
+        "isSeed": {
+          "type": "boolean"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "courseId",
+        "studentId",
+        "totalPoints",
+        "finalGrade",
+        "status",
+        "finalizedBy",
+        "comment",
+        "professorIds",
+        "isSeed",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/admins/{adminId}": {
+      "schema": "Admin",
+      "description": "Administrator privilege registry."
+    },
+    "/userProfiles/{userId}": {
+      "schema": "UserProfile",
+      "description": "Public academic profiles without PII."
+    },
+    "/userPrivate/{userId}": {
+      "schema": "UserPrivate",
+      "description": "Isolated private PII records."
+    },
+    "/studentDirectory/{studentIndex}": {
+      "schema": "StudentDirectoryEntry",
+      "description": "Student index number lookup table for course enrollments."
+    },
+    "/invitations/{inviteId}": {
+      "schema": "Invitation",
+      "description": "Controlled professor invitations."
+    },
+    "/courses/{courseId}": {
+      "schema": "Course",
+      "description": "University courses, attendance rules, and grade thresholds."
+    },
+    "/enrollments/{enrollmentId}": {
+      "schema": "Enrollment",
+      "description": "Student course enrollments."
+    },
+    "/gradingCategories/{categoryId}": {
+      "schema": "GradingCategory",
+      "description": "Course grading categories."
+    },
+    "/gradingItems/{itemId}": {
+      "schema": "GradingItem",
+      "description": "Assignments, exercises, and exams."
+    },
+    "/scores/{scoreId}": {
+      "schema": "Score",
+      "description": "Student scores per grading item."
+    },
+    "/attendanceSessions/{sessionId}": {
+      "schema": "AttendanceSession",
+      "description": "Course attendance sessions."
+    },
+    "/attendanceRecords/{recordId}": {
+      "schema": "AttendanceRecord",
+      "description": "Student attendance records per session."
+    },
+    "/finalGrades/{gradeId}": {
+      "schema": "FinalGrade",
+      "description": "Draft and finalized course grades."
+    }
+  }
+}

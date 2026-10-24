@@ -1,0 +1,404 @@
+import {
+  AttendanceRecord,
+  AttendanceSession,
+  Course,
+  FinalGrade,
+  FinalGradeStatus,
+  GradingCategory,
+  GradingItem,
+  Score,
+} from '../types/zamio';
+
+export type SessionAttendanceState = 'present' | 'absent' | 'unrecorded' | 'cancelled' | 'future';
+
+export interface SessionBreakdownRow {
+  session: AttendanceSession;
+  state: SessionAttendanceState;
+  note: string;
+}
+
+export interface AttendanceSummary {
+  enabled: boolean;
+  earnedPoints: number;
+  maxPoints: number;
+  heldCount: number;
+  attendedCount: number;
+  absentCount: number;
+  unrecordedCount: number;
+  cancelledCount: number;
+  futureCount: number;
+  percentage: number | null;
+  sessions: SessionBreakdownRow[];
+}
+
+export interface ItemBreakdownRow {
+  item: GradingItem;
+  earnedPoints: number | null;
+  maxPoints: number;
+  feedback: string;
+  graded: boolean;
+}
+
+export interface CategoryBreakdown {
+  category: GradingCategory;
+  earnedPoints: number;
+  maxPoints: number;
+  itemsMaxSum: number;
+  percentage: number;
+  items: ItemBreakdownRow[];
+}
+
+export interface CourseStudentSummary {
+  courseId: string;
+  studentId: string;
+  attendance: AttendanceSummary;
+  categories: CategoryBreakdown[];
+  totalEarnedPoints: number;
+  maxPossiblePoints: number;
+  percentageAchieved: number;
+  suggestedGrade: number | null;
+  passedThreshold: boolean;
+  officialFinalGrade: FinalGrade | null;
+  studentVisibleFinalGrade: number | null;
+}
+
+export function roundTo2(value: number): number {
+  return Math.round((value + Number.EPSILON) * 100) / 100;
+}
+
+export function roundTo1(value: number): number {
+  return Math.round((value + Number.EPSILON) * 10) / 10;
+}
+
+export function getTodayIsoLocal(now: Date = new Date()): string {
+  const year = now.getFullYear();
+  const month = String(now.getMonth() + 1).padStart(2, '0');
+  const day = String(now.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+/**
+ * Calculates attendance score and session breakdown for a student on a course.
+ *
+ * Formula:
+ *   Attendance points = Maximum attendance points * Attended sessions / Held sessions
+ *
+ * Edge cases enforced:
+ * - Disabled attendance: returns 0/0 without misleading deductions or percentages.
+ * - Cancelled sessions: excluded from held sessions.
+ * - Future sessions (session.date > referenceDateIso): excluded from held sessions.
+ * - Zero held sessions: returns 0 earned points and 0% without division-by-zero (NaN).
+ */
+export function calculateAttendance(params: {
+  attendanceEnabled: boolean;
+  attendanceMaxPoints: number;
+  sessions: AttendanceSession[];
+  records: AttendanceRecord[];
+  studentId: string;
+  referenceDateIso?: string;
+}): AttendanceSummary {
+  const {
+    attendanceEnabled,
+    attendanceMaxPoints,
+    sessions,
+    records,
+    studentId,
+    referenceDateIso = getTodayIsoLocal(),
+  } = params;
+
+  const sortedSessions = [...sessions].sort((a, b) => {
+    const byDate = a.date.localeCompare(b.date);
+    if (byDate !== 0) return byDate;
+    return a.time.localeCompare(b.time);
+  });
+
+  if (!attendanceEnabled) {
+    return {
+      enabled: false,
+      earnedPoints: 0,
+      maxPoints: 0,
+      heldCount: 0,
+      attendedCount: 0,
+      absentCount: 0,
+      unrecordedCount: 0,
+      cancelledCount: 0,
+      futureCount: 0,
+      percentage: null,
+      sessions: sortedSessions.map((session) => ({
+        session,
+        state: session.isCancelled
+          ? 'cancelled'
+          : session.date > referenceDateIso
+            ? 'future'
+            : 'unrecorded',
+        note: '',
+      })),
+    };
+  }
+
+  const safeMaxPoints = Math.max(0, attendanceMaxPoints);
+
+  // Deduplicate records by sessionId for the target student to prevent double counting
+  const recordBySessionId = new Map<string, AttendanceRecord>();
+  for (const record of records) {
+    if (record.studentId === studentId) {
+      recordBySessionId.set(record.sessionId, record);
+    }
+  }
+
+  let heldCount = 0;
+  let attendedCount = 0;
+  let absentCount = 0;
+  let unrecordedCount = 0;
+  let cancelledCount = 0;
+  let futureCount = 0;
+
+  const rows: SessionBreakdownRow[] = sortedSessions.map((session) => {
+    const rec = recordBySessionId.get(session.id);
+
+    if (session.isCancelled) {
+      cancelledCount += 1;
+      return {
+        session,
+        state: 'cancelled',
+        note: rec?.note ?? '',
+      };
+    }
+
+    if (session.date > referenceDateIso) {
+      futureCount += 1;
+      return {
+        session,
+        state: 'future',
+        note: rec?.note ?? '',
+      };
+    }
+
+    heldCount += 1;
+    if (!rec) {
+      unrecordedCount += 1;
+      return {
+        session,
+        state: 'unrecorded',
+        note: '',
+      };
+    }
+
+    if (rec.present) {
+      attendedCount += 1;
+      return {
+        session,
+        state: 'present',
+        note: rec.note,
+      };
+    }
+
+    absentCount += 1;
+    return {
+      session,
+      state: 'absent',
+      note: rec.note,
+    };
+  });
+
+  const earnedPoints =
+    heldCount === 0 ? 0 : roundTo2((safeMaxPoints * attendedCount) / heldCount);
+  const percentage =
+    heldCount === 0 ? 0 : roundTo1((attendedCount / heldCount) * 100);
+
+  return {
+    enabled: true,
+    earnedPoints,
+    maxPoints: safeMaxPoints,
+    heldCount,
+    attendedCount,
+    absentCount,
+    unrecordedCount,
+    cancelledCount,
+    futureCount,
+    percentage,
+    sessions: rows,
+  };
+}
+
+/**
+ * Computes suggested university grade (6-10) based on configurable course thresholds.
+ * Returns null if totalPoints has not reached grade6Threshold.
+ */
+export function calculateSuggestedGrade(
+  totalPoints: number,
+  thresholds: Pick<
+    Course,
+    | 'grade6Threshold'
+    | 'grade7Threshold'
+    | 'grade8Threshold'
+    | 'grade9Threshold'
+    | 'grade10Threshold'
+  >
+): number | null {
+  const pts = roundTo2(totalPoints);
+  if (pts >= thresholds.grade10Threshold) return 10;
+  if (pts >= thresholds.grade9Threshold) return 9;
+  if (pts >= thresholds.grade8Threshold) return 8;
+  if (pts >= thresholds.grade7Threshold) return 7;
+  if (pts >= thresholds.grade6Threshold) return 6;
+  return null;
+}
+
+/**
+ * Centralized calculation of a student's complete academic standing in a course.
+ * Ensures 100% consistency between Student and Professor dashboards and prevents
+ * double counting of attendance or orphaned grading items.
+ */
+export function calculateCourseStudentSummary(params: {
+  course: Course;
+  categories: GradingCategory[];
+  items: GradingItem[];
+  scores: Score[];
+  sessions: AttendanceSession[];
+  attendanceRecords: AttendanceRecord[];
+  finalGradeRecord?: FinalGrade | null;
+  studentId: string;
+  referenceDateIso?: string;
+}): CourseStudentSummary {
+  const {
+    course,
+    categories,
+    items,
+    scores,
+    sessions,
+    attendanceRecords,
+    finalGradeRecord = null,
+    studentId,
+    referenceDateIso = getTodayIsoLocal(),
+  } = params;
+
+  const courseCategories = [...categories]
+    .filter((cat) => cat.courseId === course.id)
+    .sort((a, b) => a.order - b.order || a.name.localeCompare(b.name));
+
+  // Deduplicate active items by item.id
+  const activeItemMap = new Map<string, GradingItem>();
+  for (const item of items) {
+    if (item.courseId === course.id) {
+      activeItemMap.set(item.id, item);
+    }
+  }
+
+  // Deduplicate scores by itemId for this student, ignoring negative or orphaned scores
+  const scoreByItemId = new Map<string, Score>();
+  for (const score of scores) {
+    if (score.courseId === course.id && score.studentId === studentId && activeItemMap.has(score.itemId)) {
+      scoreByItemId.set(score.itemId, score);
+    }
+  }
+
+  const attendance = calculateAttendance({
+    attendanceEnabled: course.attendanceEnabled,
+    attendanceMaxPoints: course.attendanceMaxPoints,
+    sessions: sessions.filter((s) => s.courseId === course.id),
+    records: attendanceRecords.filter((r) => r.courseId === course.id),
+    studentId,
+    referenceDateIso,
+  });
+
+  const categoryBreakdowns: CategoryBreakdown[] = courseCategories.map((category) => {
+    const categoryItems = [...activeItemMap.values()]
+      .filter((item) => item.categoryId === category.id)
+      .sort((a, b) => a.order - b.order || a.date.localeCompare(b.date));
+
+    let rawEarned = 0;
+    let itemsMaxSum = 0;
+
+    const itemRows: ItemBreakdownRow[] = categoryItems.map((item) => {
+      itemsMaxSum = roundTo2(itemsMaxSum + item.maxPoints);
+      const score = scoreByItemId.get(item.id);
+      if (!score) {
+        return {
+          item,
+          earnedPoints: null,
+          maxPoints: item.maxPoints,
+          feedback: '',
+          graded: false,
+        };
+      }
+
+      const sanitizedPoints = Math.max(
+        0,
+        course.allowBonusPoints ? score.points : Math.min(score.points, item.maxPoints)
+      );
+      rawEarned = roundTo2(rawEarned + sanitizedPoints);
+
+      return {
+        item,
+        earnedPoints: roundTo2(sanitizedPoints),
+        maxPoints: item.maxPoints,
+        feedback: score.feedback,
+        graded: true,
+      };
+    });
+
+    const cappedEarned = course.allowBonusPoints
+      ? rawEarned
+      : Math.min(rawEarned, Math.max(0, category.maxPoints));
+
+    const catMax = Math.max(0, category.maxPoints);
+    const catPct = catMax > 0 ? roundTo1((cappedEarned / catMax) * 100) : 0;
+
+    return {
+      category,
+      earnedPoints: roundTo2(cappedEarned),
+      maxPoints: catMax,
+      itemsMaxSum: roundTo2(itemsMaxSum),
+      percentage: catPct,
+      items: itemRows,
+    };
+  });
+
+  const categoriesEarnedSum = categoryBreakdowns.reduce(
+    (acc, c) => roundTo2(acc + c.earnedPoints),
+    0
+  );
+  const categoriesMaxSum = categoryBreakdowns.reduce(
+    (acc, c) => roundTo2(acc + c.maxPoints),
+    0
+  );
+
+  const totalEarnedPoints = roundTo2(
+    (course.attendanceEnabled ? attendance.earnedPoints : 0) + categoriesEarnedSum
+  );
+  const maxPossiblePoints = roundTo2(
+    (course.attendanceEnabled ? attendance.maxPoints : 0) + categoriesMaxSum
+  );
+
+  const percentageAchieved =
+    maxPossiblePoints > 0 ? roundTo1((totalEarnedPoints / maxPossiblePoints) * 100) : 0;
+
+  const suggestedGrade = calculateSuggestedGrade(totalEarnedPoints, course);
+  const passedThreshold = totalEarnedPoints >= course.grade6Threshold;
+
+  // Student-visible final grade is NEVER invented before finalized by professor AND passing rules met
+  let studentVisibleFinalGrade: number | null = null;
+  if (
+    finalGradeRecord &&
+    finalGradeRecord.status === FinalGradeStatus.FINALIZED &&
+    finalGradeRecord.finalGrade >= 6 &&
+    passedThreshold
+  ) {
+    studentVisibleFinalGrade = finalGradeRecord.finalGrade;
+  }
+
+  return {
+    courseId: course.id,
+    studentId,
+    attendance,
+    categories: categoryBreakdowns,
+    totalEarnedPoints,
+    maxPossiblePoints,
+    percentageAchieved,
+    suggestedGrade,
+    passedThreshold,
+    officialFinalGrade: finalGradeRecord,
+    studentVisibleFinalGrade,
+  };
+}

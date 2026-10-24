@@ -1,0 +1,823 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 0. Global Default-Deny Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // =========================================================================
+    // Primitive Helpers
+    // =========================================================================
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerified() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isBootstrapAdmin() {
+      return isVerified() && request.auth.token.email == 'aydinachi@gmail.com';
+    }
+
+    function isAdmin() {
+      return isBootstrapAdmin() || (
+        isVerified() &&
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+      );
+    }
+
+    function isProfessorUser() {
+      return isVerified() &&
+        exists(/databases/$(database)/documents/userProfiles/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/userProfiles/$(request.auth.uid)).data.role == 'professor';
+    }
+
+    function isCourseProfessor(courseId) {
+      return isVerified() &&
+        exists(/databases/$(database)/documents/courses/$(courseId)) &&
+        request.auth.uid in get(/databases/$(database)/documents/courses/$(courseId)).data.professorIds;
+    }
+
+    function isEnrolledStudent(courseId) {
+      return isSignedIn() &&
+        exists(/databases/$(database)/documents/enrollments/$(courseId + '_' + request.auth.uid));
+    }
+
+    function isValidBoundedIdList(arr, minLen, maxLen) {
+      return arr is list &&
+        arr.size() >= minLen &&
+        arr.size() <= maxLen &&
+        (arr.size() == 0 || (arr[0] is string && arr[0].size() >= 1 && arr[0].size() <= 128));
+    }
+
+    // =========================================================================
+    // Validation Blueprints (Anti-Update-Gap)
+    // =========================================================================
+    function isValidAdmin(data) {
+      return data.keys().hasAll(['uid', 'grantedBy', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['uid', 'grantedBy', 'createdAt', 'updatedAt']) &&
+        isValidId(data.uid) &&
+        isValidId(data.grantedBy) &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidUserProfile(data) {
+      return data.keys().hasAll([
+          'uid', 'fullName', 'studentIndex', 'department', 'role',
+          'academicYear', 'redeemedInviteId', 'isSeed', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'uid', 'fullName', 'studentIndex', 'department', 'role',
+          'academicYear', 'redeemedInviteId', 'isSeed', 'createdAt', 'updatedAt'
+        ]) &&
+        isValidId(data.uid) &&
+        data.fullName is string && data.fullName.size() >= 1 && data.fullName.size() <= 100 &&
+        data.studentIndex is string && data.studentIndex.size() <= 20 && data.studentIndex.matches('^[a-zA-Z0-9_\\-]*$') &&
+        data.department is string && data.department.size() >= 1 && data.department.size() <= 80 &&
+        data.role is string && data.role in ['student', 'professor', 'admin'] &&
+        data.academicYear is string && data.academicYear.size() >= 1 && data.academicYear.size() <= 20 &&
+        data.redeemedInviteId is string && data.redeemedInviteId.size() <= 128 &&
+        data.isSeed is bool &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidUserPrivate(data) {
+      return data.keys().hasAll(['uid', 'email', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['uid', 'email', 'createdAt', 'updatedAt']) &&
+        isValidId(data.uid) &&
+        data.email is string && data.email.size() >= 3 && data.email.size() <= 254 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidStudentDirectory(data) {
+      return data.keys().hasAll([
+          'studentIndex', 'uid', 'fullName', 'department', 'isSeed', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'studentIndex', 'uid', 'fullName', 'department', 'isSeed', 'createdAt', 'updatedAt'
+        ]) &&
+        data.studentIndex is string && data.studentIndex.size() >= 1 && data.studentIndex.size() <= 20 && data.studentIndex.matches('^[a-zA-Z0-9_\\-]+$') &&
+        isValidId(data.uid) &&
+        data.fullName is string && data.fullName.size() >= 1 && data.fullName.size() <= 100 &&
+        data.department is string && data.department.size() >= 1 && data.department.size() <= 80 &&
+        data.isSeed is bool &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidInvitation(data) {
+      return data.keys().hasAll([
+          'code', 'targetEmail', 'role', 'status', 'createdBy', 'acceptedBy', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'code', 'targetEmail', 'role', 'status', 'createdBy', 'acceptedBy', 'createdAt', 'updatedAt'
+        ]) &&
+        data.code is string && data.code.size() >= 6 && data.code.size() <= 64 && data.code.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.targetEmail is string && data.targetEmail.size() >= 3 && data.targetEmail.size() <= 254 &&
+        data.role is string && data.role in ['professor'] &&
+        data.status is string && data.status in ['pending', 'accepted', 'revoked'] &&
+        isValidId(data.createdBy) &&
+        data.acceptedBy is string && data.acceptedBy.size() <= 128 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidCourse(data) {
+      return data.keys().hasAll([
+          'code', 'name', 'semester', 'academicYear', 'ects',
+          'leadProfessorId', 'leadProfessorName', 'professorIds',
+          'categoryIds', 'itemIds', 'sessionIds',
+          'attendanceEnabled', 'attendanceMaxPoints', 'allowBonusPoints',
+          'grade6Threshold', 'grade7Threshold', 'grade8Threshold', 'grade9Threshold', 'grade10Threshold',
+          'isSeed', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'code', 'name', 'semester', 'academicYear', 'ects',
+          'leadProfessorId', 'leadProfessorName', 'professorIds',
+          'categoryIds', 'itemIds', 'sessionIds',
+          'attendanceEnabled', 'attendanceMaxPoints', 'allowBonusPoints',
+          'grade6Threshold', 'grade7Threshold', 'grade8Threshold', 'grade9Threshold', 'grade10Threshold',
+          'isSeed', 'createdAt', 'updatedAt'
+        ]) &&
+        data.code is string && data.code.size() >= 1 && data.code.size() <= 20 && data.code.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.name is string && data.name.size() >= 1 && data.name.size() <= 120 &&
+        data.semester is string && data.semester.size() >= 1 && data.semester.size() <= 60 &&
+        data.academicYear is string && data.academicYear.size() >= 1 && data.academicYear.size() <= 20 &&
+        data.ects is number && data.ects >= 1 && data.ects <= 30 &&
+        isValidId(data.leadProfessorId) &&
+        data.leadProfessorName is string && data.leadProfessorName.size() >= 1 && data.leadProfessorName.size() <= 100 &&
+        isValidBoundedIdList(data.professorIds, 1, 10) &&
+        isValidBoundedIdList(data.categoryIds, 0, 20) &&
+        isValidBoundedIdList(data.itemIds, 0, 60) &&
+        isValidBoundedIdList(data.sessionIds, 0, 60) &&
+        data.attendanceEnabled is bool &&
+        data.attendanceMaxPoints is number && data.attendanceMaxPoints >= 0 && data.attendanceMaxPoints <= 100 &&
+        data.allowBonusPoints is bool &&
+        data.grade6Threshold is number && data.grade6Threshold >= 0 &&
+        data.grade7Threshold is number && data.grade7Threshold > data.grade6Threshold &&
+        data.grade8Threshold is number && data.grade8Threshold > data.grade7Threshold &&
+        data.grade9Threshold is number && data.grade9Threshold > data.grade8Threshold &&
+        data.grade10Threshold is number && data.grade10Threshold > data.grade9Threshold && data.grade10Threshold <= 200 &&
+        data.isSeed is bool &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidEnrollment(data) {
+      return data.keys().hasAll([
+          'courseId', 'courseCode', 'courseName', 'leadProfessorName', 'academicYear',
+          'studentId', 'studentName', 'studentIndex', 'studentDepartment',
+          'professorIds', 'isSeed', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'courseId', 'courseCode', 'courseName', 'leadProfessorName', 'academicYear',
+          'studentId', 'studentName', 'studentIndex', 'studentDepartment',
+          'professorIds', 'isSeed', 'createdAt', 'updatedAt'
+        ]) &&
+        data.courseId is string && data.courseId.size() >= 1 && data.courseId.size() <= 60 && data.courseId.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.courseCode is string && data.courseCode.size() >= 1 && data.courseCode.size() <= 20 &&
+        data.courseName is string && data.courseName.size() >= 1 && data.courseName.size() <= 120 &&
+        data.leadProfessorName is string && data.leadProfessorName.size() >= 1 && data.leadProfessorName.size() <= 100 &&
+        data.academicYear is string && data.academicYear.size() >= 1 && data.academicYear.size() <= 20 &&
+        data.studentId is string && data.studentId.size() >= 1 && data.studentId.size() <= 64 && data.studentId.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.studentName is string && data.studentName.size() >= 1 && data.studentName.size() <= 100 &&
+        data.studentIndex is string && data.studentIndex.size() >= 1 && data.studentIndex.size() <= 20 &&
+        data.studentDepartment is string && data.studentDepartment.size() >= 1 && data.studentDepartment.size() <= 80 &&
+        isValidBoundedIdList(data.professorIds, 1, 10) &&
+        data.isSeed is bool &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidGradingCategory(data) {
+      return data.keys().hasAll([
+          'courseId', 'name', 'maxPoints', 'order', 'professorIds', 'isSeed', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'courseId', 'name', 'maxPoints', 'order', 'professorIds', 'isSeed', 'createdAt', 'updatedAt'
+        ]) &&
+        data.courseId is string && data.courseId.size() >= 1 && data.courseId.size() <= 60 && data.courseId.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.name is string && data.name.size() >= 1 && data.name.size() <= 80 &&
+        data.maxPoints is number && data.maxPoints >= 0 && data.maxPoints <= 100 &&
+        data.order is number && data.order >= 0 && data.order <= 50 &&
+        isValidBoundedIdList(data.professorIds, 1, 10) &&
+        data.isSeed is bool &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidGradingItem(data) {
+      return data.keys().hasAll([
+          'courseId', 'categoryId', 'name', 'maxPoints', 'date', 'description',
+          'order', 'professorIds', 'isSeed', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'courseId', 'categoryId', 'name', 'maxPoints', 'date', 'description',
+          'order', 'professorIds', 'isSeed', 'createdAt', 'updatedAt'
+        ]) &&
+        data.courseId is string && data.courseId.size() >= 1 && data.courseId.size() <= 60 && data.courseId.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.categoryId is string && data.categoryId.size() >= 1 && data.categoryId.size() <= 60 && data.categoryId.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.name is string && data.name.size() >= 1 && data.name.size() <= 120 &&
+        data.maxPoints is number && data.maxPoints > 0 && data.maxPoints <= 100 &&
+        data.date is string && data.date.size() == 10 && data.date.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$') &&
+        data.description is string && data.description.size() <= 500 &&
+        data.order is number && data.order >= 0 && data.order <= 200 &&
+        isValidBoundedIdList(data.professorIds, 1, 10) &&
+        data.isSeed is bool &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidScore(data) {
+      return data.keys().hasAll([
+          'courseId', 'categoryId', 'itemId', 'studentId', 'points', 'feedback',
+          'gradedBy', 'professorIds', 'isSeed', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'courseId', 'categoryId', 'itemId', 'studentId', 'points', 'feedback',
+          'gradedBy', 'professorIds', 'isSeed', 'createdAt', 'updatedAt'
+        ]) &&
+        data.courseId is string && data.courseId.size() >= 1 && data.courseId.size() <= 60 && data.courseId.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.categoryId is string && data.categoryId.size() >= 1 && data.categoryId.size() <= 60 && data.categoryId.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.itemId is string && data.itemId.size() >= 1 && data.itemId.size() <= 60 && data.itemId.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.studentId is string && data.studentId.size() >= 1 && data.studentId.size() <= 64 && data.studentId.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.points is number && data.points >= 0 && data.points <= 200 &&
+        data.feedback is string && data.feedback.size() <= 500 &&
+        isValidId(data.gradedBy) &&
+        isValidBoundedIdList(data.professorIds, 1, 10) &&
+        data.isSeed is bool &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidScoreWithinMax(data) {
+      return exists(/databases/$(database)/documents/gradingItems/$(data.itemId)) &&
+        exists(/databases/$(database)/documents/courses/$(data.courseId)) &&
+        exists(/databases/$(database)/documents/enrollments/$(data.courseId + '_' + data.studentId)) &&
+        get(/databases/$(database)/documents/gradingItems/$(data.itemId)).data.courseId == data.courseId && (
+          get(/databases/$(database)/documents/courses/$(data.courseId)).data.allowBonusPoints == true ||
+          data.points <= get(/databases/$(database)/documents/gradingItems/$(data.itemId)).data.maxPoints
+        );
+    }
+
+    function isValidAttendanceSession(data) {
+      return data.keys().hasAll([
+          'courseId', 'date', 'time', 'topic', 'isCancelled', 'professorIds', 'isSeed', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'courseId', 'date', 'time', 'topic', 'isCancelled', 'professorIds', 'isSeed', 'createdAt', 'updatedAt'
+        ]) &&
+        data.courseId is string && data.courseId.size() >= 1 && data.courseId.size() <= 60 && data.courseId.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.date is string && data.date.size() == 10 && data.date.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$') &&
+        data.time is string && data.time.size() <= 20 &&
+        data.topic is string && data.topic.size() <= 150 &&
+        data.isCancelled is bool &&
+        isValidBoundedIdList(data.professorIds, 1, 10) &&
+        data.isSeed is bool &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidAttendanceRecord(data) {
+      return data.keys().hasAll([
+          'courseId', 'sessionId', 'studentId', 'present', 'note', 'markedBy', 'professorIds', 'isSeed', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'courseId', 'sessionId', 'studentId', 'present', 'note', 'markedBy', 'professorIds', 'isSeed', 'createdAt', 'updatedAt'
+        ]) &&
+        data.courseId is string && data.courseId.size() >= 1 && data.courseId.size() <= 60 && data.courseId.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.sessionId is string && data.sessionId.size() >= 1 && data.sessionId.size() <= 60 && data.sessionId.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.studentId is string && data.studentId.size() >= 1 && data.studentId.size() <= 64 && data.studentId.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.present is bool &&
+        data.note is string && data.note.size() <= 200 &&
+        isValidId(data.markedBy) &&
+        isValidBoundedIdList(data.professorIds, 1, 10) &&
+        data.isSeed is bool &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidFinalGrade(data) {
+      return data.keys().hasAll([
+          'courseId', 'studentId', 'totalPoints', 'finalGrade', 'status',
+          'finalizedBy', 'comment', 'professorIds', 'isSeed', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'courseId', 'studentId', 'totalPoints', 'finalGrade', 'status',
+          'finalizedBy', 'comment', 'professorIds', 'isSeed', 'createdAt', 'updatedAt'
+        ]) &&
+        data.courseId is string && data.courseId.size() >= 1 && data.courseId.size() <= 60 && data.courseId.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.studentId is string && data.studentId.size() >= 1 && data.studentId.size() <= 64 && data.studentId.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.totalPoints is number && data.totalPoints >= 0 && data.totalPoints <= 200 &&
+        data.finalGrade is number && data.finalGrade >= 5 && data.finalGrade <= 10 &&
+        data.status is string && data.status in ['draft', 'finalized'] &&
+        isValidId(data.finalizedBy) &&
+        data.comment is string && data.comment.size() <= 300 &&
+        isValidBoundedIdList(data.professorIds, 1, 10) &&
+        data.isSeed is bool &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    // =========================================================================
+    // Collection Match Blocks
+    // =========================================================================
+
+    match /admins/{adminId} {
+      allow get: if isSignedIn() && isValidId(adminId) && (request.auth.uid == adminId || isAdmin());
+      allow list: if isBootstrapAdmin();
+      allow create: if isBootstrapAdmin() && isValidId(adminId) && isValidAdmin(incoming()) &&
+        incoming().uid == adminId &&
+        incoming().grantedBy == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+      allow update: if isValidAdmin(incoming()) && isBootstrapAdmin() && isValidId(adminId) &&
+        incoming().uid == existing().uid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['grantedBy', 'updatedAt']);
+      allow delete: if isBootstrapAdmin() && isValidId(adminId);
+    }
+
+    match /userProfiles/{userId} {
+      allow get: if isSignedIn() && isValidId(userId) && (
+        request.auth.uid == userId || isProfessorUser() || isAdmin()
+      );
+      allow list: if isBootstrapAdmin();
+      allow create: if isVerified() && isValidId(userId) && isValidUserProfile(incoming()) &&
+        incoming().uid == userId &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time && (
+          isAdmin() ||
+          (
+            request.auth.uid == userId &&
+            incoming().role == 'student' &&
+            incoming().redeemedInviteId == '' &&
+            incoming().isSeed == false
+          ) ||
+          (
+            request.auth.uid == userId &&
+            incoming().role == 'professor' &&
+            incoming().isSeed == false &&
+            isValidId(incoming().redeemedInviteId) &&
+            exists(/databases/$(database)/documents/invitations/$(incoming().redeemedInviteId)) &&
+            get(/databases/$(database)/documents/invitations/$(incoming().redeemedInviteId)).data.status == 'pending' &&
+            get(/databases/$(database)/documents/invitations/$(incoming().redeemedInviteId)).data.targetEmail == request.auth.token.email &&
+            getAfter(/databases/$(database)/documents/invitations/$(incoming().redeemedInviteId)).data.status == 'accepted'
+          )
+        );
+      allow update: if isValidUserProfile(incoming()) && isVerified() && isValidId(userId) &&
+        incoming().uid == existing().uid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().isSeed == existing().isSeed &&
+        incoming().updatedAt == request.time && (
+          (
+            isAdmin() &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'fullName', 'studentIndex', 'department', 'role', 'academicYear', 'redeemedInviteId', 'updatedAt'
+            ])
+          ) ||
+          (
+            request.auth.uid == userId &&
+            incoming().role == existing().role &&
+            incoming().redeemedInviteId == existing().redeemedInviteId &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'fullName', 'studentIndex', 'department', 'academicYear', 'updatedAt'
+            ])
+          ) ||
+          (
+            request.auth.uid == userId &&
+            existing().role == 'student' &&
+            incoming().role == 'professor' &&
+            isValidId(incoming().redeemedInviteId) &&
+            exists(/databases/$(database)/documents/invitations/$(incoming().redeemedInviteId)) &&
+            get(/databases/$(database)/documents/invitations/$(incoming().redeemedInviteId)).data.status == 'pending' &&
+            get(/databases/$(database)/documents/invitations/$(incoming().redeemedInviteId)).data.targetEmail == request.auth.token.email &&
+            getAfter(/databases/$(database)/documents/invitations/$(incoming().redeemedInviteId)).data.status == 'accepted' &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['role', 'redeemedInviteId', 'updatedAt'])
+          )
+        );
+      allow delete: if isAdmin() && isValidId(userId);
+    }
+
+    match /userPrivate/{userId} {
+      allow get: if isSignedIn() && isValidId(userId) && (request.auth.uid == userId || isAdmin());
+      allow list: if isBootstrapAdmin();
+      allow create: if isVerified() && isValidId(userId) && isValidUserPrivate(incoming()) &&
+        incoming().uid == userId &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time && (
+          (request.auth.uid == userId && incoming().email == request.auth.token.email) ||
+          isAdmin()
+        );
+      allow update: if isValidUserPrivate(incoming()) && isVerified() && isValidId(userId) &&
+        incoming().uid == existing().uid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time && (
+          (
+            request.auth.uid == userId &&
+            incoming().email == request.auth.token.email &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['email', 'updatedAt'])
+          ) ||
+          (
+            isAdmin() &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['email', 'updatedAt'])
+          )
+        );
+      allow delete: if isAdmin() && isValidId(userId);
+    }
+
+    match /studentDirectory/{studentIndex} {
+      allow get: if isSignedIn() && isValidId(studentIndex) && (
+        resource == null ||
+        resource.data.uid == request.auth.uid ||
+        isProfessorUser() ||
+        isAdmin()
+      );
+      allow list: if isBootstrapAdmin();
+      allow create: if isVerified() && isValidId(studentIndex) && isValidStudentDirectory(incoming()) &&
+        incoming().studentIndex == studentIndex &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time && (
+          isAdmin() ||
+          (
+            incoming().uid == request.auth.uid &&
+            incoming().isSeed == false &&
+            exists(/databases/$(database)/documents/userProfiles/$(request.auth.uid))
+          )
+        );
+      allow update: if isValidStudentDirectory(incoming()) && isVerified() && isValidId(studentIndex) &&
+        incoming().studentIndex == existing().studentIndex &&
+        incoming().uid == existing().uid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().isSeed == existing().isSeed &&
+        incoming().updatedAt == request.time && (
+          isAdmin() ||
+          (
+            existing().uid == request.auth.uid &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['fullName', 'department', 'updatedAt'])
+          )
+        );
+      allow delete: if isVerified() && isValidId(studentIndex) && (
+        isAdmin() || (resource != null && resource.data.uid == request.auth.uid)
+      );
+    }
+
+    match /invitations/{inviteId} {
+      allow get: if isSignedIn() && isValidId(inviteId) && (
+        isAdmin() || (isVerified() && resource != null && resource.data.targetEmail == request.auth.token.email)
+      );
+      allow list: if isBootstrapAdmin();
+      allow create: if isAdmin() && isValidId(inviteId) && isValidInvitation(incoming()) &&
+        incoming().code == inviteId &&
+        incoming().status == 'pending' &&
+        incoming().acceptedBy == '' &&
+        incoming().createdBy == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+      allow update: if isValidInvitation(incoming()) && isVerified() && isValidId(inviteId) &&
+        incoming().code == existing().code &&
+        incoming().targetEmail == existing().targetEmail &&
+        incoming().role == existing().role &&
+        incoming().createdBy == existing().createdBy &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        (existing().status == 'pending' || isAdmin()) && (
+          (
+            isAdmin() &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['status', 'acceptedBy', 'updatedAt'])
+          ) ||
+          (
+            existing().status == 'pending' &&
+            incoming().status == 'accepted' &&
+            request.auth.token.email == existing().targetEmail &&
+            incoming().acceptedBy == request.auth.uid &&
+            getAfter(/databases/$(database)/documents/userProfiles/$(request.auth.uid)).data.role == 'professor' &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['status', 'acceptedBy', 'updatedAt'])
+          )
+        );
+      allow delete: if isAdmin() && isValidId(inviteId);
+    }
+
+    match /courses/{courseId} {
+      allow get: if isSignedIn() && isValidId(courseId) && (
+        isAdmin() ||
+        (resource != null && request.auth.uid in resource.data.professorIds) ||
+        isEnrolledStudent(courseId)
+      );
+      allow list: if isSignedIn() && (
+        request.auth.uid in resource.data.professorIds ||
+        isBootstrapAdmin()
+      );
+      allow create: if isVerified() && isValidId(courseId) && isValidCourse(incoming()) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time && (
+          isAdmin() ||
+          (
+            isProfessorUser() &&
+            incoming().leadProfessorId == request.auth.uid &&
+            request.auth.uid in incoming().professorIds &&
+            incoming().isSeed == false
+          )
+        );
+      allow update: if isValidCourse(incoming()) && isVerified() && isValidId(courseId) &&
+        incoming().code == existing().code &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().isSeed == existing().isSeed &&
+        incoming().updatedAt == request.time && (
+          (
+            isAdmin() &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'name', 'semester', 'academicYear', 'ects',
+              'leadProfessorId', 'leadProfessorName', 'professorIds',
+              'categoryIds', 'itemIds', 'sessionIds',
+              'attendanceEnabled', 'attendanceMaxPoints', 'allowBonusPoints',
+              'grade6Threshold', 'grade7Threshold', 'grade8Threshold', 'grade9Threshold', 'grade10Threshold',
+              'updatedAt'
+            ])
+          ) ||
+          (
+            request.auth.uid in existing().professorIds &&
+            incoming().professorIds == existing().professorIds &&
+            incoming().leadProfessorId == existing().leadProfessorId && (
+              incoming().diff(existing()).affectedKeys().hasOnly([
+                'name', 'semester', 'academicYear', 'ects', 'leadProfessorName',
+                'attendanceEnabled', 'attendanceMaxPoints', 'allowBonusPoints',
+                'grade6Threshold', 'grade7Threshold', 'grade8Threshold', 'grade9Threshold', 'grade10Threshold',
+                'updatedAt'
+              ]) ||
+              incoming().diff(existing()).affectedKeys().hasOnly(['categoryIds', 'updatedAt']) ||
+              incoming().diff(existing()).affectedKeys().hasOnly(['itemIds', 'updatedAt']) ||
+              incoming().diff(existing()).affectedKeys().hasOnly(['sessionIds', 'updatedAt']) ||
+              incoming().diff(existing()).affectedKeys().hasOnly(['categoryIds', 'itemIds', 'updatedAt'])
+            )
+          )
+        );
+      allow delete: if isVerified() && isValidId(courseId) && (
+        isAdmin() || (resource != null && resource.data.leadProfessorId == request.auth.uid)
+      );
+    }
+
+    match /enrollments/{enrollmentId} {
+      allow get: if isSignedIn() && isValidId(enrollmentId) && (
+        isAdmin() ||
+        (resource != null && (
+          resource.data.studentId == request.auth.uid ||
+          request.auth.uid in resource.data.professorIds
+        ))
+      );
+      allow list: if isSignedIn() && (
+        resource.data.studentId == request.auth.uid ||
+        request.auth.uid in resource.data.professorIds ||
+        isBootstrapAdmin()
+      );
+      allow create: if isVerified() && isValidId(enrollmentId) && isValidEnrollment(incoming()) &&
+        enrollmentId == incoming().courseId + '_' + incoming().studentId &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        exists(/databases/$(database)/documents/courses/$(incoming().courseId)) && (
+          isAdmin() || isCourseProfessor(incoming().courseId)
+        );
+      allow update: if isValidEnrollment(incoming()) && isVerified() && isValidId(enrollmentId) &&
+        incoming().courseId == existing().courseId &&
+        incoming().studentId == existing().studentId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().isSeed == existing().isSeed &&
+        incoming().updatedAt == request.time &&
+        (isAdmin() || isCourseProfessor(existing().courseId)) &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'courseCode', 'courseName', 'leadProfessorName', 'academicYear',
+          'studentName', 'studentIndex', 'studentDepartment', 'professorIds', 'updatedAt'
+        ]);
+      allow delete: if isVerified() && isValidId(enrollmentId) && (
+        isAdmin() || (resource != null && request.auth.uid in resource.data.professorIds)
+      );
+    }
+
+    match /gradingCategories/{categoryId} {
+      allow get: if isSignedIn() && isValidId(categoryId) && (
+        isAdmin() ||
+        (resource != null && (
+          request.auth.uid in resource.data.professorIds ||
+          isEnrolledStudent(resource.data.courseId)
+        ))
+      );
+      allow list: if isSignedIn() && (
+        request.auth.uid in resource.data.professorIds ||
+        isBootstrapAdmin()
+      );
+      allow create: if isVerified() && isValidId(categoryId) && isValidGradingCategory(incoming()) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        (isAdmin() || isCourseProfessor(incoming().courseId)) &&
+        existsAfter(/databases/$(database)/documents/courses/$(incoming().courseId));
+      allow update: if isValidGradingCategory(incoming()) && isVerified() && isValidId(categoryId) &&
+        incoming().courseId == existing().courseId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().isSeed == existing().isSeed &&
+        incoming().updatedAt == request.time &&
+        (isAdmin() || isCourseProfessor(existing().courseId)) &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'name', 'maxPoints', 'order', 'professorIds', 'updatedAt'
+        ]);
+      allow delete: if isVerified() && isValidId(categoryId) && (
+        isAdmin() || (resource != null && request.auth.uid in resource.data.professorIds)
+      );
+    }
+
+    match /gradingItems/{itemId} {
+      allow get: if isSignedIn() && isValidId(itemId) && (
+        isAdmin() ||
+        (resource != null && (
+          request.auth.uid in resource.data.professorIds ||
+          isEnrolledStudent(resource.data.courseId)
+        ))
+      );
+      allow list: if isSignedIn() && (
+        request.auth.uid in resource.data.professorIds ||
+        isBootstrapAdmin()
+      );
+      allow create: if isVerified() && isValidId(itemId) && isValidGradingItem(incoming()) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        (isAdmin() || isCourseProfessor(incoming().courseId)) &&
+        existsAfter(/databases/$(database)/documents/courses/$(incoming().courseId)) &&
+        existsAfter(/databases/$(database)/documents/gradingCategories/$(incoming().categoryId));
+      allow update: if isValidGradingItem(incoming()) && isVerified() && isValidId(itemId) &&
+        incoming().courseId == existing().courseId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().isSeed == existing().isSeed &&
+        incoming().updatedAt == request.time &&
+        (isAdmin() || isCourseProfessor(existing().courseId)) &&
+        exists(/databases/$(database)/documents/gradingCategories/$(incoming().categoryId)) &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'categoryId', 'name', 'maxPoints', 'date', 'description', 'order', 'professorIds', 'updatedAt'
+        ]);
+      allow delete: if isVerified() && isValidId(itemId) && (
+        isAdmin() || (resource != null && request.auth.uid in resource.data.professorIds)
+      );
+    }
+
+    match /scores/{scoreId} {
+      allow get: if isSignedIn() && isValidId(scoreId) && (
+        isAdmin() ||
+        (resource != null && (
+          resource.data.studentId == request.auth.uid ||
+          request.auth.uid in resource.data.professorIds
+        ))
+      );
+      allow list: if isSignedIn() && (
+        resource.data.studentId == request.auth.uid ||
+        request.auth.uid in resource.data.professorIds ||
+        isBootstrapAdmin()
+      );
+      allow create: if isVerified() && isValidId(scoreId) && isValidScore(incoming()) &&
+        scoreId == incoming().itemId + '_' + incoming().studentId &&
+        incoming().gradedBy == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        (isAdmin() || isCourseProfessor(incoming().courseId)) &&
+        isValidScoreWithinMax(incoming());
+      allow update: if isValidScore(incoming()) && isVerified() && isValidId(scoreId) &&
+        incoming().courseId == existing().courseId &&
+        incoming().categoryId == existing().categoryId &&
+        incoming().itemId == existing().itemId &&
+        incoming().studentId == existing().studentId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().isSeed == existing().isSeed &&
+        incoming().gradedBy == request.auth.uid &&
+        incoming().updatedAt == request.time &&
+        (isAdmin() || isCourseProfessor(existing().courseId)) &&
+        isValidScoreWithinMax(incoming()) &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'points', 'feedback', 'gradedBy', 'professorIds', 'updatedAt'
+        ]);
+      allow delete: if isVerified() && isValidId(scoreId) && (
+        isAdmin() || (resource != null && request.auth.uid in resource.data.professorIds)
+      );
+    }
+
+    match /attendanceSessions/{sessionId} {
+      allow get: if isSignedIn() && isValidId(sessionId) && (
+        isAdmin() ||
+        (resource != null && (
+          request.auth.uid in resource.data.professorIds ||
+          isEnrolledStudent(resource.data.courseId)
+        ))
+      );
+      allow list: if isSignedIn() && (
+        request.auth.uid in resource.data.professorIds ||
+        isBootstrapAdmin()
+      );
+      allow create: if isVerified() && isValidId(sessionId) && isValidAttendanceSession(incoming()) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        (isAdmin() || isCourseProfessor(incoming().courseId)) &&
+        existsAfter(/databases/$(database)/documents/courses/$(incoming().courseId));
+      allow update: if isValidAttendanceSession(incoming()) && isVerified() && isValidId(sessionId) &&
+        incoming().courseId == existing().courseId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().isSeed == existing().isSeed &&
+        incoming().updatedAt == request.time &&
+        (isAdmin() || isCourseProfessor(existing().courseId)) &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'date', 'time', 'topic', 'isCancelled', 'professorIds', 'updatedAt'
+        ]);
+      allow delete: if isVerified() && isValidId(sessionId) && (
+        isAdmin() || (resource != null && request.auth.uid in resource.data.professorIds)
+      );
+    }
+
+    match /attendanceRecords/{recordId} {
+      allow get: if isSignedIn() && isValidId(recordId) && (
+        isAdmin() ||
+        (resource != null && (
+          resource.data.studentId == request.auth.uid ||
+          request.auth.uid in resource.data.professorIds
+        ))
+      );
+      allow list: if isSignedIn() && (
+        resource.data.studentId == request.auth.uid ||
+        request.auth.uid in resource.data.professorIds ||
+        isBootstrapAdmin()
+      );
+      allow create: if isVerified() && isValidId(recordId) && isValidAttendanceRecord(incoming()) &&
+        recordId == incoming().sessionId + '_' + incoming().studentId &&
+        incoming().markedBy == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        (isAdmin() || isCourseProfessor(incoming().courseId)) &&
+        existsAfter(/databases/$(database)/documents/attendanceSessions/$(incoming().sessionId));
+      allow update: if isValidAttendanceRecord(incoming()) && isVerified() && isValidId(recordId) &&
+        incoming().courseId == existing().courseId &&
+        incoming().sessionId == existing().sessionId &&
+        incoming().studentId == existing().studentId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().isSeed == existing().isSeed &&
+        incoming().markedBy == request.auth.uid &&
+        incoming().updatedAt == request.time &&
+        (isAdmin() || isCourseProfessor(existing().courseId)) &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'present', 'note', 'markedBy', 'professorIds', 'updatedAt'
+        ]);
+      allow delete: if isVerified() && isValidId(recordId) && (
+        isAdmin() || (resource != null && request.auth.uid in resource.data.professorIds)
+      );
+    }
+
+    match /finalGrades/{gradeId} {
+      allow get: if isSignedIn() && isValidId(gradeId) && (
+        isAdmin() ||
+        (resource != null && (
+          resource.data.studentId == request.auth.uid ||
+          request.auth.uid in resource.data.professorIds
+        ))
+      );
+      allow list: if isSignedIn() && (
+        resource.data.studentId == request.auth.uid ||
+        request.auth.uid in resource.data.professorIds ||
+        isBootstrapAdmin()
+      );
+      allow create: if isVerified() && isValidId(gradeId) && isValidFinalGrade(incoming()) &&
+        gradeId == incoming().courseId + '_' + incoming().studentId &&
+        incoming().finalizedBy == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        (isAdmin() || isCourseProfessor(incoming().courseId)) &&
+        exists(/databases/$(database)/documents/enrollments/$(gradeId));
+      allow update: if isValidFinalGrade(incoming()) && isVerified() && isValidId(gradeId) &&
+        incoming().courseId == existing().courseId &&
+        incoming().studentId == existing().studentId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().isSeed == existing().isSeed &&
+        incoming().finalizedBy == request.auth.uid &&
+        incoming().updatedAt == request.time &&
+        (existing().status != 'finalized' || isAdmin()) &&
+        (isAdmin() || isCourseProfessor(existing().courseId)) &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'totalPoints', 'finalGrade', 'status', 'finalizedBy', 'comment', 'professorIds', 'updatedAt'
+        ]);
+      allow delete: if isVerified() && isValidId(gradeId) && (
+        isAdmin() || (resource != null && request.auth.uid in resource.data.professorIds)
+      );
+    }
+  }
+}
