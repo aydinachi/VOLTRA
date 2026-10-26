@@ -78,6 +78,7 @@ import { AttendanceManagerView } from './AttendanceManagerView';
 import { CourseSettingsView } from './CourseSettingsView';
 import { ExamManagerView } from './ExamManagerView';
 import { GradebookView } from './GradebookView';
+import { ProfessorCourseSelector } from './ProfessorCourseSelector';
 
 interface ProfessorPortalProps {
   activeNav: ProfessorNavKey;
@@ -217,11 +218,6 @@ export function ProfessorPortal({ activeNav, onNavigate }: ProfessorPortalProps)
     () => courses.filter((c) => Boolean(c.isArchived)),
     [courses]
   );
-
-  const switcherCourses = useMemo(() => {
-    if (showArchivedOnHome) return archivedCourses.length > 0 ? archivedCourses : courses;
-    return activeSemesterCourses.length > 0 ? activeSemesterCourses : courses;
-  }, [showArchivedOnHome, archivedCourses, activeSemesterCourses, courses]);
 
   const activeCourse = courses.find((c) => c.id === selectedCourseId) || null;
 
@@ -662,144 +658,30 @@ export function ProfessorPortal({ activeNav, onNavigate }: ProfessorPortalProps)
     );
   }
 
-  // 1-Click Horizontal Course Switcher Bar across Professor Workspaces
-  const activeCourseHeaderBar = (
-    <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
-      <div className="px-3 py-2.5 flex items-center justify-between gap-3 overflow-x-auto">
-        <div className="flex items-center gap-1.5">
-          {switcherCourses.map((c) => {
-            const isSel = c.id === selectedCourseId;
-            return (
-              <button
-                key={c.id}
-                type="button"
-                onClick={() => setSelectedCourseId(c.id)}
-                className={cn(
-                  'px-3.5 py-2 rounded-lg text-left transition-colors cursor-pointer shrink-0 flex items-center gap-2 whitespace-nowrap',
-                  isSel
-                    ? 'bg-slate-900 text-white'
-                    : 'text-slate-700 hover:bg-slate-100'
-                )}
-              >
-                <span
-                  className={cn(
-                    'font-mono text-xs font-semibold',
-                    isSel ? 'text-blue-300' : 'text-blue-700'
-                  )}
-                >
-                  {c.code}
-                </span>
-                <span className="text-sm font-semibold">{c.name}</span>
-              </button>
-            );
-          })}
-        </div>
-
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={() => setNewCourseOpen(true)}
-          className="shrink-0"
-        >
-          <Plus className="w-3.5 h-3.5" />
-          Novi predmet
-        </Button>
-      </div>
-
-      {activeCourse && (
-        <div className="px-4 py-2.5 bg-slate-50/70 border-t border-slate-100 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-600">
-          <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-            {activeCourse.isArchived && (
-              <>
-                <span className="font-semibold text-amber-700">
-                  Arhiviran ({activeCourse.academicYear})
-                </span>
-                <span aria-hidden="true" className="text-slate-300">·</span>
-              </>
-            )}
-            {activeCourse.studyProgram && (
-              <>
-                <span className="font-medium text-blue-700">{activeCourse.studyProgram}</span>
-                <span aria-hidden="true" className="text-slate-300">·</span>
-              </>
-            )}
-            <span>
-              {getCourseProfessors(activeCourse).length > 1 ? 'Profesori: ' : 'Profesor: '}
-              <strong className="font-medium text-slate-900">
-                {formatCourseProfessors(activeCourse)}
-              </strong>
-            </span>
-            <span aria-hidden="true" className="text-slate-300">·</span>
-            <span>
-              Asistenti:{' '}
-              {getCourseAssistants(activeCourse).length > 0 ? (
-                <strong className="font-medium text-slate-800">
-                  {formatCourseAssistants(activeCourse)}
-                </strong>
-              ) : (
-                <button
-                  type="button"
-                  onClick={() => onNavigate('postavke')}
-                  className="text-blue-700 hover:underline cursor-pointer"
-                >
-                  + Dodaj asistente
-                </button>
-              )}
-            </span>
-            <span aria-hidden="true" className="text-slate-300">·</span>
-            <span className="font-mono tabular-nums">{activeCourse.ects} ECTS</span>
-            <span aria-hidden="true" className="text-slate-300">·</span>
-            <span>
-              Studenti:{' '}
-              <strong className="font-mono text-slate-900 tabular-nums">
-                {enrollments.length}
-              </strong>
-            </span>
-          </div>
-
-          <div className="flex items-center gap-4">
-            <button
-              type="button"
-              onClick={() => onNavigate('raspored')}
-              className="font-medium text-slate-600 hover:text-slate-900 hover:underline cursor-pointer whitespace-nowrap"
-            >
-              Raspored
-            </button>
-            <button
-              type="button"
-              onClick={() => onNavigate('ispiti')}
-              className={cn(
-                'font-medium hover:underline cursor-pointer whitespace-nowrap tabular-nums',
-                activeNav === 'ispiti' ? 'text-slate-900' : 'text-blue-700'
-              )}
-            >
-              Ispitni rokovi ({activeCourseTerms.length})
-            </button>
-            <button
-              type="button"
-              onClick={() => onNavigate('bodovi')}
-              className={cn(
-                'font-medium hover:underline cursor-pointer whitespace-nowrap',
-                activeNav === 'bodovi' ? 'text-slate-900' : 'text-slate-600 hover:text-slate-900'
-              )}
-            >
-              Unos bodova
-            </button>
-            <button
-              type="button"
-              onClick={() => onNavigate('postavke')}
-              className={cn(
-                'font-medium hover:underline cursor-pointer whitespace-nowrap',
-                activeNav === 'postavke' ? 'text-slate-900' : 'text-slate-600 hover:text-slate-900'
-              )}
-            >
-              Osoblje i postavke
-            </button>
-          </div>
-        </div>
-      )}
-    </div>
-  );
+  const activeCourseHeaderBar = activeCourse ? (
+    <ProfessorCourseSelector
+      activeCourse={activeCourse}
+      activeSemesterCourses={activeSemesterCourses}
+      archivedCourses={archivedCourses}
+      showArchived={showArchivedOnHome}
+      onToggleArchived={(nextShowArchived) => {
+        setShowArchivedOnHome(nextShowArchived);
+        if (nextShowArchived && archivedCourses[0]) {
+          setSelectedCourseId(archivedCourses[0].id);
+        } else if (!nextShowArchived && activeSemesterCourses[0]) {
+          setSelectedCourseId(activeSemesterCourses[0].id);
+        }
+      }}
+      selectedCourseId={selectedCourseId}
+      onSelectCourse={setSelectedCourseId}
+      onOpenNewCourse={() => setNewCourseOpen(true)}
+      activeNav={activeNav}
+      onNavigate={onNavigate}
+      enrolledCount={enrollments.length}
+      termsCount={activeCourseTerms.length}
+      sessionsCount={sessions.length}
+    />
+  ) : null;
 
   // =========================================================================
   // VIEW: POČETNA — PREDMETI I BRZI PREGLED
@@ -855,7 +737,7 @@ export function ProfessorPortal({ activeNav, onNavigate }: ProfessorPortalProps)
               />
             </div>
 
-            <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-lg overflow-x-auto max-w-full">
+            <div className="flex flex-wrap items-center gap-1 p-1 bg-slate-100 rounded-lg">
               {(
                 [
                   { key: 'all', label: `Svi programi (${cycleCounts.all})` },
@@ -1290,7 +1172,7 @@ export function ProfessorPortal({ activeNav, onNavigate }: ProfessorPortalProps)
             />
           </div>
 
-          <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-lg text-xs">
+          <div className="flex flex-wrap items-center gap-1 p-1 bg-slate-100 rounded-lg text-xs">
             {[
               { k: 'all', label: 'Svi' },
               { k: 'passed', label: 'Ostvarili prag' },
