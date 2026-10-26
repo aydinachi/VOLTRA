@@ -30,11 +30,28 @@ describe('Firestore Security Rules — Structural & Dirty Dozen Verification', (
 
     // Extract every allow list statement and verify get()/exists() are absent
     const listMatches = rulesContent.match(/allow\s+list\s*:[^;]+;/g) || [];
-    expect(listMatches.length).toBeGreaterThanOrEqual(13);
+    expect(listMatches.length).toBeGreaterThanOrEqual(19);
     for (const listRule of listMatches) {
       expect(listRule).not.toContain('get(');
       expect(listRule).not.toContain('exists(');
     }
+    expect(rulesContent).toContain('match /examTerms/{termId}');
+    expect(rulesContent).toContain('match /examRegistrations/{registrationId}');
+    expect(rulesContent).toContain('match /provisionedAccounts/{provId}');
+    expect(rulesContent).toContain('match /announcements/{announcementId}');
+    expect(rulesContent).toContain('match /scheduleEvents/{eventId}');
+    expect(rulesContent).toContain('match /academicState/{stateId}');
+    expect(rulesContent).toContain('isValidBoundedStringList');
+    expect(rulesContent).toContain('isValidNotificationPrefs');
+    expect(rulesContent).toContain('professorNames');
+    expect(rulesContent).toContain('assistantNames');
+    expect(rulesContent).toContain('studyTrack');
+    expect(rulesContent).toContain('studyProgram');
+    expect(rulesContent).toContain('isArchived');
+    // Verify student update allowlist only permits personalNote, notificationPrefs, updatedAt
+    expect(rulesContent).toMatch(
+      /existing\(\)\.role == 'student'[\s\S]*?affectedKeys\(\)\.hasOnly\(\[\s*'personalNote',\s*'notificationPrefs',\s*'updatedAt'\s*\]\)/
+    );
   });
 
   describe.runIf(hasEmulator)('Live Emulator Dirty Dozen Payloads', () => {
@@ -43,7 +60,7 @@ describe('Firestore Security Rules — Structural & Dirty Dozen Verification', (
     beforeAll(async () => {
       const [host, portStr] = (process.env.FIRESTORE_EMULATOR_HOST || '127.0.0.1:8080').split(':');
       testEnv = await initializeTestEnvironment({
-        projectId: 'zamio-security-test',
+        projectId: 'voltra-security-test',
         firestore: {
           rules: rulesContent,
           host,
@@ -87,6 +104,7 @@ describe('Firestore Security Rules — Structural & Dirty Dozen Verification', (
           categoryIds: ['cat_ar_1'],
           itemIds: ['item_ar1'],
           sessionIds: [],
+          examTermIds: ['term_locked'],
           attendanceEnabled: true,
           attendanceMaxPoints: 10,
           allowBonusPoints: false,
@@ -95,6 +113,25 @@ describe('Firestore Security Rules — Structural & Dirty Dozen Verification', (
           grade8Threshold: 75,
           grade9Threshold: 85,
           grade10Threshold: 95,
+          isSeed: false,
+          createdAt: now,
+          updatedAt: now,
+        });
+
+        await setDoc(doc(db, 'examTerms', 'term_locked'), {
+          courseId: 'crs_ar',
+          courseCode: 'OR-AR',
+          courseName: 'Arhitektura računara',
+          title: 'II parcijalni ispit',
+          examDate: '2026-11-28',
+          examTime: '10:00',
+          classroom: 'A1',
+          registrationOpenDate: '2026-11-10',
+          registrationCloseDate: '2026-11-24',
+          notes: '',
+          isOpen: false,
+          createdBy: 'prof_1',
+          professorIds: ['prof_1'],
           isSeed: false,
           createdAt: now,
           updatedAt: now,
@@ -369,8 +406,8 @@ describe('Firestore Security Rules — Structural & Dirty Dozen Verification', (
       );
     });
 
-    it('12. Rejects forged client timestamp and poisoned document ID', async () => {
-      const db = testEnv
+    it('12. Rejects forged client timestamp, poisoned ID, and registering for a locked exam term', async () => {
+      const profDb = testEnv
         .authenticatedContext('prof_1', {
           email: 'prof@etf.unsa.ba',
           email_verified: true,
@@ -378,7 +415,7 @@ describe('Firestore Security Rules — Structural & Dirty Dozen Verification', (
         .firestore();
 
       await assertFails(
-        setDoc(doc(db, 'attendanceSessions', 'ses_forged'), {
+        setDoc(doc(profDb, 'attendanceSessions', 'ses_forged'), {
           courseId: 'crs_ar',
           date: '2026-10-22',
           time: '10:00',
@@ -392,13 +429,99 @@ describe('Firestore Security Rules — Structural & Dirty Dozen Verification', (
       );
 
       await assertFails(
-        setDoc(doc(db, 'attendanceSessions', 'bad$id!'), {
+        setDoc(doc(profDb, 'attendanceSessions', 'bad$id!'), {
           courseId: 'crs_ar',
           date: '2026-10-22',
           time: '10:00',
           topic: 'Bad ID',
           isCancelled: false,
           professorIds: ['prof_1'],
+          isSeed: false,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        })
+      );
+
+      const stuDb = testEnv
+        .authenticatedContext('stu_1', {
+          email: 'stu1@etf.unsa.ba',
+          email_verified: true,
+        })
+        .firestore();
+
+      await assertFails(
+        setDoc(doc(stuDb, 'examRegistrations', 'term_locked_stu_1'), {
+          termId: 'term_locked',
+          courseId: 'crs_ar',
+          courseCode: 'OR-AR',
+          courseName: 'Arhitektura računara',
+          termTitle: 'II parcijalni ispit',
+          examDate: '2026-11-28',
+          studentId: 'stu_1',
+          studentName: 'Haris Begović',
+          studentIndex: '18942',
+          studentDepartment: 'RI',
+          status: 'registered',
+          professorIds: ['prof_1'],
+          isSeed: false,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        })
+      );
+    });
+
+    it('13. Rejects student modifying locked faculty fields (studentIndex / studyTrack) and non-admin publishing announcements', async () => {
+      await testEnv.withSecurityRulesDisabled(async (ctx) => {
+        const now = Timestamp.now();
+        await setDoc(doc(ctx.firestore(), 'userProfiles', 'stu_1'), {
+          uid: 'stu_1',
+          fullName: 'Haris Begović',
+          studentIndex: '18942',
+          department: 'Računarstvo i informatika',
+          role: 'student',
+          academicYear: '2026/2027',
+          redeemedInviteId: '',
+          studyYear: 'II godina · I ciklus (Bachelor)',
+          studyTrack: 'Bachelor · Računarstvo i informatika',
+          isSeed: false,
+          createdAt: now,
+          updatedAt: now,
+        });
+      });
+
+      const stuDb = testEnv
+        .authenticatedContext('stu_1', {
+          email: 'stu1@etf.unsa.ba',
+          email_verified: true,
+        })
+        .firestore();
+
+      await assertFails(
+        updateDoc(doc(stuDb, 'userProfiles', 'stu_1'), {
+          studentIndex: '99999',
+          studyTrack: 'Master · Računarstvo i informatika',
+          updatedAt: serverTimestamp(),
+        })
+      );
+
+      const profDb = testEnv
+        .authenticatedContext('prof_1', {
+          email: 'prof@etf.unsa.ba',
+          email_verified: true,
+        })
+        .firestore();
+
+      await assertFails(
+        setDoc(doc(profDb, 'announcements', 'ann_illegal'), {
+          title: 'Neovlaštena objava',
+          body: 'Profesor ne smije objaviti administratorsko obavještenje.',
+          category: 'opste',
+          audience: 'all',
+          pinned: false,
+          isPublished: true,
+          authorUid: 'prof_1',
+          authorName: 'Prof. Samir Ribić',
+          academicYear: '2026/2027',
           isSeed: false,
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),

@@ -2,7 +2,9 @@ import React, { useEffect, useMemo, useState } from 'react';
 import {
   Award,
   BookOpen,
+  Calendar,
   CalendarCheck,
+  CalendarCheck2,
   CheckCircle2,
   ClipboardList,
   Download,
@@ -18,34 +20,62 @@ import { useAuth } from '../../context/AuthContext';
 import {
   calculateCourseStudentSummary,
   CourseStudentSummary,
+  getTodayIsoLocal,
 } from '../../lib/calculations';
-import { cn, downloadCsv, formatPoints } from '../../lib/utils';
+import {
+  getCourseProgramCycle,
+  getSemesterPresetsForProgram,
+  STRUCNI_RS_PROGRAM,
+  STUDY_PROGRAM_GROUPS,
+  StudyCycleKey,
+} from '../../lib/programs';
+import {
+  cn,
+  downloadCsv,
+  formatBosnianDate,
+  formatCourseAssistants,
+  formatCourseProfessors,
+  formatPoints,
+  getCourseAssistants,
+  getCourseProfessors,
+} from '../../lib/utils';
 import {
   createCourse,
   enrollStudentByIndex,
   removeEnrollment,
   saveFinalGradeRecord,
+  subscribeAcademicState,
+  subscribeProfessorAllExamData,
   subscribeProfessorCourseData,
   subscribeProfessorCourses,
+  subscribeProfessorScheduleEvents,
 } from '../../services/zamioService';
 import {
+  AcademicState,
   AttendanceRecord,
   AttendanceSession,
   Course,
   Enrollment,
+  ExamRegistration,
+  ExamRegistrationStatus,
+  ExamTerm,
   FinalGrade,
   FinalGradeStatus,
   GradingCategory,
   GradingItem,
+  ScheduleEvent,
   Score,
 } from '../../types/zamio';
+import { AnnouncementsView } from '../AnnouncementsView';
 import { ProfessorNavKey } from '../AppShell';
 import { ProfileView } from '../ProfileView';
+import { ScheduleView } from '../ScheduleView';
 import { Button } from '../ui/button';
 import { Dialog } from '../ui/dialog';
 import { Input, Label } from '../ui/input';
 import { AttendanceManagerView } from './AttendanceManagerView';
 import { CourseSettingsView } from './CourseSettingsView';
+import { ExamManagerView } from './ExamManagerView';
 import { GradebookView } from './GradebookView';
 
 interface ProfessorPortalProps {
@@ -60,6 +90,13 @@ export function ProfessorPortal({ activeNav, onNavigate }: ProfessorPortalProps)
   const [courses, setCourses] = useState<Course[]>([]);
   const [loadingCourses, setLoadingCourses] = useState(true);
   const [selectedCourseId, setSelectedCourseId] = useState<string>('');
+  const [academicState, setAcademicState] = useState<AcademicState | null>(null);
+  const [showArchivedOnHome, setShowArchivedOnHome] = useState(false);
+
+  // Exam terms, registrations & schedule events across all professor's courses
+  const [examTerms, setExamTerms] = useState<ExamTerm[]>([]);
+  const [examRegistrations, setExamRegistrations] = useState<ExamRegistration[]>([]);
+  const [scheduleEvents, setScheduleEvents] = useState<ScheduleEvent[]>([]);
 
   // Active course relational collections
   const [enrollments, setEnrollments] = useState<Enrollment[]>([]);
@@ -72,16 +109,24 @@ export function ProfessorPortal({ activeNav, onNavigate }: ProfessorPortalProps)
 
   // Search, Filter & Sort on Student List / Course List
   const [courseSearch, setCourseSearch] = useState('');
+  const [programFilter, setProgramFilter] = useState<StudyCycleKey>('all');
   const [studentSearch, setStudentSearch] = useState('');
-  const [studentFilter, setStudentFilter] = useState<'all' | 'passed' | 'below' | 'finalized'>('all');
-  const [studentSort, setStudentSort] = useState<'name' | 'index' | 'total' | 'attendance'>('total');
+  const [studentFilter, setStudentFilter] = useState<'all' | 'passed' | 'below' | 'finalized'>(
+    'all'
+  );
+  const [studentSort, setStudentSort] = useState<'name' | 'index' | 'total' | 'attendance'>(
+    'total'
+  );
 
   // Create Course Modal
   const [newCourseOpen, setNewCourseOpen] = useState(false);
+  const [newStudyProgram, setNewStudyProgram] = useState('Bachelor · Računarstvo i informatika');
   const [newCode, setNewCode] = useState('');
   const [newName, setNewName] = useState('');
   const [newSemester, setNewSemester] = useState('Zimski semestar · II godina');
   const [newEcts, setNewEcts] = useState('6');
+  const [newCoProfessors, setNewCoProfessors] = useState('');
+  const [newAssistants, setNewAssistants] = useState('');
   const [newAttEnabled, setNewAttEnabled] = useState(true);
   const [newAttMax, setNewAttMax] = useState('10');
   const [creatingCourse, setCreatingCourse] = useState(false);
@@ -107,16 +152,32 @@ export function ProfessorPortal({ activeNav, onNavigate }: ProfessorPortalProps)
   useEffect(() => {
     if (!professorUid) return;
     setLoadingCourses(true);
-    const unsub = subscribeProfessorCourses(professorUid, (list) => {
+
+    const unsubCourses = subscribeProfessorCourses(professorUid, (list) => {
       const sorted = [...list].sort((a, b) => a.name.localeCompare(b.name, 'bs'));
       setCourses(sorted);
       setSelectedCourseId((prev) => {
         if (prev && sorted.some((c) => c.id === prev)) return prev;
-        return sorted[0]?.id || '';
+        const firstActive = sorted.find((c) => !c.isArchived);
+        return firstActive?.id || sorted[0]?.id || '';
       });
       setLoadingCourses(false);
     });
-    return () => unsub();
+
+    const unsubExams = subscribeProfessorAllExamData(professorUid, {
+      onExamTerms: setExamTerms,
+      onExamRegistrations: setExamRegistrations,
+    });
+
+    const unsubSchedule = subscribeProfessorScheduleEvents(professorUid, setScheduleEvents);
+    const unsubAcademic = subscribeAcademicState(setAcademicState);
+
+    return () => {
+      unsubCourses();
+      unsubExams();
+      unsubSchedule();
+      unsubAcademic();
+    };
   }, [professorUid]);
 
   useEffect(() => {
@@ -143,6 +204,20 @@ export function ProfessorPortal({ activeNav, onNavigate }: ProfessorPortalProps)
 
     return () => unsub();
   }, [professorUid, selectedCourseId]);
+
+  const activeSemesterCourses = useMemo(
+    () => courses.filter((c) => !c.isArchived),
+    [courses]
+  );
+  const archivedCourses = useMemo(
+    () => courses.filter((c) => Boolean(c.isArchived)),
+    [courses]
+  );
+
+  const switcherCourses = useMemo(() => {
+    if (showArchivedOnHome) return archivedCourses.length > 0 ? archivedCourses : courses;
+    return activeSemesterCourses.length > 0 ? activeSemesterCourses : courses;
+  }, [showArchivedOnHome, archivedCourses, activeSemesterCourses, courses]);
 
   const activeCourse = courses.find((c) => c.id === selectedCourseId) || null;
 
@@ -174,8 +249,29 @@ export function ProfessorPortal({ activeNav, onNavigate }: ProfessorPortalProps)
     finalGrades,
   ]);
 
+  const activeCourseTerms = useMemo(() => {
+    if (!activeCourse) return [];
+    return examTerms
+      .filter((t) => t.courseId === activeCourse.id)
+      .sort((a, b) => a.examDate.localeCompare(b.examDate));
+  }, [examTerms, activeCourse]);
+
+  const nearestUpcomingTermInfo = useMemo(() => {
+    if (activeCourseTerms.length === 0) return null;
+    const today = getTodayIsoLocal();
+    const term = activeCourseTerms.find((t) => t.examDate >= today) || activeCourseTerms[0];
+    const registeredCount = examRegistrations.filter(
+      (r) => r.termId === term.id && r.status === ExamRegistrationStatus.REGISTERED
+    ).length;
+    return { term, registeredCount };
+  }, [activeCourseTerms, examRegistrations]);
+
   if (activeNav === 'profil') {
     return <ProfileView />;
+  }
+
+  if (activeNav === 'obavjestenja') {
+    return <AnnouncementsView viewerMode="professor" canManage={false} />;
   }
 
   const handleCreateCourse = async (e: React.FormEvent) => {
@@ -183,21 +279,41 @@ export function ProfessorPortal({ activeNav, onNavigate }: ProfessorPortalProps)
     if (!profile) return;
     setCreatingCourse(true);
     try {
+      const titlePrefix = profile.academicTitle?.trim() || 'dr.';
+      const leadFormatted = profile.fullName.toLowerCase().startsWith(titlePrefix.toLowerCase())
+        ? profile.fullName
+        : `${titlePrefix} ${profile.fullName}`;
+
+      const extraProfessors = newCoProfessors
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+      const parsedAssistants = newAssistants
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+
       const id = await createCourse({
         professorUid: profile.uid,
-        professorName: `dr. ${profile.fullName}`,
+        professorName: leadFormatted,
+        professorNames: [leadFormatted, ...extraProfessors],
+        assistantNames: parsedAssistants,
+        studyProgram: newStudyProgram,
         code: newCode,
         name: newName,
         semester: newSemester,
-        academicYear: profile.academicYear || '2026/2027',
+        academicYear: academicState?.activeAcademicYear || profile.academicYear || '2026/2027',
         ects: Number(newEcts),
         attendanceEnabled: newAttEnabled,
         attendanceMaxPoints: newAttEnabled ? Number(newAttMax) : 0,
       });
+      setShowArchivedOnHome(false);
       setSelectedCourseId(id);
       setNewCourseOpen(false);
       setNewCode('');
       setNewName('');
+      setNewCoProfessors('');
+      setNewAssistants('');
       toast.success('Novi predmet je uspješno kreiran.');
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Greška pri kreiranju predmeta.');
@@ -241,9 +357,7 @@ export function ProfessorPortal({ activeNav, onNavigate }: ProfessorPortalProps)
 
   const openFinalizeModal = (enrollment: Enrollment, summary: CourseStudentSummary) => {
     const existing = summary.officialFinalGrade;
-    const defaultGrade = existing
-      ? existing.finalGrade
-      : summary.suggestedGrade ?? 6;
+    const defaultGrade = existing ? existing.finalGrade : summary.suggestedGrade ?? 6;
     setGradeModalStudent({ enrollment, summary });
     setGradeValueInput(String(defaultGrade));
     setGradeStatusInput(existing ? existing.status : FinalGradeStatus.FINALIZED);
@@ -321,14 +435,166 @@ export function ProfessorPortal({ activeNav, onNavigate }: ProfessorPortalProps)
         ];
       });
 
-    downloadCsv(`Zamio_${activeCourse.code}_Ocjene.csv`, headers, rows);
+    downloadCsv(`VOLTRA_${activeCourse.code}_Ocjene.csv`, headers, rows);
     toast.success('CSV izvještaj ocjena je preuzet.');
   };
+
+  const createCourseDialog = (
+    <Dialog
+      open={newCourseOpen}
+      onOpenChange={setNewCourseOpen}
+      title="Kreiraj novi predmet"
+      description="Odaberite studijski program (Stručni studij Razvoj softvera 2 god., Bachelor ili jedan od 4 Master smjera) i unesite podatke o predmetu."
+    >
+      <form onSubmit={handleCreateCourse} className="space-y-4 text-left">
+        <div>
+          <Label htmlFor="crs-prog">Studijski program / Smjer</Label>
+          <select
+            id="crs-prog"
+            value={newStudyProgram}
+            onChange={(e) => {
+              const nextProg = e.target.value;
+              setNewStudyProgram(nextProg);
+              const presets = getSemesterPresetsForProgram(nextProg);
+              if (presets.length > 0) {
+                setNewSemester(presets[0].value);
+              }
+            }}
+            className="flex h-9 w-full rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-600"
+          >
+            {STUDY_PROGRAM_GROUPS.map((grp) => (
+              <optgroup key={grp.groupLabel} label={grp.groupLabel}>
+                {grp.options.map((opt) => (
+                  <option key={opt.value} value={opt.value}>
+                    {opt.label}
+                  </option>
+                ))}
+              </optgroup>
+            ))}
+          </select>
+        </div>
+
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <Label htmlFor="crs-c">Šifra predmeta</Label>
+            <Input
+              id="crs-c"
+              value={newCode}
+              onChange={(e) => setNewCode(e.target.value)}
+              placeholder={newStudyProgram === STRUCNI_RS_PROGRAM ? 'RS-RMW' : 'RI-BP'}
+              className="font-mono"
+              required
+            />
+          </div>
+          <div>
+            <Label htmlFor="crs-e">ECTS bodovi</Label>
+            <Input
+              id="crs-e"
+              type="number"
+              min="1"
+              max="30"
+              value={newEcts}
+              onChange={(e) => setNewEcts(e.target.value)}
+              className="font-mono tabular-nums"
+              required
+            />
+          </div>
+        </div>
+        <div>
+          <Label htmlFor="crs-n">Naziv predmeta</Label>
+          <Input
+            id="crs-n"
+            value={newName}
+            onChange={(e) => setNewName(e.target.value)}
+            placeholder={
+              newStudyProgram === STRUCNI_RS_PROGRAM
+                ? 'Razvoj modernih web aplikacija'
+                : 'Baze podataka'
+            }
+            required
+          />
+        </div>
+        <div>
+          <Label htmlFor="crs-s">Semestar i godina studija</Label>
+          <Input
+            id="crs-s"
+            value={newSemester}
+            onChange={(e) => setNewSemester(e.target.value)}
+            maxLength={80}
+            required
+          />
+          <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+            {getSemesterPresetsForProgram(newStudyProgram).map((preset) => (
+              <button
+                key={preset.value}
+                type="button"
+                onClick={() => setNewSemester(preset.value)}
+                className={cn(
+                  'px-2 py-1 rounded-md text-[11px] font-medium transition-colors cursor-pointer whitespace-nowrap',
+                  newSemester === preset.value
+                    ? 'bg-slate-900 text-white'
+                    : 'bg-slate-100 text-slate-600 hover:text-slate-900 hover:bg-slate-200/70'
+                )}
+              >
+                {preset.short}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div>
+          <Label htmlFor="crs-coprofs">Dodatni profesori na predmetu (opciono, odvojeno zarezom)</Label>
+          <Input
+            id="crs-coprofs"
+            value={newCoProfessors}
+            onChange={(e) => setNewCoProfessors(e.target.value)}
+            placeholder="npr. vanr. prof. dr. Dženana Đonko"
+          />
+        </div>
+        <div>
+          <Label htmlFor="crs-asst">Asistenti na predmetu (opciono, odvojeno zarezom)</Label>
+          <Input
+            id="crs-asst"
+            value={newAssistants}
+            onChange={(e) => setNewAssistants(e.target.value)}
+            placeholder="npr. mr. Haris Šupić, dipl. el. ing. Maja Kovač"
+          />
+        </div>
+        <div className="flex items-center justify-between gap-3 pt-1">
+          <label className="flex items-center gap-2 text-xs text-slate-700 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={newAttEnabled}
+              onChange={(e) => setNewAttEnabled(e.target.checked)}
+            />
+            <span>Uključi bodovanje prisustva (podrazumijevano 10 b)</span>
+          </label>
+          {newAttEnabled && (
+            <Input
+              type="number"
+              min="0"
+              max="100"
+              value={newAttMax}
+              onChange={(e) => setNewAttMax(e.target.value)}
+              className="w-20 h-8 font-mono text-right tabular-nums"
+            />
+          )}
+        </div>
+        <div className="flex justify-end gap-2 pt-2">
+          <Button variant="outline" onClick={() => setNewCourseOpen(false)}>
+            Odustani
+          </Button>
+          <Button type="submit" disabled={creatingCourse}>
+            {creatingCourse ? 'Kreiranje...' : 'Kreiraj predmet'}
+          </Button>
+        </div>
+      </form>
+    </Dialog>
+  );
 
   if (loadingCourses) {
     return (
       <div className="space-y-4">
-        <div className="h-12 w-72 bg-slate-200/70 rounded-lg animate-pulse" />
+        <div className="h-12 bg-white border border-slate-200 rounded-xl animate-pulse" />
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
           {[1, 2, 3].map((i) => (
             <div
@@ -341,47 +607,6 @@ export function ProfessorPortal({ activeNav, onNavigate }: ProfessorPortalProps)
     );
   }
 
-  const ActiveCourseHeaderBar = () => (
-    <div className="bg-white border border-slate-200 rounded-xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-      <div className="min-w-0">
-        <div className="text-xs text-slate-500">Aktivni predmet za upravljanje</div>
-        {activeCourse ? (
-          <div className="flex flex-wrap items-center gap-2 mt-0.5">
-            <span className="font-mono text-xs font-semibold text-blue-700">
-              {activeCourse.code}
-            </span>
-            <span aria-hidden="true" className="text-slate-300">·</span>
-            <span className="font-semibold text-slate-900">{activeCourse.name}</span>
-            <span aria-hidden="true" className="text-slate-300">·</span>
-            <span className="text-xs text-slate-500">
-              Upisano studenata: <strong className="font-mono">{enrollments.length}</strong>
-            </span>
-          </div>
-        ) : (
-          <div className="text-sm text-slate-600">Nema izabranog predmeta</div>
-        )}
-      </div>
-
-      <div className="flex items-center gap-2 shrink-0">
-        <select
-          value={selectedCourseId}
-          onChange={(e) => setSelectedCourseId(e.target.value)}
-          className="h-9 rounded-lg border border-slate-300 bg-white px-3 text-sm font-medium text-slate-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-600"
-        >
-          {courses.map((c) => (
-            <option key={c.id} value={c.id}>
-              {c.code} — {c.name}
-            </option>
-          ))}
-        </select>
-        <Button variant="outline" size="sm" onClick={() => setNewCourseOpen(true)}>
-          <Plus className="w-3.5 h-3.5" />
-          Novi predmet
-        </Button>
-      </div>
-    </div>
-  );
-
   // Empty state if professor has no courses yet
   if (courses.length === 0) {
     return (
@@ -391,8 +616,8 @@ export function ProfessorPortal({ activeNav, onNavigate }: ProfessorPortalProps)
           Nemate dodijeljenih predmeta
         </h2>
         <p className="text-sm text-slate-600 mt-1.5 leading-relaxed">
-          Kreirajte novi predmet kako biste započeli unos kategorija, zadataka, prisustva i
-          upisanih studenata.
+          Kreirajte novi predmet kako biste započeli objavu rasporeda, ispitnih rokova, unos
+          bodova, prisustva i upisanih studenata.
         </p>
         <div className="mt-5">
           <Button onClick={() => setNewCourseOpen(true)}>
@@ -400,81 +625,198 @@ export function ProfessorPortal({ activeNav, onNavigate }: ProfessorPortalProps)
             Kreiraj prvi predmet
           </Button>
         </div>
-
-        <Dialog
-          open={newCourseOpen}
-          onOpenChange={setNewCourseOpen}
-          title="Kreiraj novi predmet"
-        >
-          <form onSubmit={handleCreateCourse} className="space-y-4 text-left">
-            <div className="grid grid-cols-2 gap-3">
-              <div>
-                <Label htmlFor="nc-code">Šifra predmeta</Label>
-                <Input
-                  id="nc-code"
-                  value={newCode}
-                  onChange={(e) => setNewCode(e.target.value)}
-                  placeholder="OR-AR"
-                  className="font-mono"
-                  required
-                />
-              </div>
-              <div>
-                <Label htmlFor="nc-ects">ECTS</Label>
-                <Input
-                  id="nc-ects"
-                  type="number"
-                  min="1"
-                  max="30"
-                  value={newEcts}
-                  onChange={(e) => setNewEcts(e.target.value)}
-                  className="font-mono"
-                  required
-                />
-              </div>
-            </div>
-            <div>
-              <Label htmlFor="nc-name">Naziv predmeta</Label>
-              <Input
-                id="nc-name"
-                value={newName}
-                onChange={(e) => setNewName(e.target.value)}
-                placeholder="Arhitektura računara"
-                required
-              />
-            </div>
-            <div>
-              <Label htmlFor="nc-sem">Semestar</Label>
-              <Input
-                id="nc-sem"
-                value={newSemester}
-                onChange={(e) => setNewSemester(e.target.value)}
-                required
-              />
-            </div>
-            <div className="flex justify-end gap-2 pt-2">
-              <Button variant="outline" onClick={() => setNewCourseOpen(false)}>
-                Odustani
-              </Button>
-              <Button type="submit" disabled={creatingCourse}>
-                Kreiraj predmet
-              </Button>
-            </div>
-          </form>
-        </Dialog>
+        {createCourseDialog}
       </div>
     );
   }
 
   // =========================================================================
-  // VIEW: POČETNA & MOJI PREDMETI
+  // VIEW: RASPORED NASTAVE, LABOVA, ISPITA I ROKOVA
   // =========================================================================
-  if (activeNav === 'pocetna' || activeNav === 'predmeti') {
-    const filteredCourses = courses.filter((c) => {
+  if (activeNav === 'raspored') {
+    const scheduleTargetCourses =
+      activeSemesterCourses.length > 0 ? activeSemesterCourses : courses;
+    const activeCourseIdsSet = new Set(scheduleTargetCourses.map((c) => c.id));
+    return (
+      <div className="space-y-5">
+        <ScheduleView
+          courses={scheduleTargetCourses}
+          scheduleEvents={scheduleEvents.filter((ev) => activeCourseIdsSet.has(ev.courseId))}
+          examTerms={examTerms.filter((t) => activeCourseIdsSet.has(t.courseId))}
+          gradingItems={items}
+          canEdit
+        />
+        {createCourseDialog}
+      </div>
+    );
+  }
+
+  // 1-Click Horizontal Course Switcher Bar across Professor Workspaces
+  const activeCourseHeaderBar = (
+    <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
+      <div className="px-3 py-2.5 flex items-center justify-between gap-3 overflow-x-auto">
+        <div className="flex items-center gap-1.5">
+          {switcherCourses.map((c) => {
+            const isSel = c.id === selectedCourseId;
+            return (
+              <button
+                key={c.id}
+                type="button"
+                onClick={() => setSelectedCourseId(c.id)}
+                className={cn(
+                  'px-3.5 py-2 rounded-lg text-left transition-colors cursor-pointer shrink-0 flex items-center gap-2 whitespace-nowrap',
+                  isSel
+                    ? 'bg-slate-900 text-white'
+                    : 'text-slate-700 hover:bg-slate-100'
+                )}
+              >
+                <span
+                  className={cn(
+                    'font-mono text-xs font-semibold',
+                    isSel ? 'text-blue-300' : 'text-blue-700'
+                  )}
+                >
+                  {c.code}
+                </span>
+                <span className="text-sm font-semibold">{c.name}</span>
+              </button>
+            );
+          })}
+        </div>
+
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => setNewCourseOpen(true)}
+          className="shrink-0"
+        >
+          <Plus className="w-3.5 h-3.5" />
+          Novi predmet
+        </Button>
+      </div>
+
+      {activeCourse && (
+        <div className="px-4 py-2.5 bg-slate-50/70 border-t border-slate-100 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-600">
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+            {activeCourse.isArchived && (
+              <>
+                <span className="font-semibold text-amber-700">
+                  Arhiviran ({activeCourse.academicYear})
+                </span>
+                <span aria-hidden="true" className="text-slate-300">·</span>
+              </>
+            )}
+            {activeCourse.studyProgram && (
+              <>
+                <span className="font-medium text-blue-700">{activeCourse.studyProgram}</span>
+                <span aria-hidden="true" className="text-slate-300">·</span>
+              </>
+            )}
+            <span>
+              {getCourseProfessors(activeCourse).length > 1 ? 'Profesori: ' : 'Profesor: '}
+              <strong className="font-medium text-slate-900">
+                {formatCourseProfessors(activeCourse)}
+              </strong>
+            </span>
+            <span aria-hidden="true" className="text-slate-300">·</span>
+            <span>
+              Asistenti:{' '}
+              {getCourseAssistants(activeCourse).length > 0 ? (
+                <strong className="font-medium text-slate-800">
+                  {formatCourseAssistants(activeCourse)}
+                </strong>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => onNavigate('postavke')}
+                  className="text-blue-700 hover:underline cursor-pointer"
+                >
+                  + Dodaj asistente
+                </button>
+              )}
+            </span>
+            <span aria-hidden="true" className="text-slate-300">·</span>
+            <span className="font-mono tabular-nums">{activeCourse.ects} ECTS</span>
+            <span aria-hidden="true" className="text-slate-300">·</span>
+            <span>
+              Studenti:{' '}
+              <strong className="font-mono text-slate-900 tabular-nums">
+                {enrollments.length}
+              </strong>
+            </span>
+          </div>
+
+          <div className="flex items-center gap-4">
+            <button
+              type="button"
+              onClick={() => onNavigate('raspored')}
+              className="font-medium text-slate-600 hover:text-slate-900 hover:underline cursor-pointer whitespace-nowrap"
+            >
+              Raspored
+            </button>
+            <button
+              type="button"
+              onClick={() => onNavigate('ispiti')}
+              className={cn(
+                'font-medium hover:underline cursor-pointer whitespace-nowrap tabular-nums',
+                activeNav === 'ispiti' ? 'text-slate-900' : 'text-blue-700'
+              )}
+            >
+              Ispitni rokovi ({activeCourseTerms.length})
+            </button>
+            <button
+              type="button"
+              onClick={() => onNavigate('bodovi')}
+              className={cn(
+                'font-medium hover:underline cursor-pointer whitespace-nowrap',
+                activeNav === 'bodovi' ? 'text-slate-900' : 'text-slate-600 hover:text-slate-900'
+              )}
+            >
+              Unos bodova
+            </button>
+            <button
+              type="button"
+              onClick={() => onNavigate('postavke')}
+              className={cn(
+                'font-medium hover:underline cursor-pointer whitespace-nowrap',
+                activeNav === 'postavke' ? 'text-slate-900' : 'text-slate-600 hover:text-slate-900'
+              )}
+            >
+              Osoblje i postavke
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+
+  // =========================================================================
+  // VIEW: POČETNA — PREDMETI I BRZI PREGLED
+  // =========================================================================
+  if (activeNav === 'pocetna') {
+    const basePool = showArchivedOnHome ? archivedCourses : activeSemesterCourses;
+    const filteredCourses = basePool.filter((c) => {
+      if (programFilter !== 'all' && getCourseProgramCycle(c) !== programFilter) {
+        return false;
+      }
       const q = courseSearch.trim().toLowerCase();
       if (!q) return true;
-      return c.name.toLowerCase().includes(q) || c.code.toLowerCase().includes(q);
+      return (
+        c.name.toLowerCase().includes(q) ||
+        c.code.toLowerCase().includes(q) ||
+        (c.studyProgram || '').toLowerCase().includes(q) ||
+        c.semester.toLowerCase().includes(q) ||
+        formatCourseProfessors(c).toLowerCase().includes(q) ||
+        formatCourseAssistants(c).toLowerCase().includes(q)
+      );
     });
+
+    const cycleCounts = {
+      all: basePool.length,
+      strucni_rs: basePool.filter((c) => getCourseProgramCycle(c) === 'strucni_rs').length,
+      bachelor: basePool.filter((c) => getCourseProgramCycle(c) === 'bachelor').length,
+      master: basePool.filter((c) => getCourseProgramCycle(c) === 'master').length,
+    };
 
     const avgPoints =
       enrollments.length > 0
@@ -490,217 +832,340 @@ export function ProfessorPortal({ activeNav, onNavigate }: ProfessorPortalProps)
 
     return (
       <div className="space-y-6">
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-          <div className="relative flex-1 max-w-sm">
-            <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
-            <Input
-              value={courseSearch}
-              onChange={(e) => setCourseSearch(e.target.value)}
-              placeholder="Pretraži dodijeljene predmete..."
-              className="pl-9 bg-white"
-            />
+        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+          <div className="flex flex-col sm:flex-row sm:items-center gap-3 flex-1">
+            <div className="relative flex-1 max-w-sm">
+              <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+              <Input
+                value={courseSearch}
+                onChange={(e) => setCourseSearch(e.target.value)}
+                placeholder="Pretraži predmete, smjerove ili osoblje..."
+                className="pl-9 bg-white"
+              />
+            </div>
+
+            <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-lg overflow-x-auto max-w-full">
+              {(
+                [
+                  { key: 'all', label: `Svi programi (${cycleCounts.all})` },
+                  { key: 'strucni_rs', label: `Stručni RS · 2 god. (${cycleCounts.strucni_rs})` },
+                  { key: 'bachelor', label: `Bachelor (${cycleCounts.bachelor})` },
+                  { key: 'master', label: `Master smjerovi (${cycleCounts.master})` },
+                ] as const
+              ).map((tab) => (
+                <button
+                  key={tab.key}
+                  type="button"
+                  onClick={() => setProgramFilter(tab.key)}
+                  className={cn(
+                    'px-2.5 py-1.5 text-xs font-medium rounded-md transition-colors cursor-pointer whitespace-nowrap shrink-0 tabular-nums',
+                    programFilter === tab.key
+                      ? 'bg-white text-slate-900 shadow-xs'
+                      : 'text-slate-600 hover:text-slate-900'
+                  )}
+                >
+                  {tab.label}
+                </button>
+              ))}
+            </div>
           </div>
-          <Button onClick={() => setNewCourseOpen(true)} size="sm">
-            <Plus className="w-4 h-4" />
-            Novi predmet
-          </Button>
+
+          <div className="flex items-center gap-2 shrink-0 self-start lg:self-auto">
+            {archivedCourses.length > 0 && (
+              <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-lg text-xs">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowArchivedOnHome(false);
+                    if (activeSemesterCourses[0]) {
+                      setSelectedCourseId(activeSemesterCourses[0].id);
+                    }
+                  }}
+                  className={cn(
+                    'px-2.5 py-1 rounded-md font-medium transition-colors cursor-pointer whitespace-nowrap shrink-0 tabular-nums',
+                    !showArchivedOnHome
+                      ? 'bg-white text-slate-900 shadow-xs'
+                      : 'text-slate-600 hover:text-slate-900'
+                  )}
+                >
+                  Aktivni ({activeSemesterCourses.length})
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowArchivedOnHome(true);
+                    if (archivedCourses[0]) {
+                      setSelectedCourseId(archivedCourses[0].id);
+                    }
+                  }}
+                  className={cn(
+                    'px-2.5 py-1 rounded-md font-medium transition-colors cursor-pointer whitespace-nowrap shrink-0 tabular-nums',
+                    showArchivedOnHome
+                      ? 'bg-white text-slate-900 shadow-xs'
+                      : 'text-slate-600 hover:text-slate-900'
+                  )}
+                >
+                  Arhiva ({archivedCourses.length})
+                </button>
+              </div>
+            )}
+
+            <Button onClick={() => setNewCourseOpen(true)} size="sm">
+              <Plus className="w-4 h-4" />
+              Novi predmet
+            </Button>
+          </div>
         </div>
 
         {/* Courses Grid */}
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-          {filteredCourses.map((crs) => {
-            const isSel = crs.id === selectedCourseId;
-            return (
-              <div
-                key={crs.id}
-                onClick={() => setSelectedCourseId(crs.id)}
-                className={cn(
-                  'bg-white rounded-xl p-5 border transition-colors cursor-pointer flex flex-col justify-between gap-4',
-                  isSel
-                    ? 'border-blue-600 ring-1 ring-blue-600'
-                    : 'border-slate-200 hover:border-slate-300'
-                )}
-              >
-                <div>
-                  <div className="flex items-center justify-between text-xs text-slate-500">
-                    <span className="font-mono font-semibold text-blue-700">{crs.code}</span>
-                    <span>{crs.ects} ECTS · {crs.academicYear}</span>
-                  </div>
-                  <h3 className="text-base font-semibold text-slate-900 mt-1">{crs.name}</h3>
-                  <p className="text-xs text-slate-500 mt-0.5">{crs.semester}</p>
-                </div>
+        {filteredCourses.length === 0 ? (
+          <div className="bg-white border border-slate-200 rounded-xl p-8 text-center">
+            <p className="text-sm text-slate-600">
+              Nema predmeta za odabrani studijski program ili kriterij pretrage.
+            </p>
+            <div className="mt-3 flex items-center justify-center gap-2">
+              {programFilter !== 'all' && (
+                <Button variant="outline" size="sm" onClick={() => setProgramFilter('all')}>
+                  Prikaži sve programe
+                </Button>
+              )}
+              <Button size="sm" onClick={() => setNewCourseOpen(true)}>
+                <Plus className="w-3.5 h-3.5" />
+                Dodaj predmet na ovaj smjer
+              </Button>
+            </div>
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            {filteredCourses.map((crs) => {
+              const isSel = crs.id === selectedCourseId;
+              const crsTermsCount = examTerms.filter((t) => t.courseId === crs.id).length;
+              const profList = getCourseProfessors(crs);
+              const asstList = getCourseAssistants(crs);
+              return (
+                <button
+                  key={crs.id}
+                  type="button"
+                  onClick={() => setSelectedCourseId(crs.id)}
+                  className={cn(
+                    'text-left bg-white rounded-xl p-5 border transition-colors cursor-pointer flex flex-col justify-between gap-4',
+                    isSel
+                      ? 'border-blue-600 ring-1 ring-blue-600'
+                      : 'border-slate-200 hover:border-slate-300'
+                  )}
+                >
+                  <div className="space-y-1.5">
+                    <div className="flex items-center justify-between text-xs text-slate-500">
+                      <span className="font-mono font-semibold text-blue-700">{crs.code}</span>
+                      <span className="font-mono tabular-nums">
+                        {crs.ects} ECTS · {crs.academicYear}
+                        {crs.isArchived ? ' · Arhiva' : ''}
+                      </span>
+                    </div>
+                    <h3 className="text-base font-semibold text-slate-900">{crs.name}</h3>
+                    <div className="text-xs text-slate-500">
+                      {crs.studyProgram ? (
+                        <>
+                          <span className="font-medium text-slate-700">{crs.studyProgram}</span>
+                          <span aria-hidden="true"> · </span>
+                        </>
+                      ) : null}
+                      <span>{crs.semester}</span>
+                    </div>
 
-                <div className="pt-3 border-t border-slate-100 flex items-center justify-between text-xs text-slate-600">
-                  <span>
-                    Prisustvo:{' '}
-                    <strong className="font-mono text-slate-900">
-                      {crs.attendanceEnabled ? `${crs.attendanceMaxPoints} b` : 'Isključeno'}
-                    </strong>
-                  </span>
-                  <span>
-                    Prag prolaza:{' '}
-                    <strong className="font-mono text-slate-900">{crs.grade6Threshold} b</strong>
-                  </span>
-                </div>
-              </div>
-            );
-          })}
-        </div>
+                    <div className="pt-1.5 space-y-1 text-xs">
+                      <div className="text-slate-600 line-clamp-2">
+                        <span className="text-slate-400">
+                          {profList.length > 1 ? 'Profesori: ' : 'Profesor: '}
+                        </span>
+                        <span className="font-medium text-slate-800">{profList.join(', ')}</span>
+                      </div>
+                      <div className="text-slate-500 line-clamp-2">
+                        <span className="text-slate-400">Asistenti: </span>
+                        <span>
+                          {asstList.length > 0 ? asstList.join(', ') : 'Nisu upisani'}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="pt-3 border-t border-slate-100 flex items-center justify-between text-xs text-slate-600">
+                    <span>
+                      Ispitni rokovi:{' '}
+                      <strong className="font-mono text-slate-900 tabular-nums">
+                        {crsTermsCount}
+                      </strong>
+                    </span>
+                    <span>
+                      Prag prolaza:{' '}
+                      <strong className="font-mono text-slate-900 tabular-nums">
+                        {crs.grade6Threshold} b
+                      </strong>
+                    </span>
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        )}
 
         {/* Quick Workspace Summary for Active Course */}
         {activeCourse && (
-          <div className="bg-white border border-slate-200 rounded-xl p-6 space-y-5">
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-4 border-b border-slate-100">
-              <div>
-                <div className="text-xs text-slate-500">Brzi pregled izabranog predmeta</div>
+          <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
+            <div className="p-5 sm:p-6 flex flex-col lg:flex-row lg:items-center justify-between gap-4 border-b border-slate-200">
+              <div className="min-w-0">
+                <div className="text-xs text-slate-500">
+                  Radni prostor izabranog predmeta
+                  {activeCourse.studyProgram ? ` · ${activeCourse.studyProgram}` : ''}
+                  {activeCourse.isArchived ? ' · Arhiviran semestar' : ''}
+                </div>
                 <h2 className="text-lg font-bold text-slate-900 mt-0.5">
                   {activeCourse.code} — {activeCourse.name}
                 </h2>
+                <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-slate-600">
+                  <span>
+                    {getCourseProfessors(activeCourse).length > 1 ? 'Profesori: ' : 'Profesor: '}
+                    <strong className="font-medium text-slate-900">
+                      {formatCourseProfessors(activeCourse)}
+                    </strong>
+                  </span>
+                  <span aria-hidden="true" className="text-slate-300">·</span>
+                  <span>
+                    Asistenti:{' '}
+                    {getCourseAssistants(activeCourse).length > 0 ? (
+                      <strong className="font-medium text-slate-800">
+                        {formatCourseAssistants(activeCourse)}
+                      </strong>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => onNavigate('postavke')}
+                        className="text-blue-700 hover:underline cursor-pointer"
+                      >
+                        + Dodaj asistente u postavkama
+                      </button>
+                    )}
+                  </span>
+                </div>
               </div>
 
-              <div className="flex flex-wrap items-center gap-2">
-                <Button variant="secondary" size="sm" onClick={() => onNavigate('studenti')}>
-                  <Users className="w-3.5 h-3.5" />
-                  Studenti ({enrollments.length})
+              <div className="flex flex-wrap items-center gap-2 shrink-0">
+                <Button size="sm" onClick={() => onNavigate('ispiti')}>
+                  <CalendarCheck2 className="w-3.5 h-3.5" />
+                  Ispitni rokovi ({activeCourseTerms.length})
+                </Button>
+                <Button variant="secondary" size="sm" onClick={() => onNavigate('raspored')}>
+                  <Calendar className="w-3.5 h-3.5" />
+                  Raspored
                 </Button>
                 <Button variant="secondary" size="sm" onClick={() => onNavigate('bodovi')}>
                   <ClipboardList className="w-3.5 h-3.5" />
-                  Evidencija bodova
+                  Unos bodova
                 </Button>
                 <Button variant="secondary" size="sm" onClick={() => onNavigate('prisustvo')}>
                   <CalendarCheck className="w-3.5 h-3.5" />
                   Prisustvo ({sessions.length})
                 </Button>
+                <Button variant="secondary" size="sm" onClick={() => onNavigate('studenti')}>
+                  <Users className="w-3.5 h-3.5" />
+                  Studenti ({enrollments.length})
+                </Button>
                 <Button variant="outline" size="sm" onClick={() => onNavigate('postavke')}>
                   <Settings className="w-3.5 h-3.5" />
-                  Postavke
+                  Osoblje i postavke
                 </Button>
               </div>
             </div>
 
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
-              <div className="border border-slate-200 rounded-lg p-3.5">
+            <div className="grid grid-cols-2 lg:grid-cols-4 divide-y lg:divide-y-0 sm:divide-x divide-slate-200 bg-slate-50/40">
+              <div className="p-4 sm:p-5">
                 <div className="text-xs text-slate-500">Upisani studenti</div>
-                <div className="font-mono text-xl font-bold text-slate-900 mt-1 tabular-nums">
+                <div className="font-mono text-2xl font-bold text-slate-900 mt-1 tabular-nums">
                   {enrollments.length}
                 </div>
+                <div className="text-[11px] text-slate-500 mt-0.5">Lista na predmetu</div>
               </div>
-              <div className="border border-slate-200 rounded-lg p-3.5">
-                <div className="text-xs text-slate-500">Prosjek ostvarenih bodova</div>
-                <div className="font-mono text-xl font-bold text-slate-900 mt-1 tabular-nums">
-                  {formatPoints(avgPoints)} b
+
+              <div className="p-4 sm:p-5">
+                <div className="text-xs text-slate-500">Izlaze na predstojeći ispit</div>
+                {nearestUpcomingTermInfo ? (
+                  <>
+                    <div className="font-mono text-2xl font-bold text-blue-700 mt-1 tabular-nums">
+                      {nearestUpcomingTermInfo.registeredCount} / {enrollments.length}
+                    </div>
+                    <div className="text-[11px] text-slate-500 mt-0.5 truncate">
+                      {nearestUpcomingTermInfo.term.title} (
+                      {formatBosnianDate(nearestUpcomingTermInfo.term.examDate)})
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div className="font-mono text-2xl font-bold text-slate-400 mt-1">—</div>
+                    <button
+                      type="button"
+                      onClick={() => onNavigate('ispiti')}
+                      className="text-[11px] text-blue-700 hover:underline mt-0.5 cursor-pointer"
+                    >
+                      Objavi prvi ispitni rok
+                    </button>
+                  </>
+                )}
+              </div>
+
+              <div className="p-4 sm:p-5">
+                <div className="text-xs text-slate-500">
+                  Ostvarili prag ({activeCourse.grade6Threshold}b)
                 </div>
-              </div>
-              <div className="border border-slate-200 rounded-lg p-3.5">
-                <div className="text-xs text-slate-500">Ostvarili prag ({activeCourse.grade6Threshold}b)</div>
-                <div className="font-mono text-xl font-bold text-emerald-700 mt-1 tabular-nums">
+                <div className="font-mono text-2xl font-bold text-emerald-700 mt-1 tabular-nums">
                   {passedCount} / {enrollments.length}
                 </div>
+                <div className="text-[11px] text-slate-500 mt-0.5">Kandidati za prolaznu ocjenu</div>
               </div>
-              <div className="border border-slate-200 rounded-lg p-3.5">
-                <div className="text-xs text-slate-500">Stavke ocjenjivanja</div>
-                <div className="font-mono text-xl font-bold text-slate-900 mt-1 tabular-nums">
-                  {items.length}
+
+              <div className="p-4 sm:p-5">
+                <div className="text-xs text-slate-500">Prosjek ostvarenih bodova</div>
+                <div className="font-mono text-2xl font-bold text-slate-900 mt-1 tabular-nums">
+                  {formatPoints(avgPoints)} b
+                </div>
+                <div className="text-[11px] text-slate-500 mt-0.5 tabular-nums">
+                  Ukupno {items.length} stavki ocjenjivanja
                 </div>
               </div>
             </div>
           </div>
         )}
 
-        {/* Create Course Modal */}
-        <Dialog
-          open={newCourseOpen}
-          onOpenChange={setNewCourseOpen}
-          title="Kreiraj novi predmet"
-          description="Unesite osnovne podatke o predmetu. Kategorije i pragove možete detaljno prilagoditi u postavkama."
-        >
-          <form onSubmit={handleCreateCourse} className="space-y-4">
-            <div className="grid grid-cols-2 gap-3">
-              <div>
-                <Label htmlFor="crs-c">Šifra predmeta</Label>
-                <Input
-                  id="crs-c"
-                  value={newCode}
-                  onChange={(e) => setNewCode(e.target.value)}
-                  placeholder="RI-BP"
-                  className="font-mono"
-                  required
-                />
-              </div>
-              <div>
-                <Label htmlFor="crs-e">ECTS bodovi</Label>
-                <Input
-                  id="crs-e"
-                  type="number"
-                  min="1"
-                  max="30"
-                  value={newEcts}
-                  onChange={(e) => setNewEcts(e.target.value)}
-                  className="font-mono"
-                  required
-                />
-              </div>
-            </div>
-            <div>
-              <Label htmlFor="crs-n">Naziv predmeta</Label>
-              <Input
-                id="crs-n"
-                value={newName}
-                onChange={(e) => setNewName(e.target.value)}
-                placeholder="Baze podataka"
-                required
-              />
-            </div>
-            <div>
-              <Label htmlFor="crs-s">Semestar</Label>
-              <Input
-                id="crs-s"
-                value={newSemester}
-                onChange={(e) => setNewSemester(e.target.value)}
-                required
-              />
-            </div>
-            <div className="flex items-center justify-between gap-3 pt-1">
-              <label className="flex items-center gap-2 text-xs text-slate-700 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={newAttEnabled}
-                  onChange={(e) => setNewAttEnabled(e.target.checked)}
-                />
-                <span>Uključi bodovanje prisustva (podrazumijevano 10 b)</span>
-              </label>
-              {newAttEnabled && (
-                <Input
-                  type="number"
-                  min="0"
-                  max="100"
-                  value={newAttMax}
-                  onChange={(e) => setNewAttMax(e.target.value)}
-                  className="w-20 h-8 font-mono text-right"
-                />
-              )}
-            </div>
-            <div className="flex justify-end gap-2 pt-2">
-              <Button variant="outline" onClick={() => setNewCourseOpen(false)}>
-                Odustani
-              </Button>
-              <Button type="submit" disabled={creatingCourse}>
-                {creatingCourse ? 'Kreiranje...' : 'Kreiraj predmet'}
-              </Button>
-            </div>
-          </form>
-        </Dialog>
+        {createCourseDialog}
       </div>
     );
   }
 
   // =========================================================================
-  // VIEW: EVIDENCIJA BODOVA (Gradebook)
+  // VIEW: PRIJAVA ISPITA (Publish Exam Terms & Live Turnout Roster)
+  // =========================================================================
+  if (activeNav === 'ispiti' && activeCourse) {
+    return (
+      <div className="space-y-5">
+        {activeCourseHeaderBar}
+        <ExamManagerView
+          course={activeCourse}
+          professorUid={professorUid}
+          enrollments={enrollments}
+          examTerms={examTerms}
+          examRegistrations={examRegistrations}
+        />
+        {createCourseDialog}
+      </div>
+    );
+  }
+
+  // =========================================================================
+  // VIEW: UNOS BODOVA (Gradebook)
   // =========================================================================
   if (activeNav === 'bodovi' && activeCourse) {
     return (
       <div className="space-y-5">
-        <ActiveCourseHeaderBar />
+        {activeCourseHeaderBar}
         <GradebookView
           course={activeCourse}
           professorUid={professorUid}
@@ -709,6 +1174,7 @@ export function ProfessorPortal({ activeNav, onNavigate }: ProfessorPortalProps)
           items={items}
           scores={scores}
         />
+        {createCourseDialog}
       </div>
     );
   }
@@ -719,7 +1185,7 @@ export function ProfessorPortal({ activeNav, onNavigate }: ProfessorPortalProps)
   if (activeNav === 'prisustvo' && activeCourse) {
     return (
       <div className="space-y-5">
-        <ActiveCourseHeaderBar />
+        {activeCourseHeaderBar}
         <AttendanceManagerView
           course={activeCourse}
           professorUid={professorUid}
@@ -728,6 +1194,7 @@ export function ProfessorPortal({ activeNav, onNavigate }: ProfessorPortalProps)
           records={attendanceRecords}
           onOpenSettings={() => onNavigate('postavke')}
         />
+        {createCourseDialog}
       </div>
     );
   }
@@ -738,19 +1205,21 @@ export function ProfessorPortal({ activeNav, onNavigate }: ProfessorPortalProps)
   if (activeNav === 'postavke' && activeCourse) {
     return (
       <div className="space-y-5">
-        <ActiveCourseHeaderBar />
+        {activeCourseHeaderBar}
         <CourseSettingsView
           course={activeCourse}
           categories={categories}
           items={items}
           scores={scores}
+          enrollments={enrollments}
         />
+        {createCourseDialog}
       </div>
     );
   }
 
   // =========================================================================
-  // VIEW: STUDENTI (Student List, Search/Sort/Filter, Enroll, CSV Export & Finalize Grades)
+  // VIEW: STUDENTI I OCJENE
   // =========================================================================
   const filteredAndSortedStudents = enrollments
     .filter((enr) => {
@@ -758,7 +1227,8 @@ export function ProfessorPortal({ activeNav, onNavigate }: ProfessorPortalProps)
       if (
         q &&
         !enr.studentName.toLowerCase().includes(q) &&
-        !enr.studentIndex.toLowerCase().includes(q)
+        !enr.studentIndex.toLowerCase().includes(q) &&
+        !enr.studentDepartment.toLowerCase().includes(q)
       ) {
         return false;
       }
@@ -786,7 +1256,6 @@ export function ProfessorPortal({ activeNav, onNavigate }: ProfessorPortalProps)
       return a.studentName.localeCompare(b.studentName, 'bs');
     });
 
-  // Partition categories into Assignments/Exercises vs Exams/Other for summary columns
   const isExamCategory = (catName: string) => {
     const low = catName.toLowerCase();
     return low.includes('ispit') || low.includes('parcijal') || low.includes('završ');
@@ -794,7 +1263,7 @@ export function ProfessorPortal({ activeNav, onNavigate }: ProfessorPortalProps)
 
   return (
     <div className="space-y-5">
-      <ActiveCourseHeaderBar />
+      {activeCourseHeaderBar}
 
       {/* Search, Filter, Sort & Actions Toolbar */}
       <div className="bg-white border border-slate-200 rounded-xl p-4 flex flex-col lg:flex-row lg:items-center justify-between gap-3">
@@ -821,7 +1290,7 @@ export function ProfessorPortal({ activeNav, onNavigate }: ProfessorPortalProps)
                 type="button"
                 onClick={() => setStudentFilter(f.k as typeof studentFilter)}
                 className={cn(
-                  'px-2.5 py-1 rounded-md font-medium transition-colors cursor-pointer whitespace-nowrap',
+                  'px-2.5 py-1 rounded-md font-medium transition-colors cursor-pointer whitespace-nowrap shrink-0',
                   studentFilter === f.k
                     ? 'bg-white text-slate-900 shadow-xs'
                     : 'text-slate-600 hover:text-slate-900'
@@ -927,16 +1396,16 @@ export function ProfessorPortal({ activeNav, onNavigate }: ProfessorPortalProps)
                       </td>
                       <td className="py-3 px-4 text-xs whitespace-nowrap">
                         {fg?.status === FinalGradeStatus.FINALIZED ? (
-                          <span className="inline-flex items-center gap-1.5 text-emerald-700 font-semibold font-mono">
+                          <span className="inline-flex items-center gap-1.5 text-emerald-700 font-semibold font-mono tabular-nums">
                             <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
                             Ocjena {fg.finalGrade} (zaključena)
                           </span>
                         ) : fg?.status === FinalGradeStatus.DRAFT ? (
-                          <span className="text-amber-700 font-medium font-mono">
+                          <span className="text-amber-700 font-medium font-mono tabular-nums">
                             Nacrt: {fg.finalGrade}
                           </span>
                         ) : sum?.suggestedGrade ? (
-                          <span className="text-blue-700 font-mono">
+                          <span className="text-blue-700 font-mono tabular-nums">
                             Prijedlog: {sum.suggestedGrade}
                           </span>
                         ) : (
@@ -985,7 +1454,7 @@ export function ProfessorPortal({ activeNav, onNavigate }: ProfessorPortalProps)
         open={enrollModalOpen}
         onOpenChange={setEnrollModalOpen}
         title="Upis studenta na predmet"
-        description="Unesite broj indeksa registrovanog studenta (npr. 18942, 19014 ili broj koji je student unio na svom profilu)."
+        description="Unesite broj indeksa registrovanog studenta (npr. 18942, 19014 ili indeks dodijeljen od strane administratora)."
       >
         <form onSubmit={handleEnrollStudent} className="space-y-4">
           <div>
@@ -1097,6 +1566,8 @@ export function ProfessorPortal({ activeNav, onNavigate }: ProfessorPortalProps)
           </Button>
         </div>
       </Dialog>
+
+      {createCourseDialog}
     </div>
   );
 }

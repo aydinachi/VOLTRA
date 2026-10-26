@@ -23,6 +23,43 @@ export function formatPoints(value: number | null | undefined): string {
   return value.toFixed(2).replace(/\.?0+$/, '');
 }
 
+export function getCourseProfessors(
+  course?: { professorNames?: string[]; leadProfessorName?: string } | null,
+  fallbackLeadName?: string
+): string[] {
+  if (course?.professorNames && course.professorNames.length > 0) {
+    return course.professorNames;
+  }
+  if (course?.leadProfessorName) {
+    return [course.leadProfessorName];
+  }
+  if (fallbackLeadName) {
+    return [fallbackLeadName];
+  }
+  return [];
+}
+
+export function getCourseAssistants(
+  course?: { assistantNames?: string[] } | null
+): string[] {
+  return course?.assistantNames?.filter(Boolean) ?? [];
+}
+
+export function formatCourseProfessors(
+  course?: { professorNames?: string[]; leadProfessorName?: string } | null,
+  fallbackLeadName?: string
+): string {
+  const list = getCourseProfessors(course, fallbackLeadName);
+  return list.length > 0 ? list.join(', ') : '—';
+}
+
+export function formatCourseAssistants(
+  course?: { assistantNames?: string[] } | null
+): string {
+  const list = getCourseAssistants(course);
+  return list.length > 0 ? list.join(', ') : '';
+}
+
 export function downloadCsv(filename: string, headers: string[], rows: (string | number)[][]) {
   const escapeCell = (val: string | number) => {
     const str = String(val ?? '');

@@ -1,4 +1,8 @@
 import {
+  createUserWithEmailAndPassword,
+  signOut as firebaseSignOut,
+} from 'firebase/auth';
+import {
   collection,
   deleteDoc,
   doc,
@@ -13,27 +17,54 @@ import {
   where,
   writeBatch,
 } from 'firebase/firestore';
-import { BOOTSTRAP_ADMIN_EMAIL, db, handleFirestoreError } from '../lib/firebase';
 import {
+  BOOTSTRAP_ADMIN_EMAIL,
+  db,
+  handleFirestoreError,
+  secondaryAuth,
+} from '../lib/firebase';
+import { addDaysIso, getExamWindowState, getTodayIsoLocal } from '../lib/calculations';
+import {
+  formatStudentRosterProgramLabel,
+  MASTER_RI_PROGRAM,
+  normalizeStudyTrack,
+  STRUCNI_RS_PROGRAM,
+} from '../lib/programs';
+import {
+  emailToProvisionId,
   isValidIsoDate,
   isValidResourceId,
+  sanitizeStaffList,
   sanitizeText,
+  validateExamTermDates,
   validateGradeThresholds,
   validateScoreInput,
   VALIDATION_CONSTRAINTS,
 } from '../lib/validation';
 import {
+  AcademicState,
+  Announcement,
+  AnnouncementAudience,
+  AnnouncementCategory,
   AttendanceRecord,
   AttendanceSession,
   Course,
+  DEFAULT_NOTIFICATION_PREFS,
   Enrollment,
+  ExamRegistration,
+  ExamRegistrationStatus,
+  ExamTerm,
   FinalGrade,
   FinalGradeStatus,
   GradingCategory,
   GradingItem,
   Invitation,
   InvitationStatus,
+  NotificationPreferences,
   OperationType,
+  ProvisionedAccount,
+  ScheduleEvent,
+  ScheduleEventType,
   Score,
   StudentDirectoryEntry,
   UserPrivate,
@@ -47,17 +78,51 @@ function makeEntityId(prefix: string): string {
   return `${prefix}_${ts}_${rand}`;
 }
 
+export function getSeenExamRegsStorageKey(uid: string): string {
+  return `voltra_seen_exam_regs_v1_${uid}`;
+}
+
+function recordStudentSelfExamAction(
+  uid: string,
+  registrationId: string,
+  status: ExamRegistrationStatus
+): void {
+  try {
+    const key = getSeenExamRegsStorageKey(uid);
+    const raw = localStorage.getItem(key);
+    const parsed: Record<string, string> = raw ? JSON.parse(raw) : {};
+    parsed[registrationId] = status;
+    localStorage.setItem(key, JSON.stringify(parsed));
+  } catch {
+    // Ignore storage quota errors
+  }
+}
+
+async function runParallelChunks<T>(
+  items: T[],
+  chunkSize: number,
+  worker: (item: T) => Promise<void>
+): Promise<void> {
+  for (let i = 0; i < items.length; i += chunkSize) {
+    const slice = items.slice(i, i + chunkSize);
+    await Promise.all(slice.map((item) => worker(item)));
+  }
+}
+
 export async function ensureUserAccount(params: {
   uid: string;
   email: string;
   displayName: string;
+  emailVerified?: boolean;
 }): Promise<{ profile: UserProfile; privateData: UserPrivate; isAdminUser: boolean }> {
-  const { uid, email, displayName } = params;
+  const { uid, email, displayName, emailVerified = false } = params;
   const profilePath = `userProfiles/${uid}`;
   const privatePath = `userPrivate/${uid}`;
-  const adminPath = `admins/${uid}`;
 
-  let isBootstrap = email.toLowerCase() === BOOTSTRAP_ADMIN_EMAIL.toLowerCase();
+  const isBootstrap =
+    Boolean(email) &&
+    emailVerified &&
+    email.toLowerCase() === BOOTSTRAP_ADMIN_EMAIL.toLowerCase();
   let hasAdminDoc = false;
 
   if (!isBootstrap) {
@@ -84,60 +149,209 @@ export async function ensureUserAccount(params: {
       displayName || email.split('@')[0] || 'Korisnik',
       VALIDATION_CONSTRAINTS.FULL_NAME_MAX_LENGTH
     );
-    const defaultIndex = isAdminUser ? '19001' : '';
-    const initialRole = isAdminUser ? UserRole.ADMIN : UserRole.STUDENT;
 
-    const payload = {
-      uid,
-      fullName: cleanName,
-      studentIndex: defaultIndex,
-      department: 'Računarstvo i informatika',
-      role: initialRole,
-      academicYear: '2026/2027',
-      redeemedInviteId: '',
-      isSeed: false,
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    };
-
-    try {
-      await setDoc(doc(db, 'userProfiles', uid), payload);
-    } catch (error) {
-      handleFirestoreError(error, OperationType.CREATE, profilePath);
-    }
-
-    if (defaultIndex) {
+    // Check if Administrator pre-provisioned an account record for this verified email
+    let claimedProvision: ProvisionedAccount | null = null;
+    const provId = email ? emailToProvisionId(email) : '';
+    if (emailVerified && provId) {
       try {
-        const dirSnap = await getDoc(doc(db, 'studentDirectory', defaultIndex));
-        if (!dirSnap.exists()) {
-          await setDoc(doc(db, 'studentDirectory', defaultIndex), {
-            studentIndex: defaultIndex,
-            uid,
-            fullName: cleanName,
-            department: 'Računarstvo i informatika',
-            isSeed: false,
-            createdAt: serverTimestamp(),
-            updatedAt: serverTimestamp(),
-          });
+        const provSnap = await getDoc(doc(db, 'provisionedAccounts', provId));
+        if (provSnap.exists()) {
+          const pData = provSnap.data() as ProvisionedAccount;
+          if (
+            (pData.status === 'pending' || pData.status === 'active') &&
+            pData.targetEmail.toLowerCase() === email.toLowerCase()
+          ) {
+            claimedProvision = { ...pData, id: provSnap.id };
+          }
         }
       } catch {
-        // Optional index sync
+        // Non-blocking lookup
       }
     }
 
-    profile = {
-      uid,
-      fullName: cleanName,
-      studentIndex: defaultIndex,
-      department: 'Računarstvo i informatika',
-      role: initialRole,
-      academicYear: '2026/2027',
-      redeemedInviteId: '',
-      isSeed: false,
-    };
+    if (claimedProvision && !isAdminUser) {
+      const assignedRole =
+        claimedProvision.role === 'professor' ? UserRole.PROFESSOR : UserRole.STUDENT;
+      const assignedTrack = normalizeStudyTrack(claimedProvision.studyTrack);
+      const assignedIndex = sanitizeText(
+        claimedProvision.studentIndex,
+        VALIDATION_CONSTRAINTS.STUDENT_INDEX_MAX_LENGTH
+      );
+      const assignedName =
+        sanitizeText(claimedProvision.fullName, VALIDATION_CONSTRAINTS.FULL_NAME_MAX_LENGTH) ||
+        cleanName;
+      const assignedDept =
+        sanitizeText(claimedProvision.department, VALIDATION_CONSTRAINTS.DEPARTMENT_MAX_LENGTH) ||
+        'Računarstvo i informatika';
+      const assignedYear =
+        sanitizeText(
+          claimedProvision.academicYear,
+          VALIDATION_CONSTRAINTS.ACADEMIC_YEAR_MAX_LENGTH
+        ) || '2026/2027';
+
+      const batch = writeBatch(db);
+      batch.set(doc(db, 'userProfiles', uid), {
+        uid,
+        fullName: assignedName,
+        studentIndex: assignedIndex,
+        department: assignedDept,
+        role: assignedRole,
+        academicYear: assignedYear,
+        redeemedInviteId: provId,
+        academicTitle: sanitizeText(
+          claimedProvision.academicTitle || '',
+          VALIDATION_CONSTRAINTS.ACADEMIC_TITLE_MAX_LENGTH
+        ),
+        officeLocation: sanitizeText(
+          claimedProvision.officeLocation || '',
+          VALIDATION_CONSTRAINTS.OFFICE_LOCATION_MAX_LENGTH
+        ),
+        consultationHours: sanitizeText(
+          claimedProvision.consultationHours || '',
+          VALIDATION_CONSTRAINTS.CONSULTATION_HOURS_MAX_LENGTH
+        ),
+        studyYear: sanitizeText(
+          claimedProvision.studyYear || '',
+          VALIDATION_CONSTRAINTS.STUDY_YEAR_MAX_LENGTH
+        ),
+        studyTrack: sanitizeText(assignedTrack, VALIDATION_CONSTRAINTS.STUDY_TRACK_MAX_LENGTH),
+        personalNote: '',
+        notificationPrefs: DEFAULT_NOTIFICATION_PREFS,
+        isSeed: false,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+      batch.update(doc(db, 'provisionedAccounts', provId), {
+        status: 'claimed',
+        authUid: uid,
+        updatedAt: serverTimestamp(),
+      });
+
+      try {
+        await batch.commit();
+      } catch (error) {
+        handleFirestoreError(error, OperationType.CREATE, profilePath);
+      }
+
+      if (assignedIndex) {
+        try {
+          const dirRef = doc(db, 'studentDirectory', assignedIndex);
+          const dirSnap = await getDoc(dirRef);
+          if (!dirSnap.exists()) {
+            await setDoc(dirRef, {
+              studentIndex: assignedIndex,
+              uid,
+              fullName: assignedName,
+              department:
+                sanitizeText(
+                  formatStudentRosterProgramLabel(assignedDept, assignedTrack),
+                  VALIDATION_CONSTRAINTS.DEPARTMENT_MAX_LENGTH
+                ) || assignedDept,
+              isSeed: false,
+              createdAt: serverTimestamp(),
+              updatedAt: serverTimestamp(),
+            });
+          }
+        } catch {
+          // Optional directory sync
+        }
+      }
+
+      profile = {
+        uid,
+        fullName: assignedName,
+        studentIndex: assignedIndex,
+        department: assignedDept,
+        role: assignedRole,
+        academicYear: assignedYear,
+        redeemedInviteId: provId,
+        academicTitle: claimedProvision.academicTitle || '',
+        officeLocation: claimedProvision.officeLocation || '',
+        consultationHours: claimedProvision.consultationHours || '',
+        studyYear: claimedProvision.studyYear || '',
+        studyTrack: assignedTrack,
+        personalNote: '',
+        notificationPrefs: DEFAULT_NOTIFICATION_PREFS,
+        isSeed: false,
+      };
+    } else {
+      const defaultIndex = isAdminUser ? '19001' : '';
+      const initialRole = isAdminUser ? UserRole.ADMIN : UserRole.STUDENT;
+
+      const payload = {
+        uid,
+        fullName: cleanName,
+        studentIndex: defaultIndex,
+        department: 'Računarstvo i informatika',
+        role: initialRole,
+        academicYear: '2026/2027',
+        redeemedInviteId: '',
+        academicTitle: isAdminUser ? 'vanr. prof. dr.' : '',
+        officeLocation: isAdminUser ? 'Kabinet 3-14, Kampus UNSA' : '',
+        consultationHours: isAdminUser ? 'Utorak 12:00–14:00, Četvrtak 11:00–12:00' : '',
+        studyYear: 'II godina · I ciklus (Bachelor)',
+        studyTrack: 'Bachelor · Računarstvo i informatika',
+        personalNote: '',
+        notificationPrefs: DEFAULT_NOTIFICATION_PREFS,
+        isSeed: false,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      };
+
+      try {
+        await setDoc(doc(db, 'userProfiles', uid), payload);
+      } catch (error) {
+        handleFirestoreError(error, OperationType.CREATE, profilePath);
+      }
+
+      if (defaultIndex) {
+        try {
+          const dirSnap = await getDoc(doc(db, 'studentDirectory', defaultIndex));
+          if (!dirSnap.exists()) {
+            await setDoc(doc(db, 'studentDirectory', defaultIndex), {
+              studentIndex: defaultIndex,
+              uid,
+              fullName: cleanName,
+              department: 'Računarstvo i informatika',
+              isSeed: false,
+              createdAt: serverTimestamp(),
+              updatedAt: serverTimestamp(),
+            });
+          }
+        } catch {
+          // Optional index sync
+        }
+      }
+
+      profile = {
+        uid,
+        fullName: cleanName,
+        studentIndex: defaultIndex,
+        department: 'Računarstvo i informatika',
+        role: initialRole,
+        academicYear: '2026/2027',
+        redeemedInviteId: '',
+        academicTitle: isAdminUser ? 'vanr. prof. dr.' : '',
+        officeLocation: isAdminUser ? 'Kabinet 3-14, Kampus UNSA' : '',
+        consultationHours: isAdminUser ? 'Utorak 12:00–14:00, Četvrtak 11:00–12:00' : '',
+        studyYear: 'II godina · I ciklus (Bachelor)',
+        studyTrack: 'Bachelor · Računarstvo i informatika',
+        personalNote: '',
+        notificationPrefs: DEFAULT_NOTIFICATION_PREFS,
+        isSeed: false,
+      };
+    }
   } else {
     const data = profileSnap.data() as UserProfile;
-    profile = { ...data, uid };
+    profile = {
+      ...data,
+      uid,
+      studyTrack: data.studyTrack ? normalizeStudyTrack(data.studyTrack) : data.studyTrack,
+      notificationPrefs: data.notificationPrefs
+        ? { ...DEFAULT_NOTIFICATION_PREFS, ...data.notificationPrefs }
+        : DEFAULT_NOTIFICATION_PREFS,
+    };
   }
 
   let privateSnap;
@@ -148,24 +362,161 @@ export async function ensureUserAccount(params: {
   }
 
   const safeEmail = sanitizeText(email, VALIDATION_CONSTRAINTS.EMAIL_MAX_LENGTH);
+  let resolvedPhone = '';
+  let resolvedEmail = safeEmail;
+
   if (!privateSnap.exists()) {
-    try {
-      await setDoc(doc(db, 'userPrivate', uid), {
-        uid,
-        email: safeEmail,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      });
-    } catch (error) {
-      handleFirestoreError(error, OperationType.CREATE, privatePath);
+    if (emailVerified && safeEmail) {
+      try {
+        await setDoc(doc(db, 'userPrivate', uid), {
+          uid,
+          email: safeEmail,
+          phone: '',
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      } catch (error) {
+        handleFirestoreError(error, OperationType.CREATE, privatePath);
+      }
     }
+  } else {
+    const priv = privateSnap.data() as UserPrivate;
+    resolvedEmail = priv.email || safeEmail;
+    resolvedPhone = priv.phone || '';
   }
 
   return {
     profile,
-    privateData: { uid, email: safeEmail },
+    privateData: { uid, email: resolvedEmail, phone: resolvedPhone },
     isAdminUser: isAdminUser || profile.role === UserRole.ADMIN,
   };
+}
+
+/**
+ * Student self-service profile update: strictly writes ONLY personalNote and notificationPrefs
+ * on userProfiles/{uid}, and phone on userPrivate/{uid}. Faculty-assigned fields (studentIndex,
+ * studyTrack, studyYear, department, fullName, academicYear) are locked by both UI and Firestore rules.
+ */
+export async function updateStudentOwnAllowedProfile(
+  uid: string,
+  updates: {
+    personalNote: string;
+    notificationPrefs: NotificationPreferences;
+    phone: string;
+  }
+): Promise<void> {
+  const cleanNote = sanitizeText(
+    updates.personalNote,
+    VALIDATION_CONSTRAINTS.PERSONAL_NOTE_MAX_LENGTH
+  );
+  const cleanPhone = sanitizeText(updates.phone, VALIDATION_CONSTRAINTS.PHONE_MAX_LENGTH);
+  const cleanPrefs: NotificationPreferences = {
+    resultsPublished: Boolean(updates.notificationPrefs.resultsPublished),
+    pointsChanged: Boolean(updates.notificationPrefs.pointsChanged),
+    attendanceRecorded: Boolean(updates.notificationPrefs.attendanceRecorded),
+    newExamTerm: Boolean(updates.notificationPrefs.newExamTerm),
+    announcements: Boolean(updates.notificationPrefs.announcements),
+  };
+
+  try {
+    await updateDoc(doc(db, 'userProfiles', uid), {
+      personalNote: cleanNote,
+      notificationPrefs: cleanPrefs,
+      updatedAt: serverTimestamp(),
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `userProfiles/${uid}`);
+  }
+
+  try {
+    const privRef = doc(db, 'userPrivate', uid);
+    const privSnap = await getDoc(privRef);
+    if (privSnap.exists()) {
+      await updateDoc(privRef, {
+        phone: cleanPhone,
+        updatedAt: serverTimestamp(),
+      });
+    }
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `userPrivate/${uid}`);
+  }
+}
+
+/**
+ * Professor / Admin self-service profile update: allows editing all professor fields
+ * plus optional contact phone and personal note.
+ */
+export async function updateProfessorOwnProfile(
+  uid: string,
+  updates: {
+    fullName: string;
+    department: string;
+    academicYear: string;
+    academicTitle: string;
+    officeLocation: string;
+    consultationHours: string;
+    personalNote?: string;
+    phone?: string;
+  }
+): Promise<void> {
+  const fullName = sanitizeText(updates.fullName, VALIDATION_CONSTRAINTS.FULL_NAME_MAX_LENGTH);
+  if (!fullName) {
+    throw new Error('Ime i prezime nastavnika je obavezno.');
+  }
+  const department =
+    sanitizeText(updates.department, VALIDATION_CONSTRAINTS.DEPARTMENT_MAX_LENGTH) ||
+    'Računarstvo i informatika';
+  const academicYear =
+    sanitizeText(updates.academicYear, VALIDATION_CONSTRAINTS.ACADEMIC_YEAR_MAX_LENGTH) ||
+    '2026/2027';
+
+  const patch: Record<string, unknown> = {
+    fullName,
+    department,
+    academicYear,
+    academicTitle: sanitizeText(
+      updates.academicTitle,
+      VALIDATION_CONSTRAINTS.ACADEMIC_TITLE_MAX_LENGTH
+    ),
+    officeLocation: sanitizeText(
+      updates.officeLocation,
+      VALIDATION_CONSTRAINTS.OFFICE_LOCATION_MAX_LENGTH
+    ),
+    consultationHours: sanitizeText(
+      updates.consultationHours,
+      VALIDATION_CONSTRAINTS.CONSULTATION_HOURS_MAX_LENGTH
+    ),
+    updatedAt: serverTimestamp(),
+  };
+
+  if (updates.personalNote !== undefined) {
+    patch.personalNote = sanitizeText(
+      updates.personalNote,
+      VALIDATION_CONSTRAINTS.PERSONAL_NOTE_MAX_LENGTH
+    );
+  }
+
+  try {
+    await updateDoc(doc(db, 'userProfiles', uid), patch);
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `userProfiles/${uid}`);
+  }
+
+  if (updates.phone !== undefined) {
+    const cleanPhone = sanitizeText(updates.phone, VALIDATION_CONSTRAINTS.PHONE_MAX_LENGTH);
+    try {
+      const privRef = doc(db, 'userPrivate', uid);
+      const privSnap = await getDoc(privRef);
+      if (privSnap.exists()) {
+        await updateDoc(privRef, {
+          phone: cleanPhone,
+          updatedAt: serverTimestamp(),
+        });
+      }
+    } catch (error) {
+      handleFirestoreError(error, OperationType.UPDATE, `userPrivate/${uid}`);
+    }
+  }
 }
 
 export async function updateOwnProfile(
@@ -176,6 +527,11 @@ export async function updateOwnProfile(
     studentIndex: string;
     department: string;
     academicYear: string;
+    academicTitle?: string;
+    officeLocation?: string;
+    consultationHours?: string;
+    studyYear?: string;
+    studyTrack?: string;
   }
 ): Promise<void> {
   const fullName = sanitizeText(updates.fullName, VALIDATION_CONSTRAINTS.FULL_NAME_MAX_LENGTH);
@@ -183,14 +539,12 @@ export async function updateOwnProfile(
     updates.studentIndex,
     VALIDATION_CONSTRAINTS.STUDENT_INDEX_MAX_LENGTH
   );
-  const department = sanitizeText(
-    updates.department,
-    VALIDATION_CONSTRAINTS.DEPARTMENT_MAX_LENGTH
-  );
-  const academicYear = sanitizeText(
-    updates.academicYear,
-    VALIDATION_CONSTRAINTS.ACADEMIC_YEAR_MAX_LENGTH
-  );
+  const department =
+    sanitizeText(updates.department, VALIDATION_CONSTRAINTS.DEPARTMENT_MAX_LENGTH) ||
+    'Računarstvo i informatika';
+  const academicYear =
+    sanitizeText(updates.academicYear, VALIDATION_CONSTRAINTS.ACADEMIC_YEAR_MAX_LENGTH) ||
+    '2026/2027';
 
   if (!fullName) {
     throw new Error('Ime i prezime je obavezno.');
@@ -206,14 +560,47 @@ export async function updateOwnProfile(
     }
   }
 
+  const profilePatch: Record<string, unknown> = {
+    fullName,
+    studentIndex,
+    department,
+    academicYear,
+    updatedAt: serverTimestamp(),
+  };
+
+  if (updates.academicTitle !== undefined) {
+    profilePatch.academicTitle = sanitizeText(
+      updates.academicTitle,
+      VALIDATION_CONSTRAINTS.ACADEMIC_TITLE_MAX_LENGTH
+    );
+  }
+  if (updates.officeLocation !== undefined) {
+    profilePatch.officeLocation = sanitizeText(
+      updates.officeLocation,
+      VALIDATION_CONSTRAINTS.OFFICE_LOCATION_MAX_LENGTH
+    );
+  }
+  if (updates.consultationHours !== undefined) {
+    profilePatch.consultationHours = sanitizeText(
+      updates.consultationHours,
+      VALIDATION_CONSTRAINTS.CONSULTATION_HOURS_MAX_LENGTH
+    );
+  }
+  if (updates.studyYear !== undefined) {
+    profilePatch.studyYear = sanitizeText(
+      updates.studyYear,
+      VALIDATION_CONSTRAINTS.STUDY_YEAR_MAX_LENGTH
+    );
+  }
+  if (updates.studyTrack !== undefined) {
+    profilePatch.studyTrack = sanitizeText(
+      updates.studyTrack,
+      VALIDATION_CONSTRAINTS.STUDY_TRACK_MAX_LENGTH
+    );
+  }
+
   try {
-    await updateDoc(doc(db, 'userProfiles', uid), {
-      fullName,
-      studentIndex,
-      department,
-      academicYear,
-      updatedAt: serverTimestamp(),
-    });
+    await updateDoc(doc(db, 'userProfiles', uid), profilePatch);
   } catch (error) {
     handleFirestoreError(error, OperationType.UPDATE, `userProfiles/${uid}`);
   }
@@ -231,6 +618,12 @@ export async function updateOwnProfile(
   }
 
   if (studentIndex) {
+    const dirDepartmentLabel =
+      sanitizeText(
+        formatStudentRosterProgramLabel(department, updates.studyTrack),
+        VALIDATION_CONSTRAINTS.DEPARTMENT_MAX_LENGTH
+      ) || department;
+
     const dirRef = doc(db, 'studentDirectory', studentIndex);
     try {
       const snap = await getDoc(dirRef);
@@ -239,7 +632,7 @@ export async function updateOwnProfile(
           studentIndex,
           uid,
           fullName,
-          department,
+          department: dirDepartmentLabel,
           isSeed: false,
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
@@ -247,7 +640,7 @@ export async function updateOwnProfile(
       } else if (snap.data().uid === uid) {
         await updateDoc(dirRef, {
           fullName,
-          department,
+          department: dirDepartmentLabel,
           updatedAt: serverTimestamp(),
         });
       }
@@ -409,12 +802,32 @@ export function subscribeStudentFinalGrades(
   );
 }
 
-export async function fetchCourseBundleByIds(courseId: string): Promise<{
+export function subscribeStudentExamRegistrations(
+  studentId: string,
+  onData: (registrations: ExamRegistration[]) => void
+): Unsubscribe {
+  const q = query(collection(db, 'examRegistrations'), where('studentId', '==', studentId));
+  return onSnapshot(
+    q,
+    (snap) => {
+      onData(
+        snap.docs.map((d) => ({ ...(d.data() as Omit<ExamRegistration, 'id'>), id: d.id }))
+      );
+    },
+    (error) => handleFirestoreError(error, OperationType.LIST, 'examRegistrations')
+  );
+}
+
+export interface StudentCourseBundle {
   course: Course | null;
   categories: GradingCategory[];
   items: GradingItem[];
   sessions: AttendanceSession[];
-}> {
+  examTerms: ExamTerm[];
+  scheduleEvents: ScheduleEvent[];
+}
+
+export async function fetchCourseBundleByIds(courseId: string): Promise<StudentCourseBundle> {
   let courseSnap;
   try {
     courseSnap = await getDoc(doc(db, 'courses', courseId));
@@ -423,15 +836,27 @@ export async function fetchCourseBundleByIds(courseId: string): Promise<{
   }
 
   if (!courseSnap.exists()) {
-    return { course: null, categories: [], items: [], sessions: [] };
+    return {
+      course: null,
+      categories: [],
+      items: [],
+      sessions: [],
+      examTerms: [],
+      scheduleEvents: [],
+    };
   }
 
+  const rawCourse = courseSnap.data() as Omit<Course, 'id'>;
   const course: Course = {
-    ...(courseSnap.data() as Omit<Course, 'id'>),
+    ...rawCourse,
     id: courseSnap.id,
+    studyProgram: rawCourse.studyProgram ? normalizeStudyTrack(rawCourse.studyProgram) : undefined,
   };
 
-  const [catSnaps, itemSnaps, sessionSnaps] = await Promise.all([
+  const examTermIds = course.examTermIds ?? [];
+  const scheduleEventIds = course.scheduleEventIds ?? [];
+
+  const [catSnaps, itemSnaps, sessionSnaps, termSnaps, schedSnaps] = await Promise.all([
     Promise.all(
       course.categoryIds.map(async (catId) => {
         try {
@@ -459,6 +884,24 @@ export async function fetchCourseBundleByIds(courseId: string): Promise<{
         }
       })
     ),
+    Promise.all(
+      examTermIds.map(async (termId) => {
+        try {
+          return await getDoc(doc(db, 'examTerms', termId));
+        } catch (error) {
+          handleFirestoreError(error, OperationType.GET, `examTerms/${termId}`);
+        }
+      })
+    ),
+    Promise.all(
+      scheduleEventIds.map(async (evId) => {
+        try {
+          return await getDoc(doc(db, 'scheduleEvents', evId));
+        } catch (error) {
+          handleFirestoreError(error, OperationType.GET, `scheduleEvents/${evId}`);
+        }
+      })
+    ),
   ]);
 
   const categories: GradingCategory[] = catSnaps
@@ -473,7 +916,185 @@ export async function fetchCourseBundleByIds(courseId: string): Promise<{
     .filter((s) => s.exists())
     .map((s) => ({ ...(s.data() as Omit<AttendanceSession, 'id'>), id: s.id }));
 
-  return { course, categories, items, sessions };
+  const examTerms: ExamTerm[] = termSnaps
+    .filter((s) => s.exists())
+    .map((s) => ({ ...(s.data() as Omit<ExamTerm, 'id'>), id: s.id }));
+
+  const scheduleEvents: ScheduleEvent[] = schedSnaps
+    .filter((s) => s.exists())
+    .map((s) => ({ ...(s.data() as Omit<ScheduleEvent, 'id'>), id: s.id }));
+
+  return { course, categories, items, sessions, examTerms, scheduleEvents };
+}
+
+/**
+ * Subscribes live to an enrolled course document, its published exam terms,
+ * and its schedule events so students immediately see newly published exam dates,
+ * deadline updates, or schedule changes without refreshing.
+ */
+export function subscribeStudentEnrolledCourseLive(
+  courseId: string,
+  onBundle: (bundle: StudentCourseBundle) => void
+): Unsubscribe {
+  let childUnsubs: Unsubscribe[] = [];
+  let active = true;
+
+  const cleanupChildren = () => {
+    for (const u of childUnsubs) u();
+    childUnsubs = [];
+  };
+
+  const unsubCourse = onSnapshot(
+    doc(db, 'courses', courseId),
+    async (courseSnap) => {
+      cleanupChildren();
+      if (!active) return;
+
+      if (!courseSnap.exists()) {
+        onBundle({
+          course: null,
+          categories: [],
+          items: [],
+          sessions: [],
+          examTerms: [],
+          scheduleEvents: [],
+        });
+        return;
+      }
+
+      const rawCourse = courseSnap.data() as Omit<Course, 'id'>;
+      const course: Course = {
+        ...rawCourse,
+        id: courseSnap.id,
+        studyProgram: rawCourse.studyProgram
+          ? normalizeStudyTrack(rawCourse.studyProgram)
+          : undefined,
+      };
+
+      const [catSnaps, itemSnaps, sessionSnaps] = await Promise.all([
+        Promise.all(
+          course.categoryIds.map(async (catId) => {
+            try {
+              return await getDoc(doc(db, 'gradingCategories', catId));
+            } catch (error) {
+              handleFirestoreError(error, OperationType.GET, `gradingCategories/${catId}`);
+            }
+          })
+        ),
+        Promise.all(
+          course.itemIds.map(async (itemId) => {
+            try {
+              return await getDoc(doc(db, 'gradingItems', itemId));
+            } catch (error) {
+              handleFirestoreError(error, OperationType.GET, `gradingItems/${itemId}`);
+            }
+          })
+        ),
+        Promise.all(
+          course.sessionIds.map(async (sesId) => {
+            try {
+              return await getDoc(doc(db, 'attendanceSessions', sesId));
+            } catch (error) {
+              handleFirestoreError(error, OperationType.GET, `attendanceSessions/${sesId}`);
+            }
+          })
+        ),
+      ]);
+
+      if (!active) return;
+
+      const categories: GradingCategory[] = catSnaps
+        .filter((s) => s.exists())
+        .map((s) => ({ ...(s.data() as Omit<GradingCategory, 'id'>), id: s.id }));
+      const items: GradingItem[] = itemSnaps
+        .filter((s) => s.exists())
+        .map((s) => ({ ...(s.data() as Omit<GradingItem, 'id'>), id: s.id }));
+      const sessions: AttendanceSession[] = sessionSnaps
+        .filter((s) => s.exists())
+        .map((s) => ({ ...(s.data() as Omit<AttendanceSession, 'id'>), id: s.id }));
+
+      const termIds = course.examTermIds ?? [];
+      const schedIds = course.scheduleEventIds ?? [];
+
+      if (termIds.length === 0 && schedIds.length === 0) {
+        onBundle({
+          course,
+          categories,
+          items,
+          sessions,
+          examTerms: [],
+          scheduleEvents: [],
+        });
+        return;
+      }
+
+      const liveTermsMap = new Map<string, ExamTerm>();
+      const liveSchedMap = new Map<string, ScheduleEvent>();
+
+      const emit = () => {
+        if (!active) return;
+        const orderedTerms = termIds
+          .map((id) => liveTermsMap.get(id))
+          .filter((t): t is ExamTerm => Boolean(t));
+        const orderedSched = schedIds
+          .map((id) => liveSchedMap.get(id))
+          .filter((ev): ev is ScheduleEvent => Boolean(ev));
+        onBundle({
+          course,
+          categories,
+          items,
+          sessions,
+          examTerms: orderedTerms,
+          scheduleEvents: orderedSched,
+        });
+      };
+
+      const tUnsubs = termIds.map((termId) =>
+        onSnapshot(
+          doc(db, 'examTerms', termId),
+          (tSnap) => {
+            if (tSnap.exists()) {
+              liveTermsMap.set(termId, {
+                ...(tSnap.data() as Omit<ExamTerm, 'id'>),
+                id: tSnap.id,
+              });
+            } else {
+              liveTermsMap.delete(termId);
+            }
+            emit();
+          },
+          (err) => handleFirestoreError(err, OperationType.GET, `examTerms/${termId}`)
+        )
+      );
+
+      const sUnsubs = schedIds.map((evId) =>
+        onSnapshot(
+          doc(db, 'scheduleEvents', evId),
+          (sSnap) => {
+            if (sSnap.exists()) {
+              liveSchedMap.set(evId, {
+                ...(sSnap.data() as Omit<ScheduleEvent, 'id'>),
+                id: sSnap.id,
+              });
+            } else {
+              liveSchedMap.delete(evId);
+            }
+            emit();
+          },
+          (err) => handleFirestoreError(err, OperationType.GET, `scheduleEvents/${evId}`)
+        )
+      );
+
+      childUnsubs = [...tUnsubs, ...sUnsubs];
+    },
+    (err) => handleFirestoreError(err, OperationType.GET, `courses/${courseId}`)
+  );
+
+  return () => {
+    active = false;
+    cleanupChildren();
+    unsubCourse();
+  };
 }
 
 // ============================================================================
@@ -495,6 +1116,40 @@ export function subscribeProfessorCourses(
     },
     (error) => handleFirestoreError(error, OperationType.LIST, 'courses')
   );
+}
+
+export function subscribeProfessorAllExamData(
+  professorUid: string,
+  callbacks: {
+    onExamTerms: (rows: ExamTerm[]) => void;
+    onExamRegistrations: (rows: ExamRegistration[]) => void;
+  }
+): Unsubscribe {
+  const unsubTerms = onSnapshot(
+    query(collection(db, 'examTerms'), where('professorIds', 'array-contains', professorUid)),
+    (snap) =>
+      callbacks.onExamTerms(
+        snap.docs.map((d) => ({ ...(d.data() as Omit<ExamTerm, 'id'>), id: d.id }))
+      ),
+    (err) => handleFirestoreError(err, OperationType.LIST, 'examTerms')
+  );
+
+  const unsubRegs = onSnapshot(
+    query(
+      collection(db, 'examRegistrations'),
+      where('professorIds', 'array-contains', professorUid)
+    ),
+    (snap) =>
+      callbacks.onExamRegistrations(
+        snap.docs.map((d) => ({ ...(d.data() as Omit<ExamRegistration, 'id'>), id: d.id }))
+      ),
+    (err) => handleFirestoreError(err, OperationType.LIST, 'examRegistrations')
+  );
+
+  return () => {
+    unsubTerms();
+    unsubRegs();
+  };
 }
 
 export function subscribeProfessorCourseData(
@@ -625,6 +1280,9 @@ export function subscribeProfessorCourseData(
 export async function createCourse(params: {
   professorUid: string;
   professorName: string;
+  professorNames?: string[];
+  assistantNames?: string[];
+  studyProgram?: string;
   code: string;
   name: string;
   semester: string;
@@ -643,6 +1301,26 @@ export async function createCourse(params: {
   const name = sanitizeText(params.name, VALIDATION_CONSTRAINTS.COURSE_NAME_MAX_LENGTH);
   if (!name) throw new Error('Naziv predmeta je obavezan.');
 
+  const cleanLeadProf =
+    sanitizeText(params.professorName, VALIDATION_CONSTRAINTS.FULL_NAME_MAX_LENGTH) || 'Profesor';
+
+  const cleanProfessorNames = sanitizeStaffList(
+    params.professorNames && params.professorNames.length > 0
+      ? [cleanLeadProf, ...params.professorNames]
+      : [cleanLeadProf],
+    VALIDATION_CONSTRAINTS.MAX_PROFESSORS_PER_COURSE
+  );
+
+  const cleanAssistantNames = sanitizeStaffList(
+    params.assistantNames ?? [],
+    VALIDATION_CONSTRAINTS.MAX_ASSISTANTS_PER_COURSE
+  );
+
+  const cleanStudyProgram = sanitizeText(
+    params.studyProgram || 'Bachelor · Računarstvo i informatika',
+    VALIDATION_CONSTRAINTS.STUDY_PROGRAM_MAX_LENGTH
+  );
+
   const courseId = makeEntityId('crs');
 
   // Create default ETF grading categories alongside the course
@@ -654,62 +1332,67 @@ export async function createCourse(params: {
     { id: makeEntityId('cat'), name: 'Završni ispit', maxPoints: 30, order: 5 },
   ];
 
-  const batch = writeBatch(db);
-  batch.set(doc(db, 'courses', courseId), {
-    code,
-    name,
-    semester: sanitizeText(
-      params.semester || 'Zimski semestar',
-      VALIDATION_CONSTRAINTS.SEMESTER_MAX_LENGTH
-    ),
-    academicYear: sanitizeText(
-      params.academicYear || '2026/2027',
-      VALIDATION_CONSTRAINTS.ACADEMIC_YEAR_MAX_LENGTH
-    ),
-    ects: Math.max(1, Math.min(30, Math.round(params.ects || 6))),
-    leadProfessorId: params.professorUid,
-    leadProfessorName: sanitizeText(
-      params.professorName,
-      VALIDATION_CONSTRAINTS.FULL_NAME_MAX_LENGTH
-    ),
-    professorIds: [params.professorUid],
-    categoryIds: defaultCats.map((c) => c.id),
-    itemIds: [],
-    sessionIds: [],
-    attendanceEnabled: params.attendanceEnabled,
-    attendanceMaxPoints: params.attendanceEnabled
-      ? Math.max(0, Math.min(100, Number(params.attendanceMaxPoints ?? 10)))
-      : 0,
-    allowBonusPoints: false,
-    grade6Threshold: 55,
-    grade7Threshold: 65,
-    grade8Threshold: 75,
-    grade9Threshold: 85,
-    grade10Threshold: 95,
-    isSeed: false,
-    createdAt: serverTimestamp(),
-    updatedAt: serverTimestamp(),
-  });
-
-  for (const cat of defaultCats) {
-    batch.set(doc(db, 'gradingCategories', cat.id), {
-      courseId,
-      name: cat.name,
-      maxPoints: cat.maxPoints,
-      order: cat.order,
+  try {
+    await setDoc(doc(db, 'courses', courseId), {
+      code,
+      name,
+      semester: sanitizeText(
+        params.semester || 'Zimski semestar',
+        VALIDATION_CONSTRAINTS.SEMESTER_MAX_LENGTH
+      ),
+      academicYear: sanitizeText(
+        params.academicYear || '2026/2027',
+        VALIDATION_CONSTRAINTS.ACADEMIC_YEAR_MAX_LENGTH
+      ),
+      ects: Math.max(1, Math.min(30, Math.round(params.ects || 6))),
+      leadProfessorId: params.professorUid,
+      leadProfessorName: cleanProfessorNames[0] || cleanLeadProf,
       professorIds: [params.professorUid],
+      professorNames: cleanProfessorNames,
+      assistantNames: cleanAssistantNames,
+      studyProgram: cleanStudyProgram,
+      categoryIds: defaultCats.map((c) => c.id),
+      itemIds: [],
+      sessionIds: [],
+      examTermIds: [],
+      attendanceEnabled: params.attendanceEnabled,
+      attendanceMaxPoints: params.attendanceEnabled
+        ? Math.max(0, Math.min(100, Number(params.attendanceMaxPoints ?? 10)))
+        : 0,
+      allowBonusPoints: false,
+      grade6Threshold: 55,
+      grade7Threshold: 65,
+      grade8Threshold: 75,
+      grade9Threshold: 85,
+      grade10Threshold: 95,
       isSeed: false,
       createdAt: serverTimestamp(),
       updatedAt: serverTimestamp(),
     });
-  }
-
-  try {
-    await batch.commit();
-    return courseId;
   } catch (error) {
     handleFirestoreError(error, OperationType.CREATE, `courses/${courseId}`);
   }
+
+  await Promise.all(
+    defaultCats.map(async (cat) => {
+      try {
+        await setDoc(doc(db, 'gradingCategories', cat.id), {
+          courseId,
+          name: cat.name,
+          maxPoints: cat.maxPoints,
+          order: cat.order,
+          professorIds: [params.professorUid],
+          isSeed: false,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      } catch (error) {
+        handleFirestoreError(error, OperationType.CREATE, `gradingCategories/${cat.id}`);
+      }
+    })
+  );
+
+  return courseId;
 }
 
 export async function updateCourseSettings(
@@ -720,6 +1403,9 @@ export async function updateCourseSettings(
     academicYear: string;
     ects: number;
     leadProfessorName: string;
+    professorNames?: string[];
+    assistantNames?: string[];
+    studyProgram?: string;
     attendanceEnabled: boolean;
     attendanceMaxPoints: number;
     allowBonusPoints: boolean;
@@ -738,32 +1424,280 @@ export async function updateCourseSettings(
     throw new Error('Maksimalni bodovi za prisustvo moraju biti između 0 i 100.');
   }
 
+  const cleanLead = sanitizeText(
+    updates.leadProfessorName,
+    VALIDATION_CONSTRAINTS.FULL_NAME_MAX_LENGTH
+  );
+  if (!cleanLead) {
+    throw new Error('Ime odgovornog nastavnika je obavezno.');
+  }
+
+  const patch: Record<string, unknown> = {
+    name: sanitizeText(updates.name, VALIDATION_CONSTRAINTS.COURSE_NAME_MAX_LENGTH),
+    semester: sanitizeText(updates.semester, VALIDATION_CONSTRAINTS.SEMESTER_MAX_LENGTH),
+    academicYear: sanitizeText(
+      updates.academicYear,
+      VALIDATION_CONSTRAINTS.ACADEMIC_YEAR_MAX_LENGTH
+    ),
+    ects: Math.max(1, Math.min(30, Number(updates.ects))),
+    leadProfessorName: cleanLead,
+    attendanceEnabled: updates.attendanceEnabled,
+    attendanceMaxPoints: Number(updates.attendanceMaxPoints),
+    allowBonusPoints: updates.allowBonusPoints,
+    grade6Threshold: Number(updates.grade6Threshold),
+    grade7Threshold: Number(updates.grade7Threshold),
+    grade8Threshold: Number(updates.grade8Threshold),
+    grade9Threshold: Number(updates.grade9Threshold),
+    grade10Threshold: Number(updates.grade10Threshold),
+    updatedAt: serverTimestamp(),
+  };
+
+  if (updates.professorNames) {
+    const cleanedProfs = sanitizeStaffList(
+      [cleanLead, ...updates.professorNames.slice(1)],
+      VALIDATION_CONSTRAINTS.MAX_PROFESSORS_PER_COURSE
+    );
+    patch.professorNames = cleanedProfs.length > 0 ? cleanedProfs : [cleanLead];
+  }
+  if (updates.assistantNames !== undefined) {
+    patch.assistantNames = sanitizeStaffList(
+      updates.assistantNames,
+      VALIDATION_CONSTRAINTS.MAX_ASSISTANTS_PER_COURSE
+    );
+  }
+  if (updates.studyProgram !== undefined) {
+    patch.studyProgram = sanitizeText(
+      updates.studyProgram,
+      VALIDATION_CONSTRAINTS.STUDY_PROGRAM_MAX_LENGTH
+    );
+  }
+
   try {
-    await updateDoc(doc(db, 'courses', courseId), {
-      name: sanitizeText(updates.name, VALIDATION_CONSTRAINTS.COURSE_NAME_MAX_LENGTH),
-      semester: sanitizeText(updates.semester, VALIDATION_CONSTRAINTS.SEMESTER_MAX_LENGTH),
-      academicYear: sanitizeText(
-        updates.academicYear,
-        VALIDATION_CONSTRAINTS.ACADEMIC_YEAR_MAX_LENGTH
-      ),
-      ects: Math.max(1, Math.min(30, Number(updates.ects))),
-      leadProfessorName: sanitizeText(
-        updates.leadProfessorName,
-        VALIDATION_CONSTRAINTS.FULL_NAME_MAX_LENGTH
-      ),
-      attendanceEnabled: updates.attendanceEnabled,
-      attendanceMaxPoints: Number(updates.attendanceMaxPoints),
-      allowBonusPoints: updates.allowBonusPoints,
-      grade6Threshold: Number(updates.grade6Threshold),
-      grade7Threshold: Number(updates.grade7Threshold),
-      grade8Threshold: Number(updates.grade8Threshold),
-      grade9Threshold: Number(updates.grade9Threshold),
-      grade10Threshold: Number(updates.grade10Threshold),
-      updatedAt: serverTimestamp(),
-    });
+    await updateDoc(doc(db, 'courses', courseId), patch);
   } catch (error) {
     handleFirestoreError(error, OperationType.UPDATE, `courses/${courseId}`);
   }
+}
+
+export async function updateCourseTeachingStaff(params: {
+  course: Course;
+  professorNames: string[];
+  assistantNames: string[];
+  enrollments?: Enrollment[];
+}): Promise<void> {
+  const { course, professorNames, assistantNames, enrollments = [] } = params;
+
+  const cleanedProfessors = sanitizeStaffList(
+    professorNames,
+    VALIDATION_CONSTRAINTS.MAX_PROFESSORS_PER_COURSE
+  );
+  if (cleanedProfessors.length === 0) {
+    throw new Error('Predmet mora imati najmanje jednog dodijeljenog profesora.');
+  }
+
+  const cleanedAssistants = sanitizeStaffList(
+    assistantNames,
+    VALIDATION_CONSTRAINTS.MAX_ASSISTANTS_PER_COURSE
+  );
+
+  const nextLeadName = cleanedProfessors[0];
+
+  try {
+    await updateDoc(doc(db, 'courses', course.id), {
+      leadProfessorName: nextLeadName,
+      professorNames: cleanedProfessors,
+      assistantNames: cleanedAssistants,
+      updatedAt: serverTimestamp(),
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `courses/${course.id}`);
+  }
+
+  if (enrollments.length > 0 && nextLeadName !== course.leadProfessorName) {
+    await runParallelChunks(enrollments, 15, async (enr) => {
+      try {
+        await updateDoc(doc(db, 'enrollments', enr.id), {
+          leadProfessorName: nextLeadName,
+          updatedAt: serverTimestamp(),
+        });
+      } catch {
+        // Non-blocking denormalized label sync
+      }
+    });
+  }
+}
+
+async function syncCourseProfessorIdsAcrossChildren(params: {
+  courseId: string;
+  actorUid: string;
+  nextProfessorIds: string[];
+  isAdminUser?: boolean;
+}): Promise<void> {
+  const { courseId, actorUid, nextProfessorIds, isAdminUser = false } = params;
+  const standardCollections = [
+    'enrollments',
+    'gradingCategories',
+    'gradingItems',
+    'attendanceSessions',
+    'examTerms',
+    'examRegistrations',
+    'scheduleEvents',
+    'scores',
+    'attendanceRecords',
+  ] as const;
+
+  for (const colName of standardCollections) {
+    try {
+      const q = query(
+        collection(db, colName),
+        where('professorIds', 'array-contains', actorUid),
+        where('courseId', '==', courseId)
+      );
+      const snap = await getDocs(q);
+      await runParallelChunks(snap.docs, 15, async (d) => {
+        await updateDoc(d.ref, {
+          professorIds: nextProfessorIds,
+          updatedAt: serverTimestamp(),
+        });
+      });
+    } catch {
+      // Best-effort sync
+    }
+  }
+
+  try {
+    const fgQ = query(
+      collection(db, 'finalGrades'),
+      where('professorIds', 'array-contains', actorUid),
+      where('courseId', '==', courseId)
+    );
+    const fgSnap = await getDocs(fgQ);
+    const editableFgDocs = fgSnap.docs.filter(
+      (d) => isAdminUser || d.data().status !== FinalGradeStatus.FINALIZED
+    );
+    await runParallelChunks(editableFgDocs, 15, async (d) => {
+      await updateDoc(d.ref, {
+        professorIds: nextProfessorIds,
+        finalizedBy: actorUid,
+        updatedAt: serverTimestamp(),
+      });
+    });
+  } catch {
+    // Best-effort sync
+  }
+}
+
+export async function linkCourseCoProfessorByUid(params: {
+  course: Course;
+  coProfessorUid: string;
+  actorUid: string;
+  isAdminUser?: boolean;
+}): Promise<string> {
+  const { course, coProfessorUid, actorUid, isAdminUser } = params;
+  const cleanUid = sanitizeText(coProfessorUid, VALIDATION_CONSTRAINTS.ID_MAX_LENGTH);
+  if (!isValidResourceId(cleanUid)) {
+    throw new Error('Unesite ispravan Nastavnički ID ko-profesora.');
+  }
+  if (course.professorIds.includes(cleanUid)) {
+    throw new Error('Ovaj profesor je već povezan sa predmetom.');
+  }
+  if (course.professorIds.length >= VALIDATION_CONSTRAINTS.MAX_PROFESSORS_PER_COURSE) {
+    throw new Error('Dostignut je maksimalan broj profesora na predmetu (10).');
+  }
+
+  let targetSnap;
+  try {
+    targetSnap = await getDoc(doc(db, 'userProfiles', cleanUid));
+  } catch (error) {
+    handleFirestoreError(error, OperationType.GET, `userProfiles/${cleanUid}`);
+  }
+
+  if (!targetSnap.exists()) {
+    throw new Error('Korisnički profil sa unesenim Nastavničkim ID-om nije pronađen.');
+  }
+
+  const targetData = targetSnap.data() as UserProfile;
+  if (targetData.role !== UserRole.PROFESSOR && targetData.role !== UserRole.ADMIN) {
+    throw new Error('Uneseni nalog nema ulogu profesora na portalu.');
+  }
+
+  const titlePrefix = targetData.academicTitle?.trim() || 'dr.';
+  const formattedName = sanitizeText(
+    targetData.fullName.toLowerCase().startsWith(titlePrefix.toLowerCase())
+      ? targetData.fullName
+      : `${titlePrefix} ${targetData.fullName}`,
+    VALIDATION_CONSTRAINTS.STAFF_NAME_MAX_LENGTH
+  );
+
+  const currentProfNames =
+    course.professorNames && course.professorNames.length > 0
+      ? course.professorNames
+      : [course.leadProfessorName];
+
+  const nextProfNames = sanitizeStaffList(
+    [...currentProfNames, formattedName],
+    VALIDATION_CONSTRAINTS.MAX_PROFESSORS_PER_COURSE
+  );
+  const nextProfIds = [...course.professorIds, cleanUid];
+
+  try {
+    await updateDoc(doc(db, 'courses', course.id), {
+      leadProfessorName: nextProfNames[0] || course.leadProfessorName,
+      professorIds: nextProfIds,
+      professorNames: nextProfNames,
+      assistantNames: course.assistantNames ?? [],
+      updatedAt: serverTimestamp(),
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `courses/${course.id}`);
+  }
+
+  await syncCourseProfessorIdsAcrossChildren({
+    courseId: course.id,
+    actorUid,
+    nextProfessorIds: nextProfIds,
+    isAdminUser,
+  });
+
+  return formattedName;
+}
+
+export async function unlinkCourseCoProfessorUid(params: {
+  course: Course;
+  coProfessorUid: string;
+  actorUid: string;
+  isAdminUser?: boolean;
+}): Promise<void> {
+  const { course, coProfessorUid, actorUid, isAdminUser } = params;
+  if (coProfessorUid === course.leadProfessorId) {
+    throw new Error('Odgovorni nastavnik predmeta ne može biti uklonjen.');
+  }
+  const nextProfIds = course.professorIds.filter((id) => id !== coProfessorUid);
+  if (nextProfIds.length === 0) {
+    throw new Error('Predmet mora zadržati najmanje jednog profesora.');
+  }
+
+  try {
+    await updateDoc(doc(db, 'courses', course.id), {
+      leadProfessorName: course.leadProfessorName,
+      professorIds: nextProfIds,
+      professorNames:
+        course.professorNames && course.professorNames.length > 0
+          ? course.professorNames
+          : [course.leadProfessorName],
+      assistantNames: course.assistantNames ?? [],
+      updatedAt: serverTimestamp(),
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `courses/${course.id}`);
+  }
+
+  await syncCourseProfessorIdsAcrossChildren({
+    courseId: course.id,
+    actorUid,
+    nextProfessorIds: nextProfIds,
+    isAdminUser,
+  });
 }
 
 export async function enrollStudentByIndex(params: {
@@ -906,14 +1840,24 @@ export async function deleteGradingCategory(params: {
 }): Promise<void> {
   const { course, categoryId, itemsInCategory, scoresInCategory } = params;
   const removedItemIds = new Set(itemsInCategory.map((i) => i.id));
-  const batch = writeBatch(db);
 
-  for (const sc of scoresInCategory) {
-    batch.delete(doc(db, 'scores', sc.id));
-  }
-  for (const it of itemsInCategory) {
-    batch.delete(doc(db, 'gradingItems', it.id));
-  }
+  await runParallelChunks(scoresInCategory, 20, async (sc) => {
+    try {
+      await deleteDoc(doc(db, 'scores', sc.id));
+    } catch (error) {
+      handleFirestoreError(error, OperationType.DELETE, `scores/${sc.id}`);
+    }
+  });
+
+  await runParallelChunks(itemsInCategory, 20, async (it) => {
+    try {
+      await deleteDoc(doc(db, 'gradingItems', it.id));
+    } catch (error) {
+      handleFirestoreError(error, OperationType.DELETE, `gradingItems/${it.id}`);
+    }
+  });
+
+  const batch = writeBatch(db);
   batch.delete(doc(db, 'gradingCategories', categoryId));
 
   const nextCatIds = course.categoryIds.filter((id) => id !== categoryId);
@@ -1031,10 +1975,16 @@ export async function deleteGradingItem(params: {
   itemScores: Score[];
 }): Promise<void> {
   const { course, itemId, itemScores } = params;
+
+  await runParallelChunks(itemScores, 20, async (sc) => {
+    try {
+      await deleteDoc(doc(db, 'scores', sc.id));
+    } catch (error) {
+      handleFirestoreError(error, OperationType.DELETE, `scores/${sc.id}`);
+    }
+  });
+
   const batch = writeBatch(db);
-  for (const sc of itemScores) {
-    batch.delete(doc(db, 'scores', sc.id));
-  }
   batch.delete(doc(db, 'gradingItems', itemId));
   batch.update(doc(db, 'courses', course.id), {
     itemIds: course.itemIds.filter((id) => id !== itemId),
@@ -1136,30 +2086,35 @@ export async function createAttendanceSessionWithInitialMarks(params: {
     updatedAt: serverTimestamp(),
   });
 
-  if (markAllPresent) {
-    for (const enr of enrolledStudents) {
-      const recordId = `${sessionId}_${enr.studentId}`;
-      batch.set(doc(db, 'attendanceRecords', recordId), {
-        courseId: course.id,
-        sessionId,
-        studentId: enr.studentId,
-        present: true,
-        note: '',
-        markedBy: professorUid,
-        professorIds: course.professorIds,
-        isSeed: false,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      });
-    }
-  }
-
   try {
     await batch.commit();
-    return sessionId;
   } catch (error) {
     handleFirestoreError(error, OperationType.CREATE, `attendanceSessions/${sessionId}`);
   }
+
+  if (markAllPresent && enrolledStudents.length > 0) {
+    await runParallelChunks(enrolledStudents, 15, async (enr) => {
+      const recordId = `${sessionId}_${enr.studentId}`;
+      try {
+        await setDoc(doc(db, 'attendanceRecords', recordId), {
+          courseId: course.id,
+          sessionId,
+          studentId: enr.studentId,
+          present: true,
+          note: '',
+          markedBy: professorUid,
+          professorIds: course.professorIds,
+          isSeed: false,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      } catch (error) {
+        handleFirestoreError(error, OperationType.CREATE, `attendanceRecords/${recordId}`);
+      }
+    });
+  }
+
+  return sessionId;
 }
 
 export async function updateAttendanceSession(
@@ -1189,10 +2144,16 @@ export async function deleteAttendanceSession(params: {
   sessionRecords: AttendanceRecord[];
 }): Promise<void> {
   const { course, sessionId, sessionRecords } = params;
+
+  await runParallelChunks(sessionRecords, 20, async (r) => {
+    try {
+      await deleteDoc(doc(db, 'attendanceRecords', r.id));
+    } catch (error) {
+      handleFirestoreError(error, OperationType.DELETE, `attendanceRecords/${r.id}`);
+    }
+  });
+
   const batch = writeBatch(db);
-  for (const r of sessionRecords) {
-    batch.delete(doc(db, 'attendanceRecords', r.id));
-  }
   batch.delete(doc(db, 'attendanceSessions', sessionId));
   batch.update(doc(db, 'courses', course.id), {
     sessionIds: course.sessionIds.filter((id) => id !== sessionId),
@@ -1268,40 +2229,42 @@ export async function markAllStudentsPresentInSession(params: {
 }): Promise<void> {
   const { course, sessionId, enrolledStudents, existingRecords, professorUid } = params;
   const existingMap = new Map(existingRecords.map((r) => [r.studentId, r]));
-  const batch = writeBatch(db);
 
-  for (const enr of enrolledStudents) {
+  await runParallelChunks(enrolledStudents, 15, async (enr) => {
     const recordId = `${sessionId}_${enr.studentId}`;
     const existing = existingMap.get(enr.studentId);
     if (existing) {
-      batch.update(doc(db, 'attendanceRecords', recordId), {
-        present: true,
-        note: existing.note,
-        markedBy: professorUid,
-        professorIds: course.professorIds,
-        updatedAt: serverTimestamp(),
-      });
+      if (existing.present) return;
+      try {
+        await updateDoc(doc(db, 'attendanceRecords', recordId), {
+          present: true,
+          note: existing.note,
+          markedBy: professorUid,
+          professorIds: course.professorIds,
+          updatedAt: serverTimestamp(),
+        });
+      } catch (error) {
+        handleFirestoreError(error, OperationType.UPDATE, `attendanceRecords/${recordId}`);
+      }
     } else {
-      batch.set(doc(db, 'attendanceRecords', recordId), {
-        courseId: course.id,
-        sessionId,
-        studentId: enr.studentId,
-        present: true,
-        note: '',
-        markedBy: professorUid,
-        professorIds: course.professorIds,
-        isSeed: false,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      });
+      try {
+        await setDoc(doc(db, 'attendanceRecords', recordId), {
+          courseId: course.id,
+          sessionId,
+          studentId: enr.studentId,
+          present: true,
+          note: '',
+          markedBy: professorUid,
+          professorIds: course.professorIds,
+          isSeed: false,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      } catch (error) {
+        handleFirestoreError(error, OperationType.CREATE, `attendanceRecords/${recordId}`);
+      }
     }
-  }
-
-  try {
-    await batch.commit();
-  } catch (error) {
-    handleFirestoreError(error, OperationType.WRITE, `attendanceRecords/${sessionId}`);
-  }
+  });
 }
 
 export async function saveFinalGradeRecord(params: {
@@ -1376,8 +2339,1149 @@ export async function saveFinalGradeRecord(params: {
 }
 
 // ============================================================================
+// Exam Terms & Student Exam Registrations ("Prijava ispita")
+// ============================================================================
+
+export async function createExamTerm(params: {
+  course: Course;
+  professorUid: string;
+  title: string;
+  examDate: string;
+  examTime: string;
+  classroom: string;
+  registrationOpenDate: string;
+  registrationCloseDate: string;
+  notes: string;
+}): Promise<string> {
+  const {
+    course,
+    professorUid,
+    title,
+    examDate,
+    examTime,
+    classroom,
+    registrationOpenDate,
+    registrationCloseDate,
+    notes,
+  } = params;
+
+  const existingIds = course.examTermIds ?? [];
+  if (existingIds.length >= VALIDATION_CONSTRAINTS.MAX_EXAM_TERMS_PER_COURSE) {
+    throw new Error('Dostignut je maksimalan broj ispitnih rokova za ovaj predmet (40).');
+  }
+
+  const cleanTitle = sanitizeText(title, VALIDATION_CONSTRAINTS.EXAM_TITLE_MAX_LENGTH);
+  if (!cleanTitle) {
+    throw new Error('Unesite naziv ispitnog roka (npr. I parcijalni ispit ili Završni ispit).');
+  }
+
+  const dateValidation = validateExamTermDates({
+    registrationOpenDate,
+    registrationCloseDate,
+    examDate,
+  });
+  if (!dateValidation.valid) {
+    throw new Error(dateValidation.error);
+  }
+
+  const termId = makeEntityId('ext');
+  const batch = writeBatch(db);
+
+  batch.set(doc(db, 'examTerms', termId), {
+    courseId: course.id,
+    courseCode: course.code,
+    courseName: course.name,
+    title: cleanTitle,
+    examDate,
+    examTime: sanitizeText(examTime, VALIDATION_CONSTRAINTS.SESSION_TIME_MAX_LENGTH),
+    classroom: sanitizeText(classroom, VALIDATION_CONSTRAINTS.CLASSROOM_MAX_LENGTH),
+    registrationOpenDate,
+    registrationCloseDate,
+    notes: sanitizeText(notes, VALIDATION_CONSTRAINTS.EXAM_NOTES_MAX_LENGTH),
+    isOpen: true,
+    createdBy: professorUid,
+    professorIds: course.professorIds,
+    isSeed: false,
+    createdAt: serverTimestamp(),
+    updatedAt: serverTimestamp(),
+  });
+
+  batch.update(doc(db, 'courses', course.id), {
+    examTermIds: [...existingIds, termId],
+    updatedAt: serverTimestamp(),
+  });
+
+  try {
+    await batch.commit();
+    return termId;
+  } catch (error) {
+    handleFirestoreError(error, OperationType.CREATE, `examTerms/${termId}`);
+  }
+}
+
+export async function updateExamTerm(
+  term: ExamTerm,
+  course: Course,
+  updates: {
+    title: string;
+    examDate: string;
+    examTime: string;
+    classroom: string;
+    registrationOpenDate: string;
+    registrationCloseDate: string;
+    notes: string;
+    isOpen: boolean;
+  }
+): Promise<void> {
+  const cleanTitle = sanitizeText(updates.title, VALIDATION_CONSTRAINTS.EXAM_TITLE_MAX_LENGTH);
+  if (!cleanTitle) {
+    throw new Error('Naziv ispitnog roka je obavezan.');
+  }
+
+  const dateValidation = validateExamTermDates({
+    registrationOpenDate: updates.registrationOpenDate,
+    registrationCloseDate: updates.registrationCloseDate,
+    examDate: updates.examDate,
+  });
+  if (!dateValidation.valid) {
+    throw new Error(dateValidation.error);
+  }
+
+  try {
+    await updateDoc(doc(db, 'examTerms', term.id), {
+      courseCode: course.code,
+      courseName: course.name,
+      title: cleanTitle,
+      examDate: updates.examDate,
+      examTime: sanitizeText(updates.examTime, VALIDATION_CONSTRAINTS.SESSION_TIME_MAX_LENGTH),
+      classroom: sanitizeText(updates.classroom, VALIDATION_CONSTRAINTS.CLASSROOM_MAX_LENGTH),
+      registrationOpenDate: updates.registrationOpenDate,
+      registrationCloseDate: updates.registrationCloseDate,
+      notes: sanitizeText(updates.notes, VALIDATION_CONSTRAINTS.EXAM_NOTES_MAX_LENGTH),
+      isOpen: updates.isOpen,
+      professorIds: course.professorIds,
+      updatedAt: serverTimestamp(),
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `examTerms/${term.id}`);
+  }
+}
+
+export async function toggleExamTermOpen(termId: string, isOpen: boolean): Promise<void> {
+  try {
+    await updateDoc(doc(db, 'examTerms', termId), {
+      isOpen,
+      updatedAt: serverTimestamp(),
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `examTerms/${termId}`);
+  }
+}
+
+export async function deleteExamTerm(params: {
+  course: Course;
+  termId: string;
+  termRegistrations: ExamRegistration[];
+}): Promise<void> {
+  const { course, termId, termRegistrations } = params;
+
+  await runParallelChunks(termRegistrations, 15, async (reg) => {
+    try {
+      await deleteDoc(doc(db, 'examRegistrations', reg.id));
+    } catch (error) {
+      handleFirestoreError(error, OperationType.DELETE, `examRegistrations/${reg.id}`);
+    }
+  });
+
+  const batch = writeBatch(db);
+  batch.delete(doc(db, 'examTerms', termId));
+  batch.update(doc(db, 'courses', course.id), {
+    examTermIds: (course.examTermIds ?? []).filter((id) => id !== termId),
+    updatedAt: serverTimestamp(),
+  });
+
+  try {
+    await batch.commit();
+  } catch (error) {
+    handleFirestoreError(error, OperationType.DELETE, `examTerms/${termId}`);
+  }
+}
+
+export async function setStudentExamRegistration(params: {
+  term: ExamTerm;
+  studentProfile: UserProfile;
+  status: ExamRegistrationStatus;
+  existingRegistration?: ExamRegistration;
+}): Promise<void> {
+  const { term, studentProfile, status, existingRegistration } = params;
+
+  const windowEval = getExamWindowState(term);
+  if (!windowEval.canRegisterOrCancel) {
+    throw new Error(
+      `Promjena prijave nije dostupna (${windowEval.label.toLowerCase()}).`
+    );
+  }
+
+  const registrationId = `${term.id}_${studentProfile.uid}`;
+  const cleanName =
+    sanitizeText(studentProfile.fullName, VALIDATION_CONSTRAINTS.FULL_NAME_MAX_LENGTH) ||
+    'Student';
+  const cleanIndex = sanitizeText(
+    studentProfile.studentIndex,
+    VALIDATION_CONSTRAINTS.STUDENT_INDEX_MAX_LENGTH
+  );
+  const cleanDept =
+    sanitizeText(studentProfile.department, VALIDATION_CONSTRAINTS.DEPARTMENT_MAX_LENGTH) ||
+    'Računarstvo i informatika';
+
+  if (existingRegistration) {
+    try {
+      await updateDoc(doc(db, 'examRegistrations', registrationId), {
+        status,
+        studentName: cleanName,
+        studentIndex: cleanIndex,
+        studentDepartment: cleanDept,
+        updatedAt: serverTimestamp(),
+      });
+      recordStudentSelfExamAction(studentProfile.uid, registrationId, status);
+    } catch (error) {
+      handleFirestoreError(error, OperationType.UPDATE, `examRegistrations/${registrationId}`);
+    }
+  } else {
+    try {
+      await setDoc(doc(db, 'examRegistrations', registrationId), {
+        termId: term.id,
+        courseId: term.courseId,
+        courseCode: term.courseCode,
+        courseName: term.courseName,
+        termTitle: term.title,
+        examDate: term.examDate,
+        studentId: studentProfile.uid,
+        studentName: cleanName,
+        studentIndex: cleanIndex,
+        studentDepartment: cleanDept,
+        status,
+        professorIds: term.professorIds,
+        isSeed: false,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+      recordStudentSelfExamAction(studentProfile.uid, registrationId, status);
+    } catch (error) {
+      handleFirestoreError(error, OperationType.CREATE, `examRegistrations/${registrationId}`);
+    }
+  }
+}
+
+export async function setExamRegistrationByProfessor(params: {
+  term: ExamTerm;
+  course: Course;
+  enrollment: Enrollment;
+  status: ExamRegistrationStatus;
+  existingRegistration?: ExamRegistration;
+}): Promise<void> {
+  const { term, course, enrollment, status, existingRegistration } = params;
+  const registrationId = `${term.id}_${enrollment.studentId}`;
+
+  if (existingRegistration) {
+    try {
+      await updateDoc(doc(db, 'examRegistrations', registrationId), {
+        courseCode: course.code,
+        courseName: course.name,
+        termTitle: term.title,
+        examDate: term.examDate,
+        studentName: enrollment.studentName,
+        studentIndex: enrollment.studentIndex,
+        studentDepartment: enrollment.studentDepartment,
+        status,
+        professorIds: course.professorIds,
+        updatedAt: serverTimestamp(),
+      });
+    } catch (error) {
+      handleFirestoreError(error, OperationType.UPDATE, `examRegistrations/${registrationId}`);
+    }
+  } else {
+    try {
+      await setDoc(doc(db, 'examRegistrations', registrationId), {
+        termId: term.id,
+        courseId: course.id,
+        courseCode: course.code,
+        courseName: course.name,
+        termTitle: term.title,
+        examDate: term.examDate,
+        studentId: enrollment.studentId,
+        studentName: enrollment.studentName,
+        studentIndex: enrollment.studentIndex,
+        studentDepartment: enrollment.studentDepartment,
+        status,
+        professorIds: course.professorIds,
+        isSeed: false,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    } catch (error) {
+      handleFirestoreError(error, OperationType.CREATE, `examRegistrations/${registrationId}`);
+    }
+  }
+}
+
+// ============================================================================
 // Development Seed Data (isSeed: true — separated from production records)
 // ============================================================================
+
+async function seedDemoExamDataIfMissing(params: {
+  adminUid: string;
+}): Promise<void> {
+  const { adminUid } = params;
+
+  const [arSnap, osSnap, existingTermSnap] = await Promise.all([
+    getDoc(doc(db, 'courses', 'seed_crs_ar')),
+    getDoc(doc(db, 'courses', 'seed_crs_os')),
+    getDoc(doc(db, 'examTerms', 'seed_ext_ar_p2')),
+  ]);
+
+  if (!arSnap.exists() || !osSnap.exists() || existingTermSnap.exists()) {
+    return;
+  }
+
+  const today = getTodayIsoLocal();
+  const arCourse = arSnap.data() as Course;
+  const osCourse = osSnap.data() as Course;
+
+  const demoTerms = [
+    {
+      id: 'seed_ext_ar_p2',
+      courseId: 'seed_crs_ar',
+      courseCode: 'OR-AR',
+      courseName: 'Arhitektura računara',
+      title: 'II parcijalni ispit',
+      registrationOpenDate: addDaysIso(today, -3),
+      registrationCloseDate: addDaysIso(today, 6),
+      examDate: addDaysIso(today, 10),
+      examTime: '10:00',
+      classroom: 'Amfiteatar A1',
+      notes: 'Obavezno ponijeti indeks. Dozvoljen obični naučni kalkulator.',
+      isOpen: true,
+    },
+    {
+      id: 'seed_ext_ar_zav',
+      courseId: 'seed_crs_ar',
+      courseCode: 'OR-AR',
+      courseName: 'Arhitektura računara',
+      title: 'Završni ispit — I ispitni rok',
+      registrationOpenDate: addDaysIso(today, 12),
+      registrationCloseDate: addDaysIso(today, 20),
+      examDate: addDaysIso(today, 24),
+      examTime: '09:00',
+      classroom: 'Sala S1',
+      notes: 'Integralni i usmeni dio završnog ispita.',
+      isOpen: true,
+    },
+    {
+      id: 'seed_ext_os_zav',
+      courseId: 'seed_crs_os',
+      courseCode: 'RI-OS',
+      courseName: 'Operativni sistemi',
+      title: 'Završni integralni ispit',
+      registrationOpenDate: addDaysIso(today, -2),
+      registrationCloseDate: addDaysIso(today, 5),
+      examDate: addDaysIso(today, 8),
+      examTime: '11:00',
+      classroom: 'Laboratorija 1-02',
+      notes: 'Praktični zadatak u Linux okruženju i teorijski test.',
+      isOpen: true,
+    },
+  ];
+
+  await Promise.all(
+    demoTerms.map(async (t) => {
+      const snap = await getDoc(doc(db, 'examTerms', t.id));
+      if (snap.exists()) return;
+      try {
+        await setDoc(doc(db, 'examTerms', t.id), {
+          courseId: t.courseId,
+          courseCode: t.courseCode,
+          courseName: t.courseName,
+          title: t.title,
+          examDate: t.examDate,
+          examTime: t.examTime,
+          classroom: t.classroom,
+          registrationOpenDate: t.registrationOpenDate,
+          registrationCloseDate: t.registrationCloseDate,
+          notes: t.notes,
+          isOpen: t.isOpen,
+          createdBy: adminUid,
+          professorIds: [adminUid],
+          isSeed: true,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      } catch (error) {
+        handleFirestoreError(error, OperationType.CREATE, `examTerms/${t.id}`);
+      }
+    })
+  );
+
+  // Attach examTermIds onto demo courses so students discover them immediately
+  const nextArTermIds = Array.from(
+    new Set([...(arCourse.examTermIds ?? []), 'seed_ext_ar_p2', 'seed_ext_ar_zav'])
+  );
+  const nextOsTermIds = Array.from(
+    new Set([...(osCourse.examTermIds ?? []), 'seed_ext_os_zav'])
+  );
+
+  await Promise.all([
+    updateDoc(doc(db, 'courses', 'seed_crs_ar'), {
+      examTermIds: nextArTermIds,
+      updatedAt: serverTimestamp(),
+    }).catch((err) => handleFirestoreError(err, OperationType.UPDATE, 'courses/seed_crs_ar')),
+    updateDoc(doc(db, 'courses', 'seed_crs_os'), {
+      examTermIds: nextOsTermIds,
+      updatedAt: serverTimestamp(),
+    }).catch((err) => handleFirestoreError(err, OperationType.UPDATE, 'courses/seed_crs_os')),
+  ]);
+
+  // Seed realistic demo student exam registrations so professor turnout view is populated
+  const demoRegSeeds = [
+    {
+      termId: 'seed_ext_ar_p2',
+      courseId: 'seed_crs_ar',
+      courseCode: 'OR-AR',
+      courseName: 'Arhitektura računara',
+      termTitle: 'II parcijalni ispit',
+      examDate: addDaysIso(today, 10),
+      stu: { uid: 'seed_stu_haris', fullName: 'Haris Begović', index: '18942', dept: 'Računarstvo i informatika' },
+      status: ExamRegistrationStatus.REGISTERED,
+    },
+    {
+      termId: 'seed_ext_ar_p2',
+      courseId: 'seed_crs_ar',
+      courseCode: 'OR-AR',
+      courseName: 'Arhitektura računara',
+      termTitle: 'II parcijalni ispit',
+      examDate: addDaysIso(today, 10),
+      stu: { uid: 'seed_stu_amila', fullName: 'Amila Kovačević', index: '19014', dept: 'Računarstvo i informatika' },
+      status: ExamRegistrationStatus.REGISTERED,
+    },
+    {
+      termId: 'seed_ext_ar_p2',
+      courseId: 'seed_crs_ar',
+      courseCode: 'OR-AR',
+      courseName: 'Arhitektura računara',
+      termTitle: 'II parcijalni ispit',
+      examDate: addDaysIso(today, 10),
+      stu: { uid: 'seed_stu_lejla', fullName: 'Lejla Mujić', index: '19103', dept: 'Računarstvo i informatika' },
+      status: ExamRegistrationStatus.REGISTERED,
+    },
+    {
+      termId: 'seed_ext_ar_p2',
+      courseId: 'seed_crs_ar',
+      courseCode: 'OR-AR',
+      courseName: 'Arhitektura računara',
+      termTitle: 'II parcijalni ispit',
+      examDate: addDaysIso(today, 10),
+      stu: { uid: 'seed_stu_tarik', fullName: 'Tarik Hadžić', index: '18877', dept: 'Automatika i elektronika' },
+      status: ExamRegistrationStatus.CANCELLED,
+    },
+    {
+      termId: 'seed_ext_os_zav',
+      courseId: 'seed_crs_os',
+      courseCode: 'RI-OS',
+      courseName: 'Operativni sistemi',
+      termTitle: 'Završni integralni ispit',
+      examDate: addDaysIso(today, 8),
+      stu: { uid: 'seed_stu_amila', fullName: 'Amila Kovačević', index: '19014', dept: 'Računarstvo i informatika' },
+      status: ExamRegistrationStatus.REGISTERED,
+    },
+    {
+      termId: 'seed_ext_os_zav',
+      courseId: 'seed_crs_os',
+      courseCode: 'RI-OS',
+      courseName: 'Operativni sistemi',
+      termTitle: 'Završni integralni ispit',
+      examDate: addDaysIso(today, 8),
+      stu: { uid: 'seed_stu_haris', fullName: 'Haris Begović', index: '18942', dept: 'Računarstvo i informatika' },
+      status: ExamRegistrationStatus.REGISTERED,
+    },
+  ];
+
+  await runParallelChunks(demoRegSeeds, 10, async (r) => {
+    const regId = `${r.termId}_${r.stu.uid}`;
+    const regRef = doc(db, 'examRegistrations', regId);
+    const snap = await getDoc(regRef);
+    if (snap.exists()) return;
+    try {
+      await setDoc(regRef, {
+        termId: r.termId,
+        courseId: r.courseId,
+        courseCode: r.courseCode,
+        courseName: r.courseName,
+        termTitle: r.termTitle,
+        examDate: r.examDate,
+        studentId: r.stu.uid,
+        studentName: r.stu.fullName,
+        studentIndex: r.stu.index,
+        studentDepartment: r.stu.dept,
+        status: r.status,
+        professorIds: [adminUid],
+        isSeed: true,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    } catch (error) {
+      handleFirestoreError(error, OperationType.CREATE, `examRegistrations/${regId}`);
+    }
+  });
+}
+
+async function seedDemoTeachingStaffIfMissing(params: {
+  cleanLeadProfName: string;
+}): Promise<void> {
+  const { cleanLeadProfName } = params;
+  const seedStaffMap: Array<{
+    courseId: string;
+    professorNames: string[];
+    assistantNames: string[];
+  }> = [
+    {
+      courseId: 'seed_crs_ar',
+      professorNames: sanitizeStaffList(
+        [cleanLeadProfName, 'vanr. prof. dr. Novica Nosović'],
+        VALIDATION_CONSTRAINTS.MAX_PROFESSORS_PER_COURSE
+      ),
+      assistantNames: [
+        'mr. Emir Buza, v. as.',
+        'as. Harun Šiljak, dipl. ing. el.',
+      ],
+    },
+    {
+      courseId: 'seed_crs_tp',
+      professorNames: [cleanLeadProfName],
+      assistantNames: [
+        'mr. Vedran Ljubović, v. as.',
+        'as. Mirza Mesihović, mr. el.',
+        'as. Emina Begić, bacc. ing.',
+      ],
+    },
+    {
+      courseId: 'seed_crs_os',
+      professorNames: sanitizeStaffList(
+        [cleanLeadProfName, 'doc. dr. Samir Ribić'],
+        VALIDATION_CONSTRAINTS.MAX_PROFESSORS_PER_COURSE
+      ),
+      assistantNames: ['mr. Damir Hasić, v. as.'],
+    },
+  ];
+
+  await Promise.all(
+    seedStaffMap.map(async (entry) => {
+      try {
+        const snap = await getDoc(doc(db, 'courses', entry.courseId));
+        if (!snap.exists()) return;
+        const data = snap.data() as Course;
+        if (data.professorNames && data.assistantNames) return;
+        await updateDoc(doc(db, 'courses', entry.courseId), {
+          leadProfessorName: entry.professorNames[0] || data.leadProfessorName,
+          professorNames: entry.professorNames,
+          assistantNames: entry.assistantNames,
+          updatedAt: serverTimestamp(),
+        });
+      } catch {
+        // Non-blocking seed upgrade
+      }
+    })
+  );
+}
+
+async function seedDemoStudyProgramsIfMissing(params: {
+  adminUid: string;
+  cleanAdminName: string;
+  cleanLeadProfName: string;
+  effectiveIndex: string;
+}): Promise<void> {
+  const { adminUid, cleanAdminName, cleanLeadProfName, effectiveIndex } = params;
+
+  // 1. Backfill studyProgram on original Bachelor demo courses if missing
+  await Promise.all(
+    ['seed_crs_ar', 'seed_crs_tp', 'seed_crs_os'].map(async (cid) => {
+      try {
+        const snap = await getDoc(doc(db, 'courses', cid));
+        if (!snap.exists()) return;
+        const data = snap.data() as Course;
+        if (data.studyProgram) return;
+        await updateDoc(doc(db, 'courses', cid), {
+          studyProgram: 'Bachelor · Računarstvo i informatika',
+          updatedAt: serverTimestamp(),
+        });
+      } catch {
+        // Non-blocking backfill
+      }
+    })
+  );
+
+  // 2. Normalize any legacy Master sub-track names on existing seed course/students
+  const [rsSnap, assSnap] = await Promise.all([
+    getDoc(doc(db, 'courses', 'seed_crs_rs_web')),
+    getDoc(doc(db, 'courses', 'seed_crs_ri_ass')),
+  ]);
+
+  if (assSnap.exists()) {
+    const assData = assSnap.data() as Course;
+    if (assData.studyProgram !== MASTER_RI_PROGRAM) {
+      try {
+        await updateDoc(doc(db, 'courses', 'seed_crs_ri_ass'), {
+          studyProgram: MASTER_RI_PROGRAM,
+          updatedAt: serverTimestamp(),
+        });
+      } catch {
+        // Non-blocking normalization
+      }
+    }
+  }
+
+  for (const legacyStu of [
+    { uid: 'seed_stu_kenan', idx: 'M-1408' },
+    { uid: 'seed_stu_emina', idx: 'M-1422' },
+  ]) {
+    try {
+      const sSnap = await getDoc(doc(db, 'userProfiles', legacyStu.uid));
+      if (sSnap.exists() && (sSnap.data() as UserProfile).studyTrack !== MASTER_RI_PROGRAM) {
+        await updateDoc(doc(db, 'userProfiles', legacyStu.uid), {
+          studyTrack: MASTER_RI_PROGRAM,
+          updatedAt: serverTimestamp(),
+        });
+        const dSnap = await getDoc(doc(db, 'studentDirectory', legacyStu.idx));
+        if (dSnap.exists()) {
+          await updateDoc(doc(db, 'studentDirectory', legacyStu.idx), {
+            department: MASTER_RI_PROGRAM,
+            updatedAt: serverTimestamp(),
+          });
+        }
+      }
+    } catch {
+      // Non-blocking normalization
+    }
+  }
+
+  if (rsSnap.exists() && assSnap.exists()) {
+    return;
+  }
+
+  const today = getTodayIsoLocal();
+
+  const programStudents = [
+    {
+      uid: 'seed_stu_adnan',
+      fullName: 'Adnan Karić',
+      index: 'RS-214',
+      dept: 'Stručni studij — Razvoj softvera',
+      rosterDept: 'Stručni studij · Razvoj softvera (2 god.)',
+      studyTrack: STRUCNI_RS_PROGRAM,
+      studyYear: 'II godina · Stručni studij Razvoj softvera (2 god.)',
+    },
+    {
+      uid: 'seed_stu_sara',
+      fullName: 'Sara Imamović',
+      index: 'RS-219',
+      dept: 'Stručni studij — Razvoj softvera',
+      rosterDept: 'Stručni studij · Razvoj softvera (2 god.)',
+      studyTrack: STRUCNI_RS_PROGRAM,
+      studyYear: 'II godina · Stručni studij Razvoj softvera (2 god.)',
+    },
+    {
+      uid: 'seed_stu_kenan',
+      fullName: 'Kenan Hodžić',
+      index: 'M-1408',
+      dept: 'Računarstvo i informatika',
+      rosterDept: MASTER_RI_PROGRAM,
+      studyTrack: MASTER_RI_PROGRAM,
+      studyYear: 'I godina · II ciklus (Master studij)',
+    },
+    {
+      uid: 'seed_stu_emina',
+      fullName: 'Emina Čengić',
+      index: 'M-1422',
+      dept: 'Računarstvo i informatika',
+      rosterDept: MASTER_RI_PROGRAM,
+      studyTrack: MASTER_RI_PROGRAM,
+      studyYear: 'I godina · II ciklus (Master studij)',
+    },
+  ];
+
+  // Stage A: Student profiles & studentDirectory
+  await Promise.all(
+    programStudents.map(async (stu) => {
+      const pRef = doc(db, 'userProfiles', stu.uid);
+      const dRef = doc(db, 'studentDirectory', stu.index);
+      const [pSnap, dSnap] = await Promise.all([getDoc(pRef), getDoc(dRef)]);
+      if (!pSnap.exists()) {
+        await setDoc(pRef, {
+          uid: stu.uid,
+          fullName: stu.fullName,
+          studentIndex: stu.index,
+          department: stu.dept,
+          role: UserRole.STUDENT,
+          academicYear: '2026/2027',
+          redeemedInviteId: '',
+          studyYear: stu.studyYear,
+          studyTrack: stu.studyTrack,
+          isSeed: true,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        }).catch((err) => handleFirestoreError(err, OperationType.CREATE, `userProfiles/${stu.uid}`));
+      }
+      if (!dSnap.exists()) {
+        await setDoc(dRef, {
+          studentIndex: stu.index,
+          uid: stu.uid,
+          fullName: stu.fullName,
+          department: stu.rosterDept,
+          isSeed: true,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        }).catch((err) =>
+          handleFirestoreError(err, OperationType.CREATE, `studentDirectory/${stu.index}`)
+        );
+      }
+    })
+  );
+
+  // Stage B: Create Stručni studij RS (2 god.) & Master smjer courses
+  const rsCatIds = ['seed_cat_rs_zad', 'seed_cat_rs_proj', 'seed_cat_rs_isp'];
+  const rsItemIds = ['seed_itm_rs_1', 'seed_itm_rs_2', 'seed_itm_rs_3'];
+  const rsSessionIds = ['seed_ses_rs_1', 'seed_ses_rs_2', 'seed_ses_rs_3'];
+  const rsTermId = 'seed_ext_rs_zav';
+
+  const assCatIds = ['seed_cat_ass_cas', 'seed_cat_ass_proj', 'seed_cat_ass_isp'];
+  const assItemIds = ['seed_itm_ass_1', 'seed_itm_ass_2', 'seed_itm_ass_3'];
+  const assSessionIds = ['seed_ses_ass_1', 'seed_ses_ass_2', 'seed_ses_ass_3'];
+  const assTermId = 'seed_ext_ass_zav';
+
+  if (!rsSnap.exists()) {
+    await setDoc(doc(db, 'courses', 'seed_crs_rs_web'), {
+      code: 'RS-RMW',
+      name: 'Razvoj modernih web aplikacija',
+      semester: 'Zimski semestar · II godina (3. semestar)',
+      academicYear: '2026/2027',
+      ects: 6,
+      leadProfessorId: adminUid,
+      leadProfessorName: cleanLeadProfName,
+      professorIds: [adminUid],
+      professorNames: sanitizeStaffList(
+        [cleanLeadProfName, 'doc. dr. Vensada Okanović'],
+        VALIDATION_CONSTRAINTS.MAX_PROFESSORS_PER_COURSE
+      ),
+      assistantNames: ['mr. Irfan Prazina, v. as.', 'as. Amar Švrakić, bacc. ing.'],
+      studyProgram: STRUCNI_RS_PROGRAM,
+      categoryIds: rsCatIds,
+      itemIds: rsItemIds,
+      sessionIds: rsSessionIds,
+      examTermIds: [rsTermId],
+      attendanceEnabled: true,
+      attendanceMaxPoints: 10,
+      allowBonusPoints: false,
+      grade6Threshold: 55,
+      grade7Threshold: 65,
+      grade8Threshold: 75,
+      grade9Threshold: 85,
+      grade10Threshold: 95,
+      isSeed: true,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    }).catch((err) => handleFirestoreError(err, OperationType.CREATE, 'courses/seed_crs_rs_web'));
+  }
+
+  if (!assSnap.exists()) {
+    await setDoc(doc(db, 'courses', 'seed_crs_ri_ass'), {
+      code: 'RI-ASS',
+      name: 'Arhitektura softverskih sistema i mikroservisi',
+      semester: 'Zimski semestar · I godina Mastera',
+      academicYear: '2026/2027',
+      ects: 6,
+      leadProfessorId: adminUid,
+      leadProfessorName: cleanLeadProfName,
+      professorIds: [adminUid],
+      professorNames: sanitizeStaffList(
+        [cleanLeadProfName, 'red. prof. dr. Dušanka Bošković'],
+        VALIDATION_CONSTRAINTS.MAX_PROFESSORS_PER_COURSE
+      ),
+      assistantNames: ['dr. Vedad Letić, v. as.'],
+      studyProgram: MASTER_RI_PROGRAM,
+      categoryIds: assCatIds,
+      itemIds: assItemIds,
+      sessionIds: assSessionIds,
+      examTermIds: [assTermId],
+      attendanceEnabled: true,
+      attendanceMaxPoints: 10,
+      allowBonusPoints: false,
+      grade6Threshold: 55,
+      grade7Threshold: 65,
+      grade8Threshold: 75,
+      grade9Threshold: 85,
+      grade10Threshold: 95,
+      isSeed: true,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    }).catch((err) => handleFirestoreError(err, OperationType.CREATE, 'courses/seed_crs_ri_ass'));
+  }
+
+  // Stage C: Categories, Sessions, Exam Terms & Enrollments
+  const catsToCreate = [
+    { id: 'seed_cat_rs_zad', courseId: 'seed_crs_rs_web', name: 'Praktični zadaci', max: 25, order: 1 },
+    { id: 'seed_cat_rs_proj', courseId: 'seed_crs_rs_web', name: 'Full-stack projekat', max: 35, order: 2 },
+    { id: 'seed_cat_rs_isp', courseId: 'seed_crs_rs_web', name: 'Završni praktični ispit', max: 30, order: 3 },
+    { id: 'seed_cat_ass_cas', courseId: 'seed_crs_ri_ass', name: 'Arhitektonske studije slučaja', max: 20, order: 1 },
+    { id: 'seed_cat_ass_proj', courseId: 'seed_crs_ri_ass', name: 'Istraživački projekat — Mikroservisi', max: 40, order: 2 },
+    { id: 'seed_cat_ass_isp', courseId: 'seed_crs_ri_ass', name: 'Završni usmeni ispit', max: 30, order: 3 },
+  ];
+
+  const sessionsToCreate = [
+    { id: 'seed_ses_rs_1', courseId: 'seed_crs_rs_web', date: '2026-10-01', time: '14:00 - 16:00', topic: 'Komponentna arhitektura u React i TypeScript okruženju' },
+    { id: 'seed_ses_rs_2', courseId: 'seed_crs_rs_web', date: '2026-10-08', time: '14:00 - 16:00', topic: 'REST API dizajn, validacija i autentifikacija' },
+    { id: 'seed_ses_rs_3', courseId: 'seed_crs_rs_web', date: '2026-10-15', time: '14:00 - 16:00', topic: 'Kontejnerizacija i produkcijski deployment' },
+    { id: 'seed_ses_ass_1', courseId: 'seed_crs_ri_ass', date: '2026-10-02', time: '16:00 - 18:00', topic: 'Domain-Driven Design i granice mikroservisa' },
+    { id: 'seed_ses_ass_2', courseId: 'seed_crs_ri_ass', date: '2026-10-09', time: '16:00 - 18:00', topic: 'Event-driven arhitektura i Saga obrazac' },
+    { id: 'seed_ses_ass_3', courseId: 'seed_crs_ri_ass', date: '2026-10-16', time: '16:00 - 18:00', topic: 'Otpornost sistema, telemetrija i distribuirani tracing' },
+  ];
+
+  const rsRoster = [
+    { uid: adminUid, fullName: cleanAdminName, index: effectiveIndex, dept: 'Stručni studij · Razvoj softvera (2 god.)' },
+    { uid: programStudents[0].uid, fullName: programStudents[0].fullName, index: programStudents[0].index, dept: programStudents[0].rosterDept },
+    { uid: programStudents[1].uid, fullName: programStudents[1].fullName, index: programStudents[1].index, dept: programStudents[1].rosterDept },
+  ];
+
+  const assRoster = [
+    { uid: adminUid, fullName: cleanAdminName, index: effectiveIndex, dept: MASTER_RI_PROGRAM },
+    { uid: programStudents[2].uid, fullName: programStudents[2].fullName, index: programStudents[2].index, dept: programStudents[2].rosterDept },
+    { uid: programStudents[3].uid, fullName: programStudents[3].fullName, index: programStudents[3].index, dept: programStudents[3].rosterDept },
+  ];
+
+  await Promise.all([
+    ...catsToCreate.map(async (c) => {
+      const ref = doc(db, 'gradingCategories', c.id);
+      if ((await getDoc(ref)).exists()) return;
+      await setDoc(ref, {
+        courseId: c.courseId,
+        name: c.name,
+        maxPoints: c.max,
+        order: c.order,
+        professorIds: [adminUid],
+        isSeed: true,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      }).catch((err) => handleFirestoreError(err, OperationType.CREATE, `gradingCategories/${c.id}`));
+    }),
+    ...sessionsToCreate.map(async (s) => {
+      const ref = doc(db, 'attendanceSessions', s.id);
+      if ((await getDoc(ref)).exists()) return;
+      await setDoc(ref, {
+        courseId: s.courseId,
+        date: s.date,
+        time: s.time,
+        topic: s.topic,
+        isCancelled: false,
+        professorIds: [adminUid],
+        isSeed: true,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      }).catch((err) => handleFirestoreError(err, OperationType.CREATE, `attendanceSessions/${s.id}`));
+    }),
+    ...rsRoster.map(async (stu) => {
+      const id = `seed_crs_rs_web_${stu.uid}`;
+      const ref = doc(db, 'enrollments', id);
+      if ((await getDoc(ref)).exists()) return;
+      await setDoc(ref, {
+        courseId: 'seed_crs_rs_web',
+        courseCode: 'RS-RMW',
+        courseName: 'Razvoj modernih web aplikacija',
+        leadProfessorName: cleanLeadProfName,
+        academicYear: '2026/2027',
+        studentId: stu.uid,
+        studentName: stu.fullName,
+        studentIndex: stu.index,
+        studentDepartment: stu.dept,
+        professorIds: [adminUid],
+        isSeed: true,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      }).catch((err) => handleFirestoreError(err, OperationType.CREATE, `enrollments/${id}`));
+    }),
+    ...assRoster.map(async (stu) => {
+      const id = `seed_crs_ri_ass_${stu.uid}`;
+      const ref = doc(db, 'enrollments', id);
+      if ((await getDoc(ref)).exists()) return;
+      await setDoc(ref, {
+        courseId: 'seed_crs_ri_ass',
+        courseCode: 'RI-ASS',
+        courseName: 'Arhitektura softverskih sistema i mikroservisi',
+        leadProfessorName: cleanLeadProfName,
+        academicYear: '2026/2027',
+        studentId: stu.uid,
+        studentName: stu.fullName,
+        studentIndex: stu.index,
+        studentDepartment: stu.dept,
+        professorIds: [adminUid],
+        isSeed: true,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      }).catch((err) => handleFirestoreError(err, OperationType.CREATE, `enrollments/${id}`));
+    }),
+    (async () => {
+      const ref = doc(db, 'examTerms', rsTermId);
+      if ((await getDoc(ref)).exists()) return;
+      await setDoc(ref, {
+        courseId: 'seed_crs_rs_web',
+        courseCode: 'RS-RMW',
+        courseName: 'Razvoj modernih web aplikacija',
+        title: 'Završni praktični ispit — Stručni studij RS',
+        examDate: addDaysIso(today, 9),
+        examTime: '13:00',
+        classroom: 'Laboratorija 2-05',
+        registrationOpenDate: addDaysIso(today, -2),
+        registrationCloseDate: addDaysIso(today, 6),
+        notes: 'Praktična odbrana web aplikacije u laboratoriji.',
+        isOpen: true,
+        createdBy: adminUid,
+        professorIds: [adminUid],
+        isSeed: true,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      }).catch((err) => handleFirestoreError(err, OperationType.CREATE, `examTerms/${rsTermId}`));
+    })(),
+    (async () => {
+      const ref = doc(db, 'examTerms', assTermId);
+      if ((await getDoc(ref)).exists()) return;
+      await setDoc(ref, {
+        courseId: 'seed_crs_ri_ass',
+        courseCode: 'RI-ASS',
+        courseName: 'Arhitektura softverskih sistema i mikroservisi',
+        title: 'Odbrana projekta i završni ispit — Master RI',
+        examDate: addDaysIso(today, 12),
+        examTime: '17:00',
+        classroom: 'Sala S3 (Kampus UNSA)',
+        registrationOpenDate: addDaysIso(today, -1),
+        registrationCloseDate: addDaysIso(today, 8),
+        notes: 'Prezentacija arhitekture mikroservisa i usmena odbrana.',
+        isOpen: true,
+        createdBy: adminUid,
+        professorIds: [adminUid],
+        isSeed: true,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      }).catch((err) => handleFirestoreError(err, OperationType.CREATE, `examTerms/${assTermId}`));
+    })(),
+  ]);
+
+  // Stage D: Grading Items
+  const itemsToCreate = [
+    { id: 'seed_itm_rs_1', courseId: 'seed_crs_rs_web', catId: 'seed_cat_rs_zad', name: 'REST API i JWT autentifikacija', max: 25, date: '2026-10-10', order: 1, desc: 'Implementacija serverskih ruta i validacije' },
+    { id: 'seed_itm_rs_2', courseId: 'seed_crs_rs_web', catId: 'seed_cat_rs_proj', name: 'Milestone 1 — Frontend i baza podataka', max: 35, date: '2026-10-20', order: 2, desc: 'Kompletna klijentska aplikacija sa perzistencijom' },
+    { id: 'seed_itm_rs_3', courseId: 'seed_crs_rs_web', catId: 'seed_cat_rs_isp', name: 'Završni praktični ispit', max: 30, date: addDaysIso(today, 9), order: 3, desc: 'Završna izrada funkcionalnosti uživo' },
+    { id: 'seed_itm_ass_1', courseId: 'seed_crs_ri_ass', catId: 'seed_cat_ass_cas', name: 'ADR dokumentacija i dekompozicija domena', max: 20, date: '2026-10-12', order: 1, desc: 'Architecture Decision Records za distribuirani sistem' },
+    { id: 'seed_itm_ass_2', courseId: 'seed_crs_ri_ass', catId: 'seed_cat_ass_proj', name: 'Implementacija Saga orkestracije i API Gateway-a', max: 40, date: '2026-10-21', order: 2, desc: ' Komunikacija servisa i otpornost na otkaze' },
+    { id: 'seed_itm_ass_3', courseId: 'seed_crs_ri_ass', catId: 'seed_cat_ass_isp', name: 'Završni usmeni ispit', max: 30, date: addDaysIso(today, 12), order: 3, desc: 'Usmena provjera znanja iz softverske arhitekture' },
+  ];
+
+  await Promise.all(
+    itemsToCreate.map(async (it) => {
+      const ref = doc(db, 'gradingItems', it.id);
+      if ((await getDoc(ref)).exists()) return;
+      await setDoc(ref, {
+        courseId: it.courseId,
+        categoryId: it.catId,
+        name: it.name,
+        maxPoints: it.max,
+        date: it.date,
+        description: it.desc.trim(),
+        order: it.order,
+        professorIds: [adminUid],
+        isSeed: true,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      }).catch((err) => handleFirestoreError(err, OperationType.CREATE, `gradingItems/${it.id}`));
+    })
+  );
+
+  // Stage E: Attendance Records, Scores & Exam Registrations
+  const stageEPromises: Array<Promise<void>> = [];
+
+  rsRoster.forEach((stu, idx) => {
+    rsSessionIds.forEach((sesId, sIdx) => {
+      const present = !(idx === 2 && sIdx === 1);
+      const recId = `${sesId}_${stu.uid}`;
+      stageEPromises.push(
+        (async () => {
+          const ref = doc(db, 'attendanceRecords', recId);
+          if ((await getDoc(ref)).exists()) return;
+          await setDoc(ref, {
+            courseId: 'seed_crs_rs_web',
+            sessionId: sesId,
+            studentId: stu.uid,
+            present,
+            note: '',
+            markedBy: adminUid,
+            professorIds: [adminUid],
+            isSeed: true,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+        })()
+      );
+    });
+
+    const pts1 = [23, 24.5, 20][idx] ?? 22;
+    const pts2 = [32, 34, 28][idx] ?? 30;
+    stageEPromises.push(
+      (async () => {
+        const ref = doc(db, 'scores', `seed_itm_rs_1_${stu.uid}`);
+        if ((await getDoc(ref)).exists()) return;
+        await setDoc(ref, {
+          courseId: 'seed_crs_rs_web',
+          categoryId: 'seed_cat_rs_zad',
+          itemId: 'seed_itm_rs_1',
+          studentId: stu.uid,
+          points: pts1,
+          feedback: idx === 0 ? 'Uredna validacija ulaznih podataka i struktura ruta.' : '',
+          gradedBy: adminUid,
+          professorIds: [adminUid],
+          isSeed: true,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      })(),
+      (async () => {
+        const ref = doc(db, 'scores', `seed_itm_rs_2_${stu.uid}`);
+        if ((await getDoc(ref)).exists()) return;
+        await setDoc(ref, {
+          courseId: 'seed_crs_rs_web',
+          categoryId: 'seed_cat_rs_proj',
+          itemId: 'seed_itm_rs_2',
+          studentId: stu.uid,
+          points: pts2,
+          feedback: idx === 0 ? 'Čist UI i responzivan prikaz na mobilnim uređajima.' : '',
+          gradedBy: adminUid,
+          professorIds: [adminUid],
+          isSeed: true,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      })()
+    );
+  });
+
+  assRoster.forEach((stu, idx) => {
+    assSessionIds.forEach((sesId) => {
+      const recId = `${sesId}_${stu.uid}`;
+      stageEPromises.push(
+        (async () => {
+          const ref = doc(db, 'attendanceRecords', recId);
+          if ((await getDoc(ref)).exists()) return;
+          await setDoc(ref, {
+            courseId: 'seed_crs_ri_ass',
+            sessionId: sesId,
+            studentId: stu.uid,
+            present: true,
+            note: '',
+            markedBy: adminUid,
+            professorIds: [adminUid],
+            isSeed: true,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+        })()
+      );
+    });
+
+    const pts1 = [18.5, 19.5, 17][idx] ?? 18;
+    const pts2 = [37, 39, 35][idx] ?? 36;
+    stageEPromises.push(
+      (async () => {
+        const ref = doc(db, 'scores', `seed_itm_ass_1_${stu.uid}`);
+        if ((await getDoc(ref)).exists()) return;
+        await setDoc(ref, {
+          courseId: 'seed_crs_ri_ass',
+          categoryId: 'seed_cat_ass_cas',
+          itemId: 'seed_itm_ass_1',
+          studentId: stu.uid,
+          points: pts1,
+          feedback: idx === 0 ? 'Jasno obrazloženi kompromisi u ADR dokumentima.' : '',
+          gradedBy: adminUid,
+          professorIds: [adminUid],
+          isSeed: true,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      })(),
+      (async () => {
+        const ref = doc(db, 'scores', `seed_itm_ass_2_${stu.uid}`);
+        if ((await getDoc(ref)).exists()) return;
+        await setDoc(ref, {
+          courseId: 'seed_crs_ri_ass',
+          categoryId: 'seed_cat_ass_proj',
+          itemId: 'seed_itm_ass_2',
+          studentId: stu.uid,
+          points: pts2,
+          feedback: '',
+          gradedBy: adminUid,
+          professorIds: [adminUid],
+          isSeed: true,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      })()
+    );
+  });
+
+  // Demo exam registrations on the new Stručni studij RS & Master terms
+  stageEPromises.push(
+    (async () => {
+      const regId = `${rsTermId}_${programStudents[0].uid}`;
+      const ref = doc(db, 'examRegistrations', regId);
+      if ((await getDoc(ref)).exists()) return;
+      await setDoc(ref, {
+        termId: rsTermId,
+        courseId: 'seed_crs_rs_web',
+        courseCode: 'RS-RMW',
+        courseName: 'Razvoj modernih web aplikacija',
+        termTitle: 'Završni praktični ispit — Stručni studij RS',
+        examDate: addDaysIso(today, 9),
+        studentId: programStudents[0].uid,
+        studentName: programStudents[0].fullName,
+        studentIndex: programStudents[0].index,
+        studentDepartment: programStudents[0].rosterDept,
+        status: ExamRegistrationStatus.REGISTERED,
+        professorIds: [adminUid],
+        isSeed: true,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    })(),
+    (async () => {
+      const regId = `${assTermId}_${programStudents[2].uid}`;
+      const ref = doc(db, 'examRegistrations', regId);
+      if ((await getDoc(ref)).exists()) return;
+      await setDoc(ref, {
+        termId: assTermId,
+        courseId: 'seed_crs_ri_ass',
+        courseCode: 'RI-ASS',
+        courseName: 'Arhitektura softverskih sistema i mikroservisi',
+        termTitle: 'Odbrana projekta i završni ispit — Master SI',
+        examDate: addDaysIso(today, 12),
+        studentId: programStudents[2].uid,
+        studentName: programStudents[2].fullName,
+        studentIndex: programStudents[2].index,
+        studentDepartment: programStudents[2].rosterDept,
+        status: ExamRegistrationStatus.REGISTERED,
+        professorIds: [adminUid],
+        isSeed: true,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    })()
+  );
+
+  await Promise.all(stageEPromises);
+}
 
 export async function seedEtfDemoData(params: {
   adminUid: string;
@@ -1385,13 +3489,65 @@ export async function seedEtfDemoData(params: {
   adminIndex: string;
 }): Promise<void> {
   const { adminUid, adminName, adminIndex } = params;
-  const effectiveIndex = adminIndex || '19001';
+  const cleanAdminName =
+    sanitizeText(adminName, VALIDATION_CONSTRAINTS.FULL_NAME_MAX_LENGTH) || 'Profesor';
+  const cleanLeadProfName = sanitizeText(
+    `dr. ${cleanAdminName}`,
+    VALIDATION_CONSTRAINTS.FULL_NAME_MAX_LENGTH
+  );
+  const effectiveIndex =
+    sanitizeText(adminIndex, VALIDATION_CONSTRAINTS.STUDENT_INDEX_MAX_LENGTH) || '19001';
 
-  // Ensure existing seed data isn't duplicated
-  const existingAr = await getDoc(doc(db, 'courses', 'seed_crs_ar'));
-  if (existingAr.exists()) {
+  // Completion marker written at the very end of Stage 5
+  const completionMarkerId = `seed_crs_tp_${adminUid}`;
+  const markerSnap = await getDoc(doc(db, 'finalGrades', completionMarkerId));
+  if (markerSnap.exists()) {
+    await Promise.all([
+      seedDemoExamDataIfMissing({ adminUid }),
+      seedDemoTeachingStaffIfMissing({ cleanLeadProfName }),
+      seedDemoStudyProgramsIfMissing({
+        adminUid,
+        cleanAdminName,
+        cleanLeadProfName,
+        effectiveIndex,
+      }),
+    ]);
+    await seedDemoPortalExtensionsIfMissing({
+      adminUid,
+      cleanAdminName,
+      cleanLeadProfName,
+      effectiveIndex,
+    });
     return;
   }
+
+  // Detect whether a previous partial run already wrote some seed documents
+  const partialSnap = await getDoc(doc(db, 'courses', 'seed_crs_ar'));
+  const checkBeforeCreate = partialSnap.exists();
+
+  interface SeedDocTask {
+    col: string;
+    id: string;
+    data: Record<string, unknown>;
+    alwaysCheckExisting?: boolean;
+  }
+
+  const writeSeedStage = async (tasks: SeedDocTask[]): Promise<void> => {
+    await runParallelChunks(tasks, 20, async (task) => {
+      const ref = doc(db, task.col, task.id);
+      if (checkBeforeCreate || task.alwaysCheckExisting) {
+        const existingSnap = await getDoc(ref);
+        if (existingSnap.exists()) {
+          return;
+        }
+      }
+      try {
+        await setDoc(ref, task.data);
+      } catch (error) {
+        handleFirestoreError(error, OperationType.CREATE, `${task.col}/${task.id}`);
+      }
+    });
+  };
 
   const demoStudents = [
     { uid: 'seed_stu_haris', fullName: 'Haris Begović', index: '18942', dept: 'Računarstvo i informatika' },
@@ -1402,7 +3558,7 @@ export async function seedEtfDemoData(params: {
   ];
 
   const allEnrolled = [
-    { uid: adminUid, fullName: adminName, index: effectiveIndex, dept: 'Računarstvo i informatika' },
+    { uid: adminUid, fullName: cleanAdminName, index: effectiveIndex, dept: 'Računarstvo i informatika' },
     ...demoStudents,
   ];
 
@@ -1464,237 +3620,220 @@ export async function seedEtfDemoData(params: {
     { id: 'seed_itm_os_3', catId: 'seed_cat_os_isp', name: 'Završni ispit', max: 50, date: '2026-11-25', order: 3, desc: 'Teorijski i praktični ispit' },
   ];
 
-  // Batch 1: Profiles, Directory, Courses, Categories, Items, Sessions, Enrollments
-  const batch1 = writeBatch(db);
-
+  // Stage 1: Demo student profiles and studentDirectory entries
+  const stage1Tasks: SeedDocTask[] = [];
   for (const stu of demoStudents) {
-    batch1.set(doc(db, 'userProfiles', stu.uid), {
-      uid: stu.uid,
-      fullName: stu.fullName,
-      studentIndex: stu.index,
-      department: stu.dept,
-      role: UserRole.STUDENT,
-      academicYear: '2026/2027',
-      redeemedInviteId: '',
-      isSeed: true,
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
+    stage1Tasks.push({
+      col: 'userProfiles',
+      id: stu.uid,
+      alwaysCheckExisting: true,
+      data: {
+        uid: stu.uid,
+        fullName: stu.fullName,
+        studentIndex: stu.index,
+        department: stu.dept,
+        role: UserRole.STUDENT,
+        academicYear: '2026/2027',
+        redeemedInviteId: '',
+        isSeed: true,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      },
     });
-    batch1.set(doc(db, 'studentDirectory', stu.index), {
-      studentIndex: stu.index,
-      uid: stu.uid,
-      fullName: stu.fullName,
-      department: stu.dept,
-      isSeed: true,
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
+    stage1Tasks.push({
+      col: 'studentDirectory',
+      id: stu.index,
+      alwaysCheckExisting: true,
+      data: {
+        studentIndex: stu.index,
+        uid: stu.uid,
+        fullName: stu.fullName,
+        department: stu.dept,
+        isSeed: true,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      },
     });
   }
+  await writeSeedStage(stage1Tasks);
 
-  batch1.set(doc(db, 'courses', 'seed_crs_ar'), {
-    code: 'OR-AR',
-    name: 'Arhitektura računara',
-    semester: 'Zimski semestar · II godina',
-    academicYear: '2026/2027',
-    ects: 6,
-    leadProfessorId: adminUid,
-    leadProfessorName: `dr. ${adminName}`,
-    professorIds: [adminUid],
-    categoryIds: arCatIds,
-    itemIds: arItems.map((i) => i.id),
-    sessionIds: arSessions.map((s) => s.id),
-    attendanceEnabled: true,
-    attendanceMaxPoints: 10,
-    allowBonusPoints: false,
-    grade6Threshold: 55,
-    grade7Threshold: 65,
-    grade8Threshold: 75,
-    grade9Threshold: 85,
-    grade10Threshold: 95,
-    isSeed: true,
-    createdAt: serverTimestamp(),
-    updatedAt: serverTimestamp(),
-  });
-
-  batch1.set(doc(db, 'courses', 'seed_crs_tp'), {
-    code: 'RI-TP',
-    name: 'Tehnike programiranja',
-    semester: 'Zimski semestar · I godina',
-    academicYear: '2026/2027',
-    ects: 7,
-    leadProfessorId: adminUid,
-    leadProfessorName: `dr. ${adminName}`,
-    professorIds: [adminUid],
-    categoryIds: tpCatIds,
-    itemIds: tpItems.map((i) => i.id),
-    sessionIds: tpSessions.map((s) => s.id),
-    attendanceEnabled: true,
-    attendanceMaxPoints: 10,
-    allowBonusPoints: false,
-    grade6Threshold: 55,
-    grade7Threshold: 65,
-    grade8Threshold: 75,
-    grade9Threshold: 85,
-    grade10Threshold: 95,
-    isSeed: true,
-    createdAt: serverTimestamp(),
-    updatedAt: serverTimestamp(),
-  });
-
-  batch1.set(doc(db, 'courses', 'seed_crs_os'), {
-    code: 'RI-OS',
-    name: 'Operativni sistemi',
-    semester: 'Ljetni semestar · II godina',
-    academicYear: '2026/2027',
-    ects: 5,
-    leadProfessorId: adminUid,
-    leadProfessorName: `dr. ${adminName}`,
-    professorIds: [adminUid],
-    categoryIds: osCatIds,
-    itemIds: osItems.map((i) => i.id),
-    sessionIds: [],
-    attendanceEnabled: false,
-    attendanceMaxPoints: 0,
-    allowBonusPoints: false,
-    grade6Threshold: 50,
-    grade7Threshold: 62,
-    grade8Threshold: 74,
-    grade9Threshold: 85,
-    grade10Threshold: 94,
-    isSeed: true,
-    createdAt: serverTimestamp(),
-    updatedAt: serverTimestamp(),
-  });
-
-  const arCategoriesMeta = [
-    { id: 'seed_cat_ar_zad', name: 'Zadaci', max: 10, order: 1 },
-    { id: 'seed_cat_ar_vje', name: 'Vježbe', max: 10, order: 2 },
-    { id: 'seed_cat_ar_p1', name: 'I parcijalni ispit', max: 20, order: 3 },
-    { id: 'seed_cat_ar_p2', name: 'II parcijalni ispit', max: 20, order: 4 },
-    { id: 'seed_cat_ar_zav', name: 'Završni ispit', max: 20, order: 5 },
-    { id: 'seed_cat_ar_ost', name: 'Ostalo / dodatna aktivnost', max: 10, order: 6 },
+  // Stage 2: Courses (must exist before categories, sessions, and enrollments)
+  const stage2Tasks: SeedDocTask[] = [
+    {
+      col: 'courses',
+      id: 'seed_crs_ar',
+      data: {
+        code: 'OR-AR',
+        name: 'Arhitektura računara',
+        semester: 'Zimski semestar · II godina',
+        academicYear: '2026/2027',
+        ects: 6,
+        leadProfessorId: adminUid,
+        leadProfessorName: cleanLeadProfName,
+        professorIds: [adminUid],
+        professorNames: sanitizeStaffList(
+          [cleanLeadProfName, 'vanr. prof. dr. Novica Nosović'],
+          VALIDATION_CONSTRAINTS.MAX_PROFESSORS_PER_COURSE
+        ),
+        assistantNames: ['mr. Emir Buza, v. as.', 'as. Harun Šiljak, dipl. ing. el.'],
+        studyProgram: 'Bachelor · Računarstvo i informatika',
+        categoryIds: arCatIds,
+        itemIds: arItems.map((i) => i.id),
+        sessionIds: arSessions.map((s) => s.id),
+        attendanceEnabled: true,
+        attendanceMaxPoints: 10,
+        allowBonusPoints: false,
+        grade6Threshold: 55,
+        grade7Threshold: 65,
+        grade8Threshold: 75,
+        grade9Threshold: 85,
+        grade10Threshold: 95,
+        isSeed: true,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      },
+    },
+    {
+      col: 'courses',
+      id: 'seed_crs_tp',
+      data: {
+        code: 'RI-TP',
+        name: 'Tehnike programiranja',
+        semester: 'Zimski semestar · I godina',
+        academicYear: '2026/2027',
+        ects: 7,
+        leadProfessorId: adminUid,
+        leadProfessorName: cleanLeadProfName,
+        professorIds: [adminUid],
+        professorNames: [cleanLeadProfName],
+        assistantNames: [
+          'mr. Vedran Ljubović, v. as.',
+          'as. Mirza Mesihović, mr. el.',
+          'as. Emina Begić, bacc. ing.',
+        ],
+        studyProgram: 'Bachelor · Računarstvo i informatika',
+        categoryIds: tpCatIds,
+        itemIds: tpItems.map((i) => i.id),
+        sessionIds: tpSessions.map((s) => s.id),
+        attendanceEnabled: true,
+        attendanceMaxPoints: 10,
+        allowBonusPoints: false,
+        grade6Threshold: 55,
+        grade7Threshold: 65,
+        grade8Threshold: 75,
+        grade9Threshold: 85,
+        grade10Threshold: 95,
+        isSeed: true,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      },
+    },
+    {
+      col: 'courses',
+      id: 'seed_crs_os',
+      data: {
+        code: 'RI-OS',
+        name: 'Operativni sistemi',
+        semester: 'Ljetni semestar · II godina',
+        academicYear: '2026/2027',
+        ects: 5,
+        leadProfessorId: adminUid,
+        leadProfessorName: cleanLeadProfName,
+        professorIds: [adminUid],
+        professorNames: sanitizeStaffList(
+          [cleanLeadProfName, 'doc. dr. Samir Ribić'],
+          VALIDATION_CONSTRAINTS.MAX_PROFESSORS_PER_COURSE
+        ),
+        assistantNames: ['mr. Damir Hasić, v. as.'],
+        studyProgram: 'Bachelor · Računarstvo i informatika',
+        categoryIds: osCatIds,
+        itemIds: osItems.map((i) => i.id),
+        sessionIds: [],
+        attendanceEnabled: false,
+        attendanceMaxPoints: 0,
+        allowBonusPoints: false,
+        grade6Threshold: 50,
+        grade7Threshold: 62,
+        grade8Threshold: 74,
+        grade9Threshold: 85,
+        grade10Threshold: 94,
+        isSeed: true,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      },
+    },
   ];
-  for (const c of arCategoriesMeta) {
-    batch1.set(doc(db, 'gradingCategories', c.id), {
-      courseId: 'seed_crs_ar',
-      name: c.name,
-      maxPoints: c.max,
-      order: c.order,
-      professorIds: [adminUid],
-      isSeed: true,
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    });
-  }
+  await writeSeedStage(stage2Tasks);
 
-  const tpCategoriesMeta = [
-    { id: 'seed_cat_tp_zad', name: 'Zadaće', max: 20, order: 1 },
-    { id: 'seed_cat_tp_vje', name: 'Vježbe', max: 10, order: 2 },
-    { id: 'seed_cat_tp_p1', name: 'I parcijalni ispit', max: 20, order: 3 },
-    { id: 'seed_cat_tp_p2', name: 'II parcijalni ispit', max: 20, order: 4 },
-    { id: 'seed_cat_tp_zav', name: 'Završni ispit', max: 20, order: 5 },
+  // Stage 3: Categories, Attendance Sessions, and Enrollments (depend on Courses)
+  const stage3Tasks: SeedDocTask[] = [];
+  const allCategoriesMeta = [
+    { courseId: 'seed_crs_ar', id: 'seed_cat_ar_zad', name: 'Zadaci', max: 10, order: 1 },
+    { courseId: 'seed_crs_ar', id: 'seed_cat_ar_vje', name: 'Vježbe', max: 10, order: 2 },
+    { courseId: 'seed_crs_ar', id: 'seed_cat_ar_p1', name: 'I parcijalni ispit', max: 20, order: 3 },
+    { courseId: 'seed_crs_ar', id: 'seed_cat_ar_p2', name: 'II parcijalni ispit', max: 20, order: 4 },
+    { courseId: 'seed_crs_ar', id: 'seed_cat_ar_zav', name: 'Završni ispit', max: 20, order: 5 },
+    { courseId: 'seed_crs_ar', id: 'seed_cat_ar_ost', name: 'Ostalo / dodatna aktivnost', max: 10, order: 6 },
+    { courseId: 'seed_crs_tp', id: 'seed_cat_tp_zad', name: 'Zadaće', max: 20, order: 1 },
+    { courseId: 'seed_crs_tp', id: 'seed_cat_tp_vje', name: 'Vježbe', max: 10, order: 2 },
+    { courseId: 'seed_crs_tp', id: 'seed_cat_tp_p1', name: 'I parcijalni ispit', max: 20, order: 3 },
+    { courseId: 'seed_crs_tp', id: 'seed_cat_tp_p2', name: 'II parcijalni ispit', max: 20, order: 4 },
+    { courseId: 'seed_crs_tp', id: 'seed_cat_tp_zav', name: 'Završni ispit', max: 20, order: 5 },
+    { courseId: 'seed_crs_os', id: 'seed_cat_os_lab', name: 'Laboratorijske vježbe', max: 25, order: 1 },
+    { courseId: 'seed_crs_os', id: 'seed_cat_os_proj', name: 'Projektni zadatak', max: 25, order: 2 },
+    { courseId: 'seed_crs_os', id: 'seed_cat_os_isp', name: 'Završni ispit', max: 50, order: 3 },
   ];
-  for (const c of tpCategoriesMeta) {
-    batch1.set(doc(db, 'gradingCategories', c.id), {
-      courseId: 'seed_crs_tp',
-      name: c.name,
-      maxPoints: c.max,
-      order: c.order,
-      professorIds: [adminUid],
-      isSeed: true,
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    });
-  }
 
-  const osCategoriesMeta = [
-    { id: 'seed_cat_os_lab', name: 'Laboratorijske vježbe', max: 25, order: 1 },
-    { id: 'seed_cat_os_proj', name: 'Projektni zadatak', max: 25, order: 2 },
-    { id: 'seed_cat_os_isp', name: 'Završni ispit', max: 50, order: 3 },
-  ];
-  for (const c of osCategoriesMeta) {
-    batch1.set(doc(db, 'gradingCategories', c.id), {
-      courseId: 'seed_crs_os',
-      name: c.name,
-      maxPoints: c.max,
-      order: c.order,
-      professorIds: [adminUid],
-      isSeed: true,
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    });
-  }
-
-  for (const it of arItems) {
-    batch1.set(doc(db, 'gradingItems', it.id), {
-      courseId: 'seed_crs_ar',
-      categoryId: it.catId,
-      name: it.name,
-      maxPoints: it.max,
-      date: it.date,
-      description: it.desc,
-      order: it.order,
-      professorIds: [adminUid],
-      isSeed: true,
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    });
-  }
-  for (const it of tpItems) {
-    batch1.set(doc(db, 'gradingItems', it.id), {
-      courseId: 'seed_crs_tp',
-      categoryId: it.catId,
-      name: it.name,
-      maxPoints: it.max,
-      date: it.date,
-      description: it.desc,
-      order: it.order,
-      professorIds: [adminUid],
-      isSeed: true,
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    });
-  }
-  for (const it of osItems) {
-    batch1.set(doc(db, 'gradingItems', it.id), {
-      courseId: 'seed_crs_os',
-      categoryId: it.catId,
-      name: it.name,
-      maxPoints: it.max,
-      date: it.date,
-      description: it.desc,
-      order: it.order,
-      professorIds: [adminUid],
-      isSeed: true,
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
+  for (const c of allCategoriesMeta) {
+    stage3Tasks.push({
+      col: 'gradingCategories',
+      id: c.id,
+      data: {
+        courseId: c.courseId,
+        name: c.name,
+        maxPoints: c.max,
+        order: c.order,
+        professorIds: [adminUid],
+        isSeed: true,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      },
     });
   }
 
   for (const ses of arSessions) {
-    batch1.set(doc(db, 'attendanceSessions', ses.id), {
-      courseId: 'seed_crs_ar',
-      date: ses.date,
-      time: ses.time,
-      topic: ses.topic,
-      isCancelled: ses.cancelled,
-      professorIds: [adminUid],
-      isSeed: true,
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
+    stage3Tasks.push({
+      col: 'attendanceSessions',
+      id: ses.id,
+      data: {
+        courseId: 'seed_crs_ar',
+        date: ses.date,
+        time: ses.time,
+        topic: ses.topic,
+        isCancelled: ses.cancelled,
+        professorIds: [adminUid],
+        isSeed: true,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      },
     });
   }
+
   for (const ses of tpSessions) {
-    batch1.set(doc(db, 'attendanceSessions', ses.id), {
-      courseId: 'seed_crs_tp',
-      date: ses.date,
-      time: ses.time,
-      topic: ses.topic,
-      isCancelled: ses.cancelled,
-      professorIds: [adminUid],
-      isSeed: true,
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
+    stage3Tasks.push({
+      col: 'attendanceSessions',
+      id: ses.id,
+      data: {
+        courseId: 'seed_crs_tp',
+        date: ses.date,
+        time: ses.time,
+        topic: ses.topic,
+        isCancelled: ses.cancelled,
+        professorIds: [adminUid],
+        isSeed: true,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      },
     });
   }
 
@@ -1705,76 +3844,108 @@ export async function seedEtfDemoData(params: {
   ];
   for (const crs of courseMetaList) {
     for (const stu of allEnrolled) {
-      batch1.set(doc(db, 'enrollments', `${crs.id}_${stu.uid}`), {
-        courseId: crs.id,
-        courseCode: crs.code,
-        courseName: crs.name,
-        leadProfessorName: `dr. ${adminName}`,
-        academicYear: '2026/2027',
-        studentId: stu.uid,
-        studentName: stu.fullName,
-        studentIndex: stu.index,
-        studentDepartment: stu.dept,
+      stage3Tasks.push({
+        col: 'enrollments',
+        id: `${crs.id}_${stu.uid}`,
+        data: {
+          courseId: crs.id,
+          courseCode: crs.code,
+          courseName: crs.name,
+          leadProfessorName: cleanLeadProfName,
+          academicYear: '2026/2027',
+          studentId: stu.uid,
+          studentName: stu.fullName,
+          studentIndex: stu.index,
+          studentDepartment: stu.dept,
+          professorIds: [adminUid],
+          isSeed: true,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        },
+      });
+    }
+  }
+  await writeSeedStage(stage3Tasks);
+
+  // Stage 4: Grading Items (depend on Courses and Grading Categories)
+  const stage4Tasks: SeedDocTask[] = [];
+  const allItemsWithCourse = [
+    ...arItems.map((it) => ({ ...it, courseId: 'seed_crs_ar' })),
+    ...tpItems.map((it) => ({ ...it, courseId: 'seed_crs_tp' })),
+    ...osItems.map((it) => ({ ...it, courseId: 'seed_crs_os' })),
+  ];
+  for (const it of allItemsWithCourse) {
+    stage4Tasks.push({
+      col: 'gradingItems',
+      id: it.id,
+      data: {
+        courseId: it.courseId,
+        categoryId: it.catId,
+        name: it.name,
+        maxPoints: it.max,
+        date: it.date,
+        description: it.desc,
+        order: it.order,
         professorIds: [adminUid],
         isSeed: true,
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
-      });
-    }
+      },
+    });
   }
+  await writeSeedStage(stage4Tasks);
 
-  try {
-    await batch1.commit();
-  } catch (error) {
-    handleFirestoreError(error, OperationType.WRITE, 'seed_batch_1');
-  }
+  // Stage 5: Attendance Records, Scores, and Final Grades (depend on Sessions, Items, and Enrollments)
+  const stage5Tasks: SeedDocTask[] = [];
 
-  // Batch 2: Attendance records, student scores, and finalized/draft grades
-  const batch2 = writeBatch(db);
-
-  // Attendance for AR (5 held sessions: seed_ses_ar_1..4 and seed_ses_ar_6)
   const heldArIds = ['seed_ses_ar_1', 'seed_ses_ar_2', 'seed_ses_ar_3', 'seed_ses_ar_4', 'seed_ses_ar_6'];
   allEnrolled.forEach((stu, stuIdx) => {
     heldArIds.forEach((sesId, sesIdx) => {
-      // Make realistic attendance patterns (e.g. 4/5 = 8/10b for first user, 5/5 = 10/10b for Amila, 3/5 = 6/10b for Mirza)
       const present =
         stuIdx === 1
           ? true
           : stuIdx === 5
             ? sesIdx < 3
             : !(sesIdx === 3 && stuIdx % 2 === 0);
-      batch2.set(doc(db, 'attendanceRecords', `${sesId}_${stu.uid}`), {
-        courseId: 'seed_crs_ar',
-        sessionId: sesId,
-        studentId: stu.uid,
-        present,
-        note: present ? '' : 'Izostanak evidentiran na predavanju',
-        markedBy: adminUid,
-        professorIds: [adminUid],
-        isSeed: true,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
+      stage5Tasks.push({
+        col: 'attendanceRecords',
+        id: `${sesId}_${stu.uid}`,
+        data: {
+          courseId: 'seed_crs_ar',
+          sessionId: sesId,
+          studentId: stu.uid,
+          present,
+          note: present ? '' : 'Izostanak evidentiran na predavanju',
+          markedBy: adminUid,
+          professorIds: [adminUid],
+          isSeed: true,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        },
       });
     });
 
     tpSessions.forEach((ses, sesIdx) => {
       const present = !(stuIdx === 3 && sesIdx === 2);
-      batch2.set(doc(db, 'attendanceRecords', `${ses.id}_${stu.uid}`), {
-        courseId: 'seed_crs_tp',
-        sessionId: ses.id,
-        studentId: stu.uid,
-        present,
-        note: '',
-        markedBy: adminUid,
-        professorIds: [adminUid],
-        isSeed: true,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
+      stage5Tasks.push({
+        col: 'attendanceRecords',
+        id: `${ses.id}_${stu.uid}`,
+        data: {
+          courseId: 'seed_crs_tp',
+          sessionId: ses.id,
+          studentId: stu.uid,
+          present,
+          note: '',
+          markedBy: adminUid,
+          professorIds: [adminUid],
+          isSeed: true,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        },
       });
     });
   });
 
-  // Scores for AR (In-progress semester: Zadaci 1-5, Vježbe 1-2, I parcijalni, Dodatni projekat graded; II parcijalni & Usmeni upcoming)
   const arScoredTemplates = [
     { itemId: 'seed_itm_ar_1', catId: 'seed_cat_ar_zad', pts: [2, 2, 1.8, 1.5, 2, 1.2], fb: 'Tačna minimizacija Karnaughovom mapom.' },
     { itemId: 'seed_itm_ar_2', catId: 'seed_cat_ar_zad', pts: [2, 2, 1.9, 1.6, 1.8, 1.4], fb: '' },
@@ -1789,23 +3960,26 @@ export async function seedEtfDemoData(params: {
 
   allEnrolled.forEach((stu, idx) => {
     for (const tmpl of arScoredTemplates) {
-      batch2.set(doc(db, 'scores', `${tmpl.itemId}_${stu.uid}`), {
-        courseId: 'seed_crs_ar',
-        categoryId: tmpl.catId,
-        itemId: tmpl.itemId,
-        studentId: stu.uid,
-        points: tmpl.pts[idx] ?? 1.5,
-        feedback: idx === 0 ? tmpl.fb : '',
-        gradedBy: adminUid,
-        professorIds: [adminUid],
-        isSeed: true,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
+      stage5Tasks.push({
+        col: 'scores',
+        id: `${tmpl.itemId}_${stu.uid}`,
+        data: {
+          courseId: 'seed_crs_ar',
+          categoryId: tmpl.catId,
+          itemId: tmpl.itemId,
+          studentId: stu.uid,
+          points: tmpl.pts[idx] ?? 1.5,
+          feedback: idx === 0 ? tmpl.fb : '',
+          gradedBy: adminUid,
+          professorIds: [adminUid],
+          isSeed: true,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        },
       });
     }
   });
 
-  // Scores & Finalized Grades for TP
   const tpScoredTemplates = [
     { itemId: 'seed_itm_tp_1', catId: 'seed_cat_tp_zad', pts: [9.5, 10, 8.5, 7.5, 9, 6.5] },
     { itemId: 'seed_itm_tp_2', catId: 'seed_cat_tp_zad', pts: [9.0, 9.5, 8.0, 7.0, 8.5, 6.0] },
@@ -1815,6 +3989,74 @@ export async function seedEtfDemoData(params: {
     { itemId: 'seed_itm_tp_6', catId: 'seed_cat_tp_zav', pts: [18, 19, 15, 13.5, 17, 12] },
   ];
 
+  allEnrolled.forEach((stu, idx) => {
+    for (const tmpl of tpScoredTemplates) {
+      stage5Tasks.push({
+        col: 'scores',
+        id: `${tmpl.itemId}_${stu.uid}`,
+        data: {
+          courseId: 'seed_crs_tp',
+          categoryId: tmpl.catId,
+          itemId: tmpl.itemId,
+          studentId: stu.uid,
+          points: tmpl.pts[idx] ?? 8,
+          feedback:
+            idx === 0 && tmpl.itemId === 'seed_itm_tp_6'
+              ? 'Čist i moderan C++ kod bez curenja memorije.'
+              : '',
+          gradedBy: adminUid,
+          professorIds: [adminUid],
+          isSeed: true,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        },
+      });
+    }
+  });
+
+  // Scores for OS
+  allEnrolled.forEach((stu, idx) => {
+    const pts1 = [23, 25, 20, 19, 22, 16][idx] ?? 20;
+    const pts2 = [24, 24, 21, 18, 23, 17][idx] ?? 20;
+    stage5Tasks.push({
+      col: 'scores',
+      id: `seed_itm_os_1_${stu.uid}`,
+      data: {
+        courseId: 'seed_crs_os',
+        categoryId: 'seed_cat_os_lab',
+        itemId: 'seed_itm_os_1',
+        studentId: stu.uid,
+        points: pts1,
+        feedback: '',
+        gradedBy: adminUid,
+        professorIds: [adminUid],
+        isSeed: true,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      },
+    });
+    stage5Tasks.push({
+      col: 'scores',
+      id: `seed_itm_os_2_${stu.uid}`,
+      data: {
+        courseId: 'seed_crs_os',
+        categoryId: 'seed_cat_os_proj',
+        itemId: 'seed_itm_os_2',
+        studentId: stu.uid,
+        points: pts2,
+        feedback: idx === 0 ? 'Uredna sinhronizacija pristupa uređaju u jezgru.' : '',
+        gradedBy: adminUid,
+        professorIds: [adminUid],
+        isSeed: true,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      },
+    });
+  });
+
+  await writeSeedStage(stage5Tasks);
+
+  // Finalize TP grades last so completionMarkerId marks 100% completion
   const tpFinalMeta = [
     { total: 92, grade: 9, status: FinalGradeStatus.FINALIZED },
     { total: 97, grade: 10, status: FinalGradeStatus.FINALIZED },
@@ -1824,82 +4066,451 @@ export async function seedEtfDemoData(params: {
     { total: 65.5, grade: 7, status: FinalGradeStatus.DRAFT },
   ];
 
-  allEnrolled.forEach((stu, idx) => {
-    for (const tmpl of tpScoredTemplates) {
-      batch2.set(doc(db, 'scores', `${tmpl.itemId}_${stu.uid}`), {
-        courseId: 'seed_crs_tp',
-        categoryId: tmpl.catId,
-        itemId: tmpl.itemId,
-        studentId: stu.uid,
-        points: tmpl.pts[idx] ?? 8,
-        feedback: idx === 0 && tmpl.itemId === 'seed_itm_tp_6' ? 'Čist i moderan C++ kod bez curenja memorije.' : '',
-        gradedBy: adminUid,
-        professorIds: [adminUid],
-        isSeed: true,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      });
-    }
+  const finalGradeTasks: SeedDocTask[] = [];
+  let markerTask: SeedDocTask | null = null;
 
+  allEnrolled.forEach((stu, idx) => {
     const fg = tpFinalMeta[idx];
-    if (fg) {
-      batch2.set(doc(db, 'finalGrades', `seed_crs_tp_${stu.uid}`), {
+    if (!fg) return;
+    const task: SeedDocTask = {
+      col: 'finalGrades',
+      id: `seed_crs_tp_${stu.uid}`,
+      data: {
         courseId: 'seed_crs_tp',
         studentId: stu.uid,
         totalPoints: fg.total,
         finalGrade: fg.grade,
         status: fg.status,
         finalizedBy: adminUid,
-        comment: fg.status === FinalGradeStatus.FINALIZED ? 'Uspješno položen predmet u septembarskom/oktobarskom roku.' : 'Nacrt ocjene prije upisa.',
+        comment:
+          fg.status === FinalGradeStatus.FINALIZED
+            ? 'Uspješno položen predmet u septembarskom/oktobarskom roku.'
+            : 'Nacrt ocjene prije upisa.',
         professorIds: [adminUid],
         isSeed: true,
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
-      });
+      },
+    };
+    if (stu.uid === adminUid) {
+      markerTask = task;
+    } else {
+      finalGradeTasks.push(task);
     }
   });
 
-  // Scores for OS
-  allEnrolled.forEach((stu, idx) => {
-    const pts1 = [23, 25, 20, 19, 22, 16][idx] ?? 20;
-    const pts2 = [24, 24, 21, 18, 23, 17][idx] ?? 20;
-    batch2.set(doc(db, 'scores', `seed_itm_os_1_${stu.uid}`), {
-      courseId: 'seed_crs_os',
-      categoryId: 'seed_cat_os_lab',
-      itemId: 'seed_itm_os_1',
-      studentId: stu.uid,
-      points: pts1,
-      feedback: '',
-      gradedBy: adminUid,
-      professorIds: [adminUid],
-      isSeed: true,
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    });
-    batch2.set(doc(db, 'scores', `seed_itm_os_2_${stu.uid}`), {
-      courseId: 'seed_crs_os',
-      categoryId: 'seed_cat_os_proj',
-      itemId: 'seed_itm_os_2',
-      studentId: stu.uid,
-      points: pts2,
-      feedback: idx === 0 ? 'Uredna sinhronizacija pristupa uređaju u jezgru.' : '',
-      gradedBy: adminUid,
-      professorIds: [adminUid],
-      isSeed: true,
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    });
+  await writeSeedStage(finalGradeTasks);
+  if (markerTask) {
+    await writeSeedStage([markerTask]);
+  }
+  await Promise.all([
+    seedDemoExamDataIfMissing({ adminUid }),
+    seedDemoStudyProgramsIfMissing({
+      adminUid,
+      cleanAdminName,
+      cleanLeadProfName,
+      effectiveIndex,
+    }),
+  ]);
+  await seedDemoPortalExtensionsIfMissing({
+    adminUid,
+    cleanAdminName,
+    cleanLeadProfName,
+    effectiveIndex,
   });
+}
 
+async function seedDemoPortalExtensionsIfMissing(params: {
+  adminUid: string;
+  cleanAdminName: string;
+  cleanLeadProfName: string;
+  effectiveIndex: string;
+}): Promise<void> {
+  const { adminUid, cleanAdminName, cleanLeadProfName, effectiveIndex } = params;
+  const today = getTodayIsoLocal();
+  const jsDay = new Date().getDay();
+  const todayDow = jsDay === 0 ? 7 : jsDay; // 1=Pon .. 7=Ned
+  const tomorrowDow = todayDow === 7 ? 1 : todayDow + 1;
+
+  // 1. Academic State ("academicState/current")
   try {
-    await batch2.commit();
-  } catch (error) {
-    handleFirestoreError(error, OperationType.WRITE, 'seed_batch_2');
+    const stateRef = doc(db, 'academicState', 'current');
+    if (!(await getDoc(stateRef)).exists()) {
+      await setDoc(stateRef, {
+        activeAcademicYear: '2026/2027',
+        activeSemesterType: 'Zimski',
+        semesterLabel: 'Zimski semestar 2026/2027',
+        updatedBy: adminUid,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    }
+  } catch {
+    // Non-blocking seed
+  }
+
+  // 2. Official Admin Announcements ("announcements")
+  const seedAnnouncements = [
+    {
+      id: 'seed_ann_1',
+      title: 'Raspored ispitnih rokova i pravila prijave u zimskom semestru 2026/2027',
+      body: 'Obavještavaju se studenti I i II ciklusa studija te Stručnog studija Razvoj softvera da se prijava parcijalnih i završnih ispita vrši isključivo putem VOLTRA portala najkasnije do datuma zatvaranja prijave navedenog na predmetu.',
+      category: 'ispiti' as AnnouncementCategory,
+      audience: 'all' as AnnouncementAudience,
+      pinned: true,
+    },
+    {
+      id: 'seed_ann_2',
+      title: 'Raspored laboratorijskih vježbi u Kampusu Univerziteta u Sarajevu',
+      body: 'Redovne laboratorijske vježbe na odsjecima Računarstvo i informatika, Automatika i elektronika, Elektroenergetika i Telekomunikacije održavaju se prema objavljenom rasporedu po grupama. Prisustvo se evidentira elektronski na svakom terminu.',
+      category: 'nastava' as AnnouncementCategory,
+      audience: 'students' as AnnouncementAudience,
+      pinned: false,
+    },
+    {
+      id: 'seed_ann_3',
+      title: 'Uputstvo nastavnom osoblju za zaključivanje ocjena i arhiviranje semestra',
+      body: 'Predmetni nastavnici unose bodove po kategorijama i zaključuju konačne ocjene u sekciji Studenti i ocjene. Nakon završetka ispitnog roka studentska služba i administrator vrše arhiviranje semestra.',
+      category: 'semestar' as AnnouncementCategory,
+      audience: 'professors' as AnnouncementAudience,
+      pinned: false,
+    },
+  ];
+
+  await Promise.all(
+    seedAnnouncements.map(async (ann) => {
+      try {
+        const ref = doc(db, 'announcements', ann.id);
+        if ((await getDoc(ref)).exists()) return;
+        await setDoc(ref, {
+          title: ann.title,
+          body: ann.body,
+          category: ann.category,
+          audience: ann.audience,
+          pinned: ann.pinned,
+          isPublished: true,
+          authorUid: adminUid,
+          authorName: `Studentska služba · ${cleanAdminName}`,
+          academicYear: '2026/2027',
+          isSeed: true,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      } catch {
+        // Non-blocking seed
+      }
+    })
+  );
+
+  // 3. Schedule Events ("scheduleEvents") — ensures "Danas" & "Ove sedmice" are populated
+  const existingSchedSnap = await getDoc(doc(db, 'scheduleEvents', 'seed_sch_ar_lec'));
+  if (!existingSchedSnap.exists()) {
+    const scheduleSeeds: Array<{
+      id: string;
+      courseId: string;
+      courseCode: string;
+      courseName: string;
+      eventType: ScheduleEventType;
+      title: string;
+      isRecurringWeekly: boolean;
+      dayOfWeek: number;
+      date: string;
+      startTime: string;
+      endTime: string;
+      location: string;
+      description: string;
+    }> = [
+      {
+        id: 'seed_sch_ar_lec',
+        courseId: 'seed_crs_ar',
+        courseCode: 'OR-AR',
+        courseName: 'Arhitektura računara',
+        eventType: ScheduleEventType.LECTURE,
+        title: 'Predavanje — Cjevovodna obrada i keš memorija',
+        isRecurringWeekly: true,
+        dayOfWeek: todayDow,
+        date: today,
+        startTime: '09:00',
+        endTime: '11:00',
+        location: 'Amfiteatar A1 · Kampus UNSA',
+        description: 'Redovno sedmično predavanje za studente II godine.',
+      },
+      {
+        id: 'seed_sch_ar_lab',
+        courseId: 'seed_crs_ar',
+        courseCode: 'OR-AR',
+        courseName: 'Arhitektura računara',
+        eventType: ScheduleEventType.LAB,
+        title: 'Laboratorijske vježbe — x86 Asembler i prekidi',
+        isRecurringWeekly: true,
+        dayOfWeek: todayDow,
+        date: today,
+        startTime: '13:00',
+        endTime: '14:30',
+        location: 'Laboratorija 1-04',
+        description: 'Praktične laboratorijske vježbe uz prisustvo asistenta.',
+      },
+      {
+        id: 'seed_sch_ar_proj',
+        courseId: 'seed_crs_ar',
+        courseCode: 'OR-AR',
+        courseName: 'Arhitektura računara',
+        eventType: ScheduleEventType.PROJECT_DEADLINE,
+        title: 'Rok za predaju — RISC-V 5-stepeni simulator',
+        isRecurringWeekly: false,
+        dayOfWeek: tomorrowDow,
+        date: addDaysIso(today, 2),
+        startTime: '23:59',
+        endTime: '23:59',
+        location: 'VOLTRA repozitorij predmeta',
+        description: 'Predaja izvornog koda i kratkog tehničkog izvještaja.',
+      },
+      {
+        id: 'seed_sch_os_lec',
+        courseId: 'seed_crs_os',
+        courseCode: 'RI-OS',
+        courseName: 'Operativni sistemi',
+        eventType: ScheduleEventType.LECTURE,
+        title: 'Predavanje — Sinhronizacija procesa i raspoređivač jezgra',
+        isRecurringWeekly: true,
+        dayOfWeek: tomorrowDow,
+        date: addDaysIso(today, 1),
+        startTime: '11:00',
+        endTime: '13:00',
+        location: 'Sala S1 · Kampus UNSA',
+        description: 'Redovno sedmično predavanje.',
+      },
+      {
+        id: 'seed_sch_rs_lab',
+        courseId: 'seed_crs_rs_web',
+        courseCode: 'RS-RMW',
+        courseName: 'Razvoj modernih web aplikacija',
+        eventType: ScheduleEventType.LAB,
+        title: 'Laboratorijske vježbe — Full-stack autentifikacija i API',
+        isRecurringWeekly: true,
+        dayOfWeek: todayDow,
+        date: today,
+        startTime: '15:00',
+        endTime: '17:00',
+        location: 'Laboratorija 2-05',
+        description: 'Stručni studij Razvoj softvera (2 godine).',
+      },
+      {
+        id: 'seed_sch_ass_proj',
+        courseId: 'seed_crs_ri_ass',
+        courseCode: 'RI-ASS',
+        courseName: 'Arhitektura softverskih sistema i mikroservisi',
+        eventType: ScheduleEventType.PROJECT_DEADLINE,
+        title: 'Rok za projekat — Saga orkestracija i distribuirani tracing',
+        isRecurringWeekly: false,
+        dayOfWeek: tomorrowDow,
+        date: addDaysIso(today, 4),
+        startTime: '20:00',
+        endTime: '20:00',
+        location: 'Sala S3 / Online predaja',
+        description: 'Master studij · Računarstvo i informatika.',
+      },
+    ];
+
+    const byCourse = new Map<string, string[]>();
+    for (const ev of scheduleSeeds) {
+      try {
+        const courseSnap = await getDoc(doc(db, 'courses', ev.courseId));
+        if (!courseSnap.exists()) continue;
+        const cData = courseSnap.data() as Course;
+        const existingIds = byCourse.get(ev.courseId) ?? (cData.scheduleEventIds ?? []);
+        const nextIds = Array.from(new Set([...existingIds, ev.id]));
+        byCourse.set(ev.courseId, nextIds);
+
+        const batch = writeBatch(db);
+        batch.set(doc(db, 'scheduleEvents', ev.id), {
+          courseId: ev.courseId,
+          courseCode: ev.courseCode,
+          courseName: ev.courseName,
+          eventType: ev.eventType,
+          title: ev.title,
+          isRecurringWeekly: ev.isRecurringWeekly,
+          dayOfWeek: ev.dayOfWeek,
+          date: ev.date,
+          startTime: ev.startTime,
+          endTime: ev.endTime,
+          location: ev.location,
+          description: ev.description,
+          createdBy: adminUid,
+          professorIds: [adminUid],
+          isSeed: true,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+        batch.update(doc(db, 'courses', ev.courseId), {
+          scheduleEventIds: nextIds,
+          updatedAt: serverTimestamp(),
+        });
+        await batch.commit();
+      } catch {
+        // Non-blocking seed
+      }
+    }
+  }
+
+  // 4. Archived Previous Academic Year Courses (2025/2026) so students see old semesters & passed courses
+  const archIm1Snap = await getDoc(doc(db, 'courses', 'seed_crs_im1'));
+  if (!archIm1Snap.exists()) {
+    const archivedCourses = [
+      {
+        id: 'seed_crs_im1',
+        code: 'RI-IM1',
+        name: 'Inženjerska matematika 1',
+        semester: 'Zimski semestar · I godina',
+        academicYear: '2025/2026',
+        ects: 7,
+        studyProgram: 'Bachelor · Računarstvo i informatika',
+        catId: 'seed_cat_im1_isp',
+        itemId: 'seed_itm_im1_zav',
+        itemName: 'Integralni završni ispit i parcijalni bodovi',
+        points: 88,
+        grade: 9,
+      },
+      {
+        id: 'seed_crs_uup',
+        code: 'OR-UUP',
+        name: 'Uvod u programiranje',
+        semester: 'Zimski semestar · I godina',
+        academicYear: '2025/2026',
+        ects: 6,
+        studyProgram: 'Bachelor · Računarstvo i informatika',
+        catId: 'seed_cat_uup_isp',
+        itemId: 'seed_itm_uup_zav',
+        itemName: 'Zadaće, laboratorijske vježbe i završni ispit u C-u',
+        points: 96,
+        grade: 10,
+      },
+    ];
+
+    const archStudents = [
+      { uid: adminUid, fullName: cleanAdminName, index: effectiveIndex, dept: 'Računarstvo i informatika' },
+      { uid: 'seed_stu_haris', fullName: 'Haris Begović', index: '18942', dept: 'Računarstvo i informatika' },
+      { uid: 'seed_stu_amila', fullName: 'Amila Kovačević', index: '19014', dept: 'Računarstvo i informatika' },
+    ];
+
+    for (const ac of archivedCourses) {
+      try {
+        await setDoc(doc(db, 'courses', ac.id), {
+          code: ac.code,
+          name: ac.name,
+          semester: ac.semester,
+          academicYear: ac.academicYear,
+          ects: ac.ects,
+          leadProfessorId: adminUid,
+          leadProfessorName: cleanLeadProfName,
+          professorIds: [adminUid],
+          professorNames: [cleanLeadProfName],
+          assistantNames: ['mr. Vedran Ljubović, v. as.'],
+          studyProgram: ac.studyProgram,
+          categoryIds: [ac.catId],
+          itemIds: [ac.itemId],
+          sessionIds: [],
+          examTermIds: [],
+          scheduleEventIds: [],
+          isArchived: true,
+          attendanceEnabled: false,
+          attendanceMaxPoints: 0,
+          allowBonusPoints: false,
+          grade6Threshold: 55,
+          grade7Threshold: 65,
+          grade8Threshold: 75,
+          grade9Threshold: 85,
+          grade10Threshold: 95,
+          isSeed: true,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+
+        await setDoc(doc(db, 'gradingCategories', ac.catId), {
+          courseId: ac.id,
+          name: 'Ukupne ispitne obaveze',
+          maxPoints: 100,
+          order: 1,
+          professorIds: [adminUid],
+          isSeed: true,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+
+        await setDoc(doc(db, 'gradingItems', ac.itemId), {
+          courseId: ac.id,
+          categoryId: ac.catId,
+          name: ac.itemName,
+          maxPoints: 100,
+          date: '2026-01-28',
+          description: 'Arhivirani rezultat iz akademske 2025/2026. godine.',
+          order: 1,
+          professorIds: [adminUid],
+          isSeed: true,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+
+        for (const stu of archStudents) {
+          const enrId = `${ac.id}_${stu.uid}`;
+          await setDoc(doc(db, 'enrollments', enrId), {
+            courseId: ac.id,
+            courseCode: ac.code,
+            courseName: ac.name,
+            leadProfessorName: cleanLeadProfName,
+            academicYear: ac.academicYear,
+            semester: ac.semester,
+            isArchived: true,
+            studentId: stu.uid,
+            studentName: stu.fullName,
+            studentIndex: stu.index,
+            studentDepartment: stu.dept,
+            professorIds: [adminUid],
+            isSeed: true,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+
+          await setDoc(doc(db, 'scores', `${ac.itemId}_${stu.uid}`), {
+            courseId: ac.id,
+            categoryId: ac.catId,
+            itemId: ac.itemId,
+            studentId: stu.uid,
+            points: ac.points,
+            feedback: 'Položeno u januarsko-februarskom ispitnom roku 2025/2026.',
+            gradedBy: adminUid,
+            professorIds: [adminUid],
+            isSeed: true,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+
+          await setDoc(doc(db, 'finalGrades', `${ac.id}_${stu.uid}`), {
+            courseId: ac.id,
+            studentId: stu.uid,
+            totalPoints: ac.points,
+            finalGrade: ac.grade,
+            status: FinalGradeStatus.FINALIZED,
+            finalizedBy: adminUid,
+            comment: `Zaključena ocjena iz akademske ${ac.academicYear}. godine.`,
+            professorIds: [adminUid],
+            isSeed: true,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+        }
+      } catch {
+        // Non-blocking archived seed
+      }
+    }
   }
 }
 
 export async function clearEtfDemoData(professorUid: string): Promise<number> {
   const collectionsToClean = [
+    'scheduleEvents',
+    'examRegistrations',
+    'examTerms',
     'scores',
     'attendanceRecords',
     'finalGrades',
@@ -1920,34 +4531,1028 @@ export async function clearEtfDemoData(professorUid: string): Promise<number> {
     const snap = await getDocs(q);
     const seedDocs = snap.docs.filter((d) => d.data().isSeed === true);
 
-    for (let i = 0; i < seedDocs.length; i += 400) {
-      const chunk = seedDocs.slice(i, i + 400);
-      const batch = writeBatch(db);
-      for (const docSnap of chunk) {
-        batch.delete(docSnap.ref);
-        deletedCount += 1;
-      }
-      await batch.commit();
-    }
+    await runParallelChunks(seedDocs, 20, async (docSnap) => {
+      await deleteDoc(docSnap.ref);
+      deletedCount += 1;
+    });
   }
 
-  // Clean demo student profiles & directory entries (bootstrap admin allowed)
+  // Clean demo student profiles, directory entries & announcements (bootstrap admin allowed)
   try {
     const profSnap = await getDocs(query(collection(db, 'userProfiles'), where('isSeed', '==', true)));
     const dirSnap = await getDocs(query(collection(db, 'studentDirectory'), where('isSeed', '==', true)));
-    const batch = writeBatch(db);
-    profSnap.docs.forEach((d) => {
-      batch.delete(d.ref);
+    const annSnap = await getDocs(query(collection(db, 'announcements'), where('isSeed', '==', true)));
+    const allSeedIdentityDocs = [...profSnap.docs, ...dirSnap.docs, ...annSnap.docs];
+    await runParallelChunks(allSeedIdentityDocs, 20, async (docSnap) => {
+      await deleteDoc(docSnap.ref);
       deletedCount += 1;
     });
-    dirSnap.docs.forEach((d) => {
-      batch.delete(d.ref);
-      deletedCount += 1;
-    });
-    await batch.commit();
   } catch {
     // Non-bootstrap professor skips global profile cleanup
   }
 
   return deletedCount;
 }
+
+// ============================================================================
+// Official Announcements ("Obavještenja" — Admin Write, All Users Read)
+// ============================================================================
+
+export function subscribePublishedAnnouncements(
+  onData: (items: Announcement[]) => void
+): Unsubscribe {
+  const q = query(collection(db, 'announcements'), where('isPublished', '==', true));
+  return onSnapshot(
+    q,
+    (snap) => {
+      const list = snap.docs.map((d) => ({
+        ...(d.data() as Omit<Announcement, 'id'>),
+        id: d.id,
+      }));
+      list.sort((a, b) => {
+        if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
+        const aSec = (a.createdAt as { seconds?: number })?.seconds ?? 0;
+        const bSec = (b.createdAt as { seconds?: number })?.seconds ?? 0;
+        return bSec - aSec;
+      });
+      onData(list);
+    },
+    (err) => handleFirestoreError(err, OperationType.LIST, 'announcements')
+  );
+}
+
+export function subscribeAllAnnouncementsForAdmin(
+  onData: (items: Announcement[]) => void
+): Unsubscribe {
+  return onSnapshot(
+    collection(db, 'announcements'),
+    (snap) => {
+      const list = snap.docs.map((d) => ({
+        ...(d.data() as Omit<Announcement, 'id'>),
+        id: d.id,
+      }));
+      list.sort((a, b) => {
+        if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
+        const aSec = (a.createdAt as { seconds?: number })?.seconds ?? 0;
+        const bSec = (b.createdAt as { seconds?: number })?.seconds ?? 0;
+        return bSec - aSec;
+      });
+      onData(list);
+    },
+    (err) => handleFirestoreError(err, OperationType.LIST, 'announcements')
+  );
+}
+
+export async function createAnnouncement(params: {
+  adminUid: string;
+  authorName: string;
+  title: string;
+  body: string;
+  category: AnnouncementCategory;
+  audience: AnnouncementAudience;
+  pinned: boolean;
+  academicYear: string;
+}): Promise<string> {
+  const cleanTitle = sanitizeText(
+    params.title,
+    VALIDATION_CONSTRAINTS.ANNOUNCEMENT_TITLE_MAX_LENGTH
+  );
+  const cleanBody = sanitizeText(params.body, VALIDATION_CONSTRAINTS.ANNOUNCEMENT_BODY_MAX_LENGTH);
+  if (!cleanTitle || !cleanBody) {
+    throw new Error('Naslov i tekst obavještenja su obavezni.');
+  }
+
+  const id = makeEntityId('ann');
+  try {
+    await setDoc(doc(db, 'announcements', id), {
+      title: cleanTitle,
+      body: cleanBody,
+      category: params.category,
+      audience: params.audience,
+      pinned: Boolean(params.pinned),
+      isPublished: true,
+      authorUid: params.adminUid,
+      authorName:
+        sanitizeText(params.authorName, VALIDATION_CONSTRAINTS.FULL_NAME_MAX_LENGTH) ||
+        'Administrator',
+      academicYear:
+        sanitizeText(params.academicYear, VALIDATION_CONSTRAINTS.ACADEMIC_YEAR_MAX_LENGTH) ||
+        '2026/2027',
+      isSeed: false,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+    return id;
+  } catch (error) {
+    handleFirestoreError(error, OperationType.CREATE, `announcements/${id}`);
+  }
+}
+
+export async function updateAnnouncement(
+  id: string,
+  updates: {
+    title: string;
+    body: string;
+    category: AnnouncementCategory;
+    audience: AnnouncementAudience;
+    pinned: boolean;
+    isPublished: boolean;
+    authorName: string;
+    academicYear: string;
+  }
+): Promise<void> {
+  const cleanTitle = sanitizeText(
+    updates.title,
+    VALIDATION_CONSTRAINTS.ANNOUNCEMENT_TITLE_MAX_LENGTH
+  );
+  const cleanBody = sanitizeText(
+    updates.body,
+    VALIDATION_CONSTRAINTS.ANNOUNCEMENT_BODY_MAX_LENGTH
+  );
+  if (!cleanTitle || !cleanBody) {
+    throw new Error('Naslov i sadržaj obavještenja su obavezni.');
+  }
+
+  try {
+    await updateDoc(doc(db, 'announcements', id), {
+      title: cleanTitle,
+      body: cleanBody,
+      category: updates.category,
+      audience: updates.audience,
+      pinned: Boolean(updates.pinned),
+      isPublished: Boolean(updates.isPublished),
+      authorName:
+        sanitizeText(updates.authorName, VALIDATION_CONSTRAINTS.FULL_NAME_MAX_LENGTH) ||
+        'Administrator',
+      academicYear:
+        sanitizeText(updates.academicYear, VALIDATION_CONSTRAINTS.ACADEMIC_YEAR_MAX_LENGTH) ||
+        '2026/2027',
+      updatedAt: serverTimestamp(),
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `announcements/${id}`);
+  }
+}
+
+export async function deleteAnnouncement(id: string): Promise<void> {
+  try {
+    await deleteDoc(doc(db, 'announcements', id));
+  } catch (error) {
+    handleFirestoreError(error, OperationType.DELETE, `announcements/${id}`);
+  }
+}
+
+// ============================================================================
+// Schedule & Deadlines ("Raspored" — Lectures, Labs, Exams, Project Deadlines)
+// ============================================================================
+
+export function subscribeProfessorScheduleEvents(
+  professorUid: string,
+  onData: (events: ScheduleEvent[]) => void
+): Unsubscribe {
+  const q = query(
+    collection(db, 'scheduleEvents'),
+    where('professorIds', 'array-contains', professorUid)
+  );
+  return onSnapshot(
+    q,
+    (snap) => {
+      onData(snap.docs.map((d) => ({ ...(d.data() as Omit<ScheduleEvent, 'id'>), id: d.id })));
+    },
+    (err) => handleFirestoreError(err, OperationType.LIST, 'scheduleEvents')
+  );
+}
+
+export function subscribeAllScheduleEventsForAdmin(
+  onData: (events: ScheduleEvent[]) => void
+): Unsubscribe {
+  return onSnapshot(
+    collection(db, 'scheduleEvents'),
+    (snap) => {
+      onData(snap.docs.map((d) => ({ ...(d.data() as Omit<ScheduleEvent, 'id'>), id: d.id })));
+    },
+    (err) => handleFirestoreError(err, OperationType.LIST, 'scheduleEvents')
+  );
+}
+
+export async function createScheduleEvent(params: {
+  course: Course;
+  actorUid: string;
+  eventType: ScheduleEventType;
+  title: string;
+  isRecurringWeekly: boolean;
+  dayOfWeek: number;
+  date: string;
+  startTime: string;
+  endTime: string;
+  location: string;
+  description: string;
+}): Promise<string> {
+  const { course, actorUid } = params;
+  const existingIds = course.scheduleEventIds ?? [];
+  if (existingIds.length >= VALIDATION_CONSTRAINTS.MAX_SCHEDULE_EVENTS_PER_COURSE) {
+    throw new Error('Dostignut je maksimalan broj stavki rasporeda za ovaj predmet (80).');
+  }
+
+  const cleanTitle = sanitizeText(params.title, VALIDATION_CONSTRAINTS.SCHEDULE_TITLE_MAX_LENGTH);
+  if (!cleanTitle) {
+    throw new Error('Unesite naziv termina ili roka.');
+  }
+  const cleanDate = params.date || getTodayIsoLocal();
+  if (!isValidIsoDate(cleanDate)) {
+    throw new Error('Datum mora biti u formatu YYYY-MM-DD.');
+  }
+  const cleanStart =
+    sanitizeText(params.startTime, VALIDATION_CONSTRAINTS.SCHEDULE_TIME_MAX_LENGTH) || '09:00';
+  const cleanEnd = sanitizeText(params.endTime, VALIDATION_CONSTRAINTS.SCHEDULE_TIME_MAX_LENGTH);
+  const dow = Math.max(1, Math.min(7, Math.round(params.dayOfWeek || 1)));
+
+  const eventId = makeEntityId('sch');
+  const batch = writeBatch(db);
+  batch.set(doc(db, 'scheduleEvents', eventId), {
+    courseId: course.id,
+    courseCode: course.code,
+    courseName: course.name,
+    eventType: params.eventType,
+    title: cleanTitle,
+    isRecurringWeekly: Boolean(params.isRecurringWeekly),
+    dayOfWeek: dow,
+    date: cleanDate,
+    startTime: cleanStart,
+    endTime: cleanEnd,
+    location: sanitizeText(params.location, VALIDATION_CONSTRAINTS.SCHEDULE_LOCATION_MAX_LENGTH),
+    description: sanitizeText(
+      params.description,
+      VALIDATION_CONSTRAINTS.SCHEDULE_DESCRIPTION_MAX_LENGTH
+    ),
+    createdBy: actorUid,
+    professorIds: course.professorIds,
+    isSeed: false,
+    createdAt: serverTimestamp(),
+    updatedAt: serverTimestamp(),
+  });
+  batch.update(doc(db, 'courses', course.id), {
+    scheduleEventIds: [...existingIds, eventId],
+    updatedAt: serverTimestamp(),
+  });
+
+  try {
+    await batch.commit();
+    return eventId;
+  } catch (error) {
+    handleFirestoreError(error, OperationType.CREATE, `scheduleEvents/${eventId}`);
+  }
+}
+
+export async function updateScheduleEvent(
+  event: ScheduleEvent,
+  course: Course,
+  updates: {
+    eventType: ScheduleEventType;
+    title: string;
+    isRecurringWeekly: boolean;
+    dayOfWeek: number;
+    date: string;
+    startTime: string;
+    endTime: string;
+    location: string;
+    description: string;
+  }
+): Promise<void> {
+  const cleanTitle = sanitizeText(updates.title, VALIDATION_CONSTRAINTS.SCHEDULE_TITLE_MAX_LENGTH);
+  if (!cleanTitle) {
+    throw new Error('Naziv stavke rasporeda je obavezan.');
+  }
+  const cleanDate = updates.date || event.date || getTodayIsoLocal();
+  if (!isValidIsoDate(cleanDate)) {
+    throw new Error('Datum nije ispravan.');
+  }
+
+  try {
+    await updateDoc(doc(db, 'scheduleEvents', event.id), {
+      courseCode: course.code,
+      courseName: course.name,
+      eventType: updates.eventType,
+      title: cleanTitle,
+      isRecurringWeekly: Boolean(updates.isRecurringWeekly),
+      dayOfWeek: Math.max(1, Math.min(7, Math.round(updates.dayOfWeek || 1))),
+      date: cleanDate,
+      startTime:
+        sanitizeText(updates.startTime, VALIDATION_CONSTRAINTS.SCHEDULE_TIME_MAX_LENGTH) || '09:00',
+      endTime: sanitizeText(updates.endTime, VALIDATION_CONSTRAINTS.SCHEDULE_TIME_MAX_LENGTH),
+      location: sanitizeText(updates.location, VALIDATION_CONSTRAINTS.SCHEDULE_LOCATION_MAX_LENGTH),
+      description: sanitizeText(
+        updates.description,
+        VALIDATION_CONSTRAINTS.SCHEDULE_DESCRIPTION_MAX_LENGTH
+      ),
+      professorIds: course.professorIds,
+      updatedAt: serverTimestamp(),
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `scheduleEvents/${event.id}`);
+  }
+}
+
+export async function deleteScheduleEvent(params: {
+  course: Course;
+  eventId: string;
+}): Promise<void> {
+  const { course, eventId } = params;
+  const batch = writeBatch(db);
+  batch.delete(doc(db, 'scheduleEvents', eventId));
+  batch.update(doc(db, 'courses', course.id), {
+    scheduleEventIds: (course.scheduleEventIds ?? []).filter((id) => id !== eventId),
+    updatedAt: serverTimestamp(),
+  });
+  try {
+    await batch.commit();
+  } catch (error) {
+    handleFirestoreError(error, OperationType.DELETE, `scheduleEvents/${eventId}`);
+  }
+}
+
+// ============================================================================
+// Semesters, Academic State & Archiving ("Semestri i akademske godine")
+// ============================================================================
+
+export function subscribeAcademicState(
+  onData: (state: AcademicState | null) => void
+): Unsubscribe {
+  return onSnapshot(
+    doc(db, 'academicState', 'current'),
+    (snap) => {
+      if (!snap.exists()) {
+        onData(null);
+        return;
+      }
+      onData({ ...(snap.data() as Omit<AcademicState, 'id'>), id: snap.id });
+    },
+    (err) => handleFirestoreError(err, OperationType.GET, 'academicState/current')
+  );
+}
+
+export async function setCourseArchiveStatus(params: {
+  course: Course;
+  isArchived: boolean;
+  courseEnrollments: Enrollment[];
+}): Promise<void> {
+  const { course, isArchived, courseEnrollments } = params;
+  try {
+    await updateDoc(doc(db, 'courses', course.id), {
+      isArchived,
+      updatedAt: serverTimestamp(),
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `courses/${course.id}`);
+  }
+
+  await runParallelChunks(courseEnrollments, 15, async (enr) => {
+    try {
+      await updateDoc(doc(db, 'enrollments', enr.id), {
+        isArchived,
+        semester: course.semester,
+        updatedAt: serverTimestamp(),
+      });
+    } catch {
+      // Best-effort enrollment archive flag sync
+    }
+  });
+}
+
+export async function archiveSemesterAndOpenNew(params: {
+  adminUid: string;
+  coursesToArchive: Course[];
+  allEnrollments: Enrollment[];
+  nextAcademicYear: string;
+  nextSemesterType: 'Zimski' | 'Ljetni';
+  nextSemesterLabel: string;
+  cloneFreshCourses?: boolean;
+}): Promise<{ archivedCount: number; clonedCount: number }> {
+  const {
+    adminUid,
+    coursesToArchive,
+    allEnrollments,
+    nextAcademicYear,
+    nextSemesterType,
+    nextSemesterLabel,
+    cloneFreshCourses = false,
+  } = params;
+
+  const cleanYear =
+    sanitizeText(nextAcademicYear, VALIDATION_CONSTRAINTS.ACADEMIC_YEAR_MAX_LENGTH) || '2027/2028';
+  const cleanLabel =
+    sanitizeText(nextSemesterLabel, VALIDATION_CONSTRAINTS.SEMESTER_MAX_LENGTH) ||
+    `${nextSemesterType} semestar ${cleanYear}`;
+
+  let archivedCount = 0;
+  for (const crs of coursesToArchive) {
+    const crsEnrollments = allEnrollments.filter((e) => e.courseId === crs.id);
+    await setCourseArchiveStatus({
+      course: crs,
+      isArchived: true,
+      courseEnrollments: crsEnrollments,
+    });
+    archivedCount += 1;
+  }
+
+  let clonedCount = 0;
+  if (cloneFreshCourses) {
+    for (const crs of coursesToArchive) {
+      const newCourseId = makeEntityId('crs');
+      const defaultCats = [
+        { id: makeEntityId('cat'), name: 'Zadaci', maxPoints: 10, order: 1 },
+        { id: makeEntityId('cat'), name: 'Vježbe', maxPoints: 10, order: 2 },
+        { id: makeEntityId('cat'), name: 'I parcijalni ispit', maxPoints: 20, order: 3 },
+        { id: makeEntityId('cat'), name: 'II parcijalni ispit', maxPoints: 20, order: 4 },
+        { id: makeEntityId('cat'), name: 'Završni ispit', maxPoints: 30, order: 5 },
+      ];
+
+      await setDoc(doc(db, 'courses', newCourseId), {
+        code: crs.code,
+        name: crs.name,
+        semester: crs.semester,
+        academicYear: cleanYear,
+        ects: crs.ects,
+        leadProfessorId: crs.leadProfessorId,
+        leadProfessorName: crs.leadProfessorName,
+        professorIds: crs.professorIds,
+        professorNames: crs.professorNames ?? [crs.leadProfessorName],
+        assistantNames: crs.assistantNames ?? [],
+        studyProgram: crs.studyProgram || 'Bachelor · Računarstvo i informatika',
+        categoryIds: defaultCats.map((c) => c.id),
+        itemIds: [],
+        sessionIds: [],
+        examTermIds: [],
+        scheduleEventIds: [],
+        isArchived: false,
+        attendanceEnabled: crs.attendanceEnabled,
+        attendanceMaxPoints: crs.attendanceMaxPoints,
+        allowBonusPoints: crs.allowBonusPoints,
+        grade6Threshold: crs.grade6Threshold,
+        grade7Threshold: crs.grade7Threshold,
+        grade8Threshold: crs.grade8Threshold,
+        grade9Threshold: crs.grade9Threshold,
+        grade10Threshold: crs.grade10Threshold,
+        isSeed: false,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+
+      await Promise.all(
+        defaultCats.map((cat) =>
+          setDoc(doc(db, 'gradingCategories', cat.id), {
+            courseId: newCourseId,
+            name: cat.name,
+            maxPoints: cat.maxPoints,
+            order: cat.order,
+            professorIds: crs.professorIds,
+            isSeed: false,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          })
+        )
+      );
+      clonedCount += 1;
+    }
+  }
+
+  const stateRef = doc(db, 'academicState', 'current');
+  const stateSnap = await getDoc(stateRef);
+  try {
+    if (stateSnap.exists()) {
+      await updateDoc(stateRef, {
+        activeAcademicYear: cleanYear,
+        activeSemesterType: nextSemesterType,
+        semesterLabel: cleanLabel,
+        updatedBy: adminUid,
+        updatedAt: serverTimestamp(),
+      });
+    } else {
+      await setDoc(stateRef, {
+        activeAcademicYear: cleanYear,
+        activeSemesterType: nextSemesterType,
+        semesterLabel: cleanLabel,
+        updatedBy: adminUid,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    }
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, 'academicState/current');
+  }
+
+  return { archivedCount, clonedCount };
+}
+
+// ============================================================================
+// Administrator Console Subscriptions & Account Provisioning
+// ============================================================================
+
+export function subscribeAllUsersForAdmin(callbacks: {
+  onProfiles: (rows: UserProfile[]) => void;
+  onPrivates: (rows: UserPrivate[]) => void;
+  onProvisioned: (rows: ProvisionedAccount[]) => void;
+}): Unsubscribe {
+  const u1 = onSnapshot(
+    collection(db, 'userProfiles'),
+    (snap) => {
+      callbacks.onProfiles(
+        snap.docs.map((d) => {
+          const data = d.data() as UserProfile;
+          return {
+            ...data,
+            uid: d.id,
+            studyTrack: data.studyTrack ? normalizeStudyTrack(data.studyTrack) : data.studyTrack,
+          };
+        })
+      );
+    },
+    (err) => handleFirestoreError(err, OperationType.LIST, 'userProfiles')
+  );
+
+  const u2 = onSnapshot(
+    collection(db, 'userPrivate'),
+    (snap) => {
+      callbacks.onPrivates(
+        snap.docs.map((d) => ({ ...(d.data() as Omit<UserPrivate, 'uid'>), uid: d.id }))
+      );
+    },
+    (err) => handleFirestoreError(err, OperationType.LIST, 'userPrivate')
+  );
+
+  const u3 = onSnapshot(
+    collection(db, 'provisionedAccounts'),
+    (snap) => {
+      callbacks.onProvisioned(
+        snap.docs.map((d) => ({ ...(d.data() as Omit<ProvisionedAccount, 'id'>), id: d.id }))
+      );
+    },
+    (err) => handleFirestoreError(err, OperationType.LIST, 'provisionedAccounts')
+  );
+
+  return () => {
+    u1();
+    u2();
+    u3();
+  };
+}
+
+export function subscribeAllCoursesForAdmin(
+  onData: (courses: Course[]) => void
+): Unsubscribe {
+  return onSnapshot(
+    collection(db, 'courses'),
+    (snap) => {
+      onData(
+        snap.docs.map((d) => {
+          const raw = d.data() as Omit<Course, 'id'>;
+          return {
+            ...raw,
+            id: d.id,
+            studyProgram: raw.studyProgram ? normalizeStudyTrack(raw.studyProgram) : undefined,
+          };
+        })
+      );
+    },
+    (err) => handleFirestoreError(err, OperationType.LIST, 'courses')
+  );
+}
+
+export function subscribeAllEnrollmentsForAdmin(
+  onData: (rows: Enrollment[]) => void
+): Unsubscribe {
+  return onSnapshot(
+    collection(db, 'enrollments'),
+    (snap) => {
+      onData(snap.docs.map((d) => ({ ...(d.data() as Omit<Enrollment, 'id'>), id: d.id })));
+    },
+    (err) => handleFirestoreError(err, OperationType.LIST, 'enrollments')
+  );
+}
+
+export interface AdminCreatedAccountResult {
+  uid: string;
+  email: string;
+  password: string;
+  role: 'student' | 'professor';
+  fullName: string;
+  studentIndex: string;
+  studyTrack: string;
+  studyYear: string;
+  department: string;
+  emailPasswordAuthActive: boolean;
+}
+
+export async function adminCreateUserAccount(params: {
+  adminUid: string;
+  email: string;
+  password: string;
+  fullName: string;
+  role: 'student' | 'professor';
+  studentIndex?: string;
+  department: string;
+  studyTrack?: string;
+  studyYear?: string;
+  academicYear: string;
+  academicTitle?: string;
+  officeLocation?: string;
+  consultationHours?: string;
+  phone?: string;
+  coursesToEnroll?: Course[];
+}): Promise<AdminCreatedAccountResult> {
+  const cleanEmail = sanitizeText(
+    params.email.toLowerCase(),
+    VALIDATION_CONSTRAINTS.EMAIL_MAX_LENGTH
+  );
+  if (!cleanEmail || !cleanEmail.includes('@')) {
+    throw new Error('Unesite ispravnu e-mail adresu za prijavu.');
+  }
+  const password = params.password.trim();
+  if (password.length < 6 || password.length > 64) {
+    throw new Error('Početna lozinka mora imati najmanje 6 znakova.');
+  }
+  const cleanName = sanitizeText(params.fullName, VALIDATION_CONSTRAINTS.FULL_NAME_MAX_LENGTH);
+  if (!cleanName) {
+    throw new Error('Ime i prezime korisnika je obavezno.');
+  }
+
+  const cleanIndex =
+    params.role === 'student'
+      ? sanitizeText(params.studentIndex || '', VALIDATION_CONSTRAINTS.STUDENT_INDEX_MAX_LENGTH)
+      : '';
+
+  if (params.role === 'student') {
+    if (!cleanIndex || !VALIDATION_CONSTRAINTS.STUDENT_INDEX_REQUIRED_PATTERN.test(cleanIndex)) {
+      throw new Error('Za studenta je obavezan ispravan broj indeksa (npr. 19240 ili RS-230).');
+    }
+    const existingIdxSnap = await getDoc(doc(db, 'studentDirectory', cleanIndex));
+    if (existingIdxSnap.exists()) {
+      throw new Error(`Broj indeksa ${cleanIndex} je već dodijeljen drugom studentu.`);
+    }
+  }
+
+  const cleanDept =
+    sanitizeText(params.department, VALIDATION_CONSTRAINTS.DEPARTMENT_MAX_LENGTH) ||
+    'Računarstvo i informatika';
+  const cleanTrack =
+    params.role === 'student'
+      ? sanitizeText(
+          normalizeStudyTrack(params.studyTrack),
+          VALIDATION_CONSTRAINTS.STUDY_TRACK_MAX_LENGTH
+        )
+      : '';
+  const cleanStudyYear =
+    params.role === 'student'
+      ? sanitizeText(params.studyYear || '', VALIDATION_CONSTRAINTS.STUDY_YEAR_MAX_LENGTH)
+      : '';
+  const cleanAcadYear =
+    sanitizeText(params.academicYear, VALIDATION_CONSTRAINTS.ACADEMIC_YEAR_MAX_LENGTH) ||
+    '2026/2027';
+  const cleanTitle =
+    params.role === 'professor'
+      ? sanitizeText(params.academicTitle || 'doc. dr.', VALIDATION_CONSTRAINTS.ACADEMIC_TITLE_MAX_LENGTH)
+      : '';
+  const cleanOffice =
+    params.role === 'professor'
+      ? sanitizeText(params.officeLocation || '', VALIDATION_CONSTRAINTS.OFFICE_LOCATION_MAX_LENGTH)
+      : '';
+  const cleanConsult =
+    params.role === 'professor'
+      ? sanitizeText(
+          params.consultationHours || '',
+          VALIDATION_CONSTRAINTS.CONSULTATION_HOURS_MAX_LENGTH
+        )
+      : '';
+  const cleanPhone = sanitizeText(params.phone || '', VALIDATION_CONSTRAINTS.PHONE_MAX_LENGTH);
+
+  let createdAuthUid = '';
+  let emailPasswordAuthActive = true;
+
+  try {
+    const cred = await createUserWithEmailAndPassword(secondaryAuth, cleanEmail, password);
+    createdAuthUid = cred.user.uid;
+    await firebaseSignOut(secondaryAuth);
+  } catch (err: unknown) {
+    const code = (err as { code?: string })?.code;
+    if (code === 'auth/email-already-in-use') {
+      throw new Error(
+        `E-mail adresa ${cleanEmail} već ima kreiran login nalog u Firebase autentifikaciji.`
+      );
+    }
+    if (code === 'auth/operation-not-allowed') {
+      emailPasswordAuthActive = false;
+    } else {
+      throw new Error(
+        err instanceof Error ? err.message : 'Greška pri kreiranju login naloga.'
+      );
+    }
+  }
+
+  const provId = emailToProvisionId(cleanEmail);
+
+  try {
+    await setDoc(doc(db, 'provisionedAccounts', provId), {
+      targetEmail: cleanEmail,
+      fullName: cleanName,
+      role: params.role,
+      studentIndex: cleanIndex,
+      department: cleanDept,
+      studyTrack: cleanTrack,
+      studyYear: cleanStudyYear,
+      academicYear: cleanAcadYear,
+      academicTitle: cleanTitle,
+      officeLocation: cleanOffice,
+      consultationHours: cleanConsult,
+      authUid: createdAuthUid,
+      status: createdAuthUid ? 'active' : 'pending',
+      createdBy: params.adminUid,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.CREATE, `provisionedAccounts/${provId}`);
+  }
+
+  if (createdAuthUid) {
+    const roleEnum = params.role === 'professor' ? UserRole.PROFESSOR : UserRole.STUDENT;
+    try {
+      await setDoc(doc(db, 'userProfiles', createdAuthUid), {
+        uid: createdAuthUid,
+        fullName: cleanName,
+        studentIndex: cleanIndex,
+        department: cleanDept,
+        role: roleEnum,
+        academicYear: cleanAcadYear,
+        redeemedInviteId: provId,
+        academicTitle: cleanTitle,
+        officeLocation: cleanOffice,
+        consultationHours: cleanConsult,
+        studyYear: cleanStudyYear,
+        studyTrack: cleanTrack,
+        personalNote: '',
+        provisionedByAdmin: true,
+        notificationPrefs: DEFAULT_NOTIFICATION_PREFS,
+        isSeed: false,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+
+      await setDoc(doc(db, 'userPrivate', createdAuthUid), {
+        uid: createdAuthUid,
+        email: cleanEmail,
+        phone: cleanPhone,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    } catch (error) {
+      handleFirestoreError(error, OperationType.CREATE, `userProfiles/${createdAuthUid}`);
+    }
+
+    if (params.role === 'student' && cleanIndex) {
+      const rosterDept =
+        sanitizeText(
+          formatStudentRosterProgramLabel(cleanDept, cleanTrack),
+          VALIDATION_CONSTRAINTS.DEPARTMENT_MAX_LENGTH
+        ) || cleanDept;
+
+      try {
+        await setDoc(doc(db, 'studentDirectory', cleanIndex), {
+          studentIndex: cleanIndex,
+          uid: createdAuthUid,
+          fullName: cleanName,
+          department: rosterDept,
+          isSeed: false,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      } catch (error) {
+        handleFirestoreError(error, OperationType.CREATE, `studentDirectory/${cleanIndex}`);
+      }
+
+      if (params.coursesToEnroll && params.coursesToEnroll.length > 0) {
+        await runParallelChunks(params.coursesToEnroll, 10, async (crs) => {
+          const enrId = `${crs.id}_${createdAuthUid}`;
+          await setDoc(doc(db, 'enrollments', enrId), {
+            courseId: crs.id,
+            courseCode: crs.code,
+            courseName: crs.name,
+            leadProfessorName: crs.leadProfessorName,
+            academicYear: crs.academicYear,
+            semester: crs.semester,
+            isArchived: Boolean(crs.isArchived),
+            studentId: createdAuthUid,
+            studentName: cleanName,
+            studentIndex: cleanIndex,
+            studentDepartment: rosterDept,
+            professorIds: crs.professorIds,
+            isSeed: false,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+        });
+      }
+    }
+  }
+
+  return {
+    uid: createdAuthUid,
+    email: cleanEmail,
+    password,
+    role: params.role,
+    fullName: cleanName,
+    studentIndex: cleanIndex,
+    studyTrack: cleanTrack,
+    studyYear: cleanStudyYear,
+    department: cleanDept,
+    emailPasswordAuthActive,
+  };
+}
+
+export async function adminUpdateUserAccount(params: {
+  targetProfile: UserProfile;
+  fullName: string;
+  role: UserRole;
+  studentIndex: string;
+  department: string;
+  studyTrack: string;
+  studyYear: string;
+  academicYear: string;
+  academicTitle: string;
+  officeLocation: string;
+  consultationHours: string;
+  phone?: string;
+  userEnrollments?: Enrollment[];
+}): Promise<void> {
+  const { targetProfile, userEnrollments = [] } = params;
+  const uid = targetProfile.uid;
+  const prevIndex = targetProfile.studentIndex || '';
+
+  const cleanName = sanitizeText(params.fullName, VALIDATION_CONSTRAINTS.FULL_NAME_MAX_LENGTH);
+  if (!cleanName) throw new Error('Ime i prezime je obavezno.');
+
+  const cleanIndex = sanitizeText(
+    params.studentIndex,
+    VALIDATION_CONSTRAINTS.STUDENT_INDEX_MAX_LENGTH
+  );
+  if (cleanIndex && !VALIDATION_CONSTRAINTS.STUDENT_INDEX_PATTERN.test(cleanIndex)) {
+    throw new Error('Broj indeksa smije sadržavati samo slova, brojeve i crtice.');
+  }
+
+  if (cleanIndex && cleanIndex !== prevIndex) {
+    const existingSnap = await getDoc(doc(db, 'studentDirectory', cleanIndex));
+    if (existingSnap.exists() && existingSnap.data().uid !== uid) {
+      throw new Error(`Broj indeksa ${cleanIndex} je već zauzet.`);
+    }
+  }
+
+  const cleanDept =
+    sanitizeText(params.department, VALIDATION_CONSTRAINTS.DEPARTMENT_MAX_LENGTH) ||
+    'Računarstvo i informatika';
+  const cleanTrack = params.studyTrack
+    ? sanitizeText(
+        normalizeStudyTrack(params.studyTrack),
+        VALIDATION_CONSTRAINTS.STUDY_TRACK_MAX_LENGTH
+      )
+    : '';
+  const cleanStudyYear = sanitizeText(
+    params.studyYear,
+    VALIDATION_CONSTRAINTS.STUDY_YEAR_MAX_LENGTH
+  );
+  const cleanAcadYear =
+    sanitizeText(params.academicYear, VALIDATION_CONSTRAINTS.ACADEMIC_YEAR_MAX_LENGTH) ||
+    '2026/2027';
+
+  try {
+    await updateDoc(doc(db, 'userProfiles', uid), {
+      fullName: cleanName,
+      role: params.role,
+      studentIndex: cleanIndex,
+      department: cleanDept,
+      studyTrack: cleanTrack,
+      studyYear: cleanStudyYear,
+      academicYear: cleanAcadYear,
+      academicTitle: sanitizeText(
+        params.academicTitle,
+        VALIDATION_CONSTRAINTS.ACADEMIC_TITLE_MAX_LENGTH
+      ),
+      officeLocation: sanitizeText(
+        params.officeLocation,
+        VALIDATION_CONSTRAINTS.OFFICE_LOCATION_MAX_LENGTH
+      ),
+      consultationHours: sanitizeText(
+        params.consultationHours,
+        VALIDATION_CONSTRAINTS.CONSULTATION_HOURS_MAX_LENGTH
+      ),
+      updatedAt: serverTimestamp(),
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `userProfiles/${uid}`);
+  }
+
+  if (params.phone !== undefined) {
+    const cleanPhone = sanitizeText(params.phone, VALIDATION_CONSTRAINTS.PHONE_MAX_LENGTH);
+    try {
+      const privRef = doc(db, 'userPrivate', uid);
+      if ((await getDoc(privRef)).exists()) {
+        await updateDoc(privRef, {
+          phone: cleanPhone,
+          updatedAt: serverTimestamp(),
+        });
+      }
+    } catch {
+      // Optional private update
+    }
+  }
+
+  if (prevIndex && prevIndex !== cleanIndex) {
+    try {
+      const oldRef = doc(db, 'studentDirectory', prevIndex);
+      const oldSnap = await getDoc(oldRef);
+      if (oldSnap.exists() && oldSnap.data().uid === uid) {
+        await deleteDoc(oldRef);
+      }
+    } catch {
+      // Best-effort cleanup
+    }
+  }
+
+  const rosterDept =
+    sanitizeText(
+      formatStudentRosterProgramLabel(cleanDept, cleanTrack),
+      VALIDATION_CONSTRAINTS.DEPARTMENT_MAX_LENGTH
+    ) || cleanDept;
+
+  if (cleanIndex) {
+    const dirRef = doc(db, 'studentDirectory', cleanIndex);
+    const snap = await getDoc(dirRef);
+    if (!snap.exists()) {
+      await setDoc(dirRef, {
+        studentIndex: cleanIndex,
+        uid,
+        fullName: cleanName,
+        department: rosterDept,
+        isSeed: Boolean(targetProfile.isSeed),
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    } else if (snap.data().uid === uid) {
+      await updateDoc(dirRef, {
+        fullName: cleanName,
+        department: rosterDept,
+        updatedAt: serverTimestamp(),
+      });
+    }
+  }
+
+  if (userEnrollments.length > 0 && cleanIndex) {
+    await runParallelChunks(userEnrollments, 15, async (enr) => {
+      try {
+        await updateDoc(doc(db, 'enrollments', enr.id), {
+          studentName: cleanName,
+          studentIndex: cleanIndex,
+          studentDepartment: rosterDept,
+          updatedAt: serverTimestamp(),
+        });
+      } catch {
+        // Non-blocking sync
+      }
+    });
+  }
+}
+
+export async function adminEnrollStudentInCourse(params: {
+  student: UserProfile;
+  course: Course;
+}): Promise<void> {
+  const { student, course } = params;
+  const cleanIdx = student.studentIndex || '00000';
+  const rosterDept =
+    sanitizeText(
+      formatStudentRosterProgramLabel(student.department, student.studyTrack),
+      VALIDATION_CONSTRAINTS.DEPARTMENT_MAX_LENGTH
+    ) || student.department;
+  const enrId = `${course.id}_${student.uid}`;
+
+  try {
+    await setDoc(doc(db, 'enrollments', enrId), {
+      courseId: course.id,
+      courseCode: course.code,
+      courseName: course.name,
+      leadProfessorName: course.leadProfessorName,
+      academicYear: course.academicYear,
+      semester: course.semester,
+      isArchived: Boolean(course.isArchived),
+      studentId: student.uid,
+      studentName: student.fullName,
+      studentIndex: cleanIdx,
+      studentDepartment: rosterDept,
+      professorIds: course.professorIds,
+      isSeed: false,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.CREATE, `enrollments/${enrId}`);
+  }
+}
+

@@ -1,63 +1,121 @@
 import React, { createContext, useContext, useEffect, useState, useCallback } from 'react';
 import {
+  EmailAuthProvider,
+  linkWithCredential,
   onAuthStateChanged,
+  reauthenticateWithCredential,
+  signInWithEmailAndPassword,
   signInWithPopup,
   signOut as firebaseSignOut,
+  updatePassword,
   User,
 } from 'firebase/auth';
 import { auth, googleProvider } from '../lib/firebase';
 import { ensureUserAccount, seedEtfDemoData } from '../services/zamioService';
 import { UserPrivate, UserProfile, UserRole } from '../types/zamio';
 
-export type ActivePortalMode = 'student' | 'professor';
+export type ActivePortalMode = 'student' | 'professor' | 'admin';
 
 interface AuthContextValue {
   firebaseUser: User | null;
   profile: UserProfile | null;
   privateData: UserPrivate | null;
   isAdminUser: boolean;
+  hasPasswordProvider: boolean;
   authReady: boolean;
   signingIn: boolean;
   authError: string | null;
+  clearAuthError: () => void;
   portalMode: ActivePortalMode;
   setPortalMode: (mode: ActivePortalMode) => void;
   signInWithGoogle: () => Promise<void>;
+  signInWithCredentials: (email: string, password: string) => Promise<void>;
+  changeOwnPassword: (params: { currentPassword?: string; newPassword: string }) => Promise<void>;
   signOut: () => Promise<void>;
   refreshProfile: () => Promise<void>;
 }
 
 const AuthContext = createContext<AuthContextValue | undefined>(undefined);
 
+function translateFirebaseAuthError(err: unknown): string {
+  const code = (err as { code?: string })?.code || '';
+  if (
+    code === 'auth/invalid-credential' ||
+    code === 'auth/wrong-password' ||
+    code === 'auth/user-not-found' ||
+    code === 'auth/invalid-email'
+  ) {
+    return 'Pogrešna e-mail adresa ili lozinka. Provjerite pristupne podatke koje vam je dodijelio administrator.';
+  }
+  if (code === 'auth/operation-not-allowed') {
+    return 'Prijava putem e-maila i lozinke trenutno nije uključena u Firebase konzoli (Authentication → Sign-in method → Email/Password).';
+  }
+  if (code === 'auth/too-many-requests') {
+    return 'Previše neuspješnih pokušaja prijave. Sačekajte nekoliko minuta pa pokušajte ponovo.';
+  }
+  if (code === 'auth/weak-password') {
+    return 'Nova lozinka mora sadržavati najmanje 6 znakova.';
+  }
+  if (code === 'auth/requires-recent-login') {
+    return 'Radi sigurnosti je potrebna ponovna prijava prije promjene lozinke.';
+  }
+  if (code === 'auth/provider-already-linked') {
+    return 'Lozinka je već povezana sa ovim nalogom. Unesite trenutnu lozinku za promjenu.';
+  }
+  return err instanceof Error
+    ? err.message
+    : 'Autentifikacija nije uspjela. Pokušajte ponovo.';
+}
+
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [firebaseUser, setFirebaseUser] = useState<User | null>(null);
   const [profile, setProfile] = useState<UserProfile | null>(null);
   const [privateData, setPrivateData] = useState<UserPrivate | null>(null);
   const [isAdminUser, setIsAdminUser] = useState(false);
+  const [hasPasswordProvider, setHasPasswordProvider] = useState(false);
   const [authReady, setAuthReady] = useState(false);
   const [signingIn, setSigningIn] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
   const [portalMode, setPortalModeState] = useState<ActivePortalMode>('student');
 
+  const computeHasPassword = (user: User | null): boolean => {
+    if (!user) return false;
+    return user.providerData.some((p) => p.providerId === 'password');
+  };
+
   const syncAccount = useCallback(async (user: User, isFirstBootSeed = false) => {
+    setHasPasswordProvider(computeHasPassword(user));
+
     const res = await ensureUserAccount({
       uid: user.uid,
       email: user.email || '',
-      displayName: user.displayName || 'Korisnik',
+      displayName: user.displayName || user.email?.split('@')[0] || 'Korisnik',
+      emailVerified: user.emailVerified,
     });
 
     setProfile(res.profile);
     setPrivateData(res.privateData);
     setIsAdminUser(res.isAdminUser);
 
-    if (res.isAdminUser || res.profile.role === UserRole.PROFESSOR) {
-      setPortalModeState((prev) =>
-        res.profile.role === UserRole.PROFESSOR ? 'professor' : prev
-      );
-    } else {
-      setPortalModeState('student');
-    }
+    setPortalModeState((prev) => {
+      const adminAllowed = res.isAdminUser || res.profile.role === UserRole.ADMIN;
+      const profAllowed = adminAllowed || res.profile.role === UserRole.PROFESSOR;
 
-    // Automatically initialize realistic ETF Sarajevo seed data once for admin if DB has no seed course yet
+      if (isFirstBootSeed) {
+        if (adminAllowed) return 'admin';
+        if (res.profile.role === UserRole.PROFESSOR) return 'professor';
+        return 'student';
+      }
+
+      if (prev === 'admin' && adminAllowed) return 'admin';
+      if (prev === 'professor' && profAllowed) return 'professor';
+      if (prev === 'student') return 'student';
+
+      if (adminAllowed) return 'admin';
+      if (profAllowed) return 'professor';
+      return 'student';
+    });
+
     if (isFirstBootSeed && res.isAdminUser) {
       try {
         await seedEtfDemoData({
@@ -74,6 +132,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, async (user) => {
       setFirebaseUser(user);
+      setHasPasswordProvider(computeHasPassword(user));
       if (!user) {
         setProfile(null);
         setPrivateData(null);
@@ -108,14 +167,61 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     } catch (err: unknown) {
       const code = (err as { code?: string })?.code;
       if (code !== 'auth/popup-closed-by-user') {
-        setAuthError(
-          err instanceof Error
-            ? err.message
-            : 'Prijava putem Google računa nije uspjela. Pokušajte ponovo.'
-        );
+        setAuthError(translateFirebaseAuthError(err));
       }
     } finally {
       setSigningIn(false);
+    }
+  };
+
+  const signInWithCredentials = async (email: string, password: string) => {
+    const cleanEmail = email.trim();
+    if (!cleanEmail || !password) {
+      setAuthError('Unesite e-mail adresu i lozinku.');
+      return;
+    }
+    setSigningIn(true);
+    setAuthError(null);
+    try {
+      await signInWithEmailAndPassword(auth, cleanEmail, password);
+    } catch (err: unknown) {
+      setAuthError(translateFirebaseAuthError(err));
+      throw err;
+    } finally {
+      setSigningIn(false);
+    }
+  };
+
+  const changeOwnPassword = async (params: {
+    currentPassword?: string;
+    newPassword: string;
+  }) => {
+    const user = auth.currentUser;
+    if (!user || !user.email) {
+      throw new Error('Korisnik nije prijavljen ili nema registrovanu e-mail adresu.');
+    }
+    const cleanNew = params.newPassword.trim();
+    if (cleanNew.length < 6 || cleanNew.length > 64) {
+      throw new Error('Nova lozinka mora imati između 6 i 64 znaka.');
+    }
+
+    const alreadyHasPassword = computeHasPassword(user);
+
+    try {
+      if (alreadyHasPassword) {
+        if (!params.currentPassword) {
+          throw new Error('Unesite trenutnu lozinku radi potvrde identiteta.');
+        }
+        const credential = EmailAuthProvider.credential(user.email, params.currentPassword);
+        await reauthenticateWithCredential(user, credential);
+        await updatePassword(user, cleanNew);
+      } else {
+        const credential = EmailAuthProvider.credential(user.email, cleanNew);
+        await linkWithCredential(user, credential);
+      }
+      setHasPasswordProvider(true);
+    } catch (err: unknown) {
+      throw new Error(translateFirebaseAuthError(err));
     }
   };
 
@@ -124,6 +230,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setProfile(null);
     setPrivateData(null);
     setIsAdminUser(false);
+    setHasPasswordProvider(false);
     setPortalModeState('student');
   };
 
@@ -133,7 +240,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   };
 
   const setPortalMode = (mode: ActivePortalMode) => {
-    if (mode === 'professor' && !isAdminUser && profile?.role !== UserRole.PROFESSOR) {
+    const adminAllowed = isAdminUser || profile?.role === UserRole.ADMIN;
+    if (mode === 'admin' && !adminAllowed) {
+      return;
+    }
+    if (mode === 'professor' && !adminAllowed && profile?.role !== UserRole.PROFESSOR) {
       return;
     }
     setPortalModeState(mode);
@@ -146,12 +257,16 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         profile,
         privateData,
         isAdminUser,
+        hasPasswordProvider,
         authReady,
         signingIn,
         authError,
+        clearAuthError: () => setAuthError(null),
         portalMode,
         setPortalMode,
         signInWithGoogle,
+        signInWithCredentials,
+        changeOwnPassword,
         signOut,
         refreshProfile,
       }}

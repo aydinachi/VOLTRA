@@ -2,6 +2,7 @@ import {
   AttendanceRecord,
   AttendanceSession,
   Course,
+  ExamTerm,
   FinalGrade,
   FinalGradeStatus,
   GradingCategory,
@@ -10,6 +11,15 @@ import {
 } from '../types/zamio';
 
 export type SessionAttendanceState = 'present' | 'absent' | 'unrecorded' | 'cancelled' | 'future';
+
+export type ExamWindowState = 'open' | 'upcoming' | 'closed' | 'locked' | 'held';
+
+export interface ExamWindowEvaluation {
+  state: ExamWindowState;
+  canRegisterOrCancel: boolean;
+  label: string;
+  daysRemaining: number | null;
+}
 
 export interface SessionBreakdownRow {
   session: AttendanceSession;
@@ -75,6 +85,80 @@ export function getTodayIsoLocal(now: Date = new Date()): string {
   const month = String(now.getMonth() + 1).padStart(2, '0');
   const day = String(now.getDate()).padStart(2, '0');
   return `${year}-${month}-${day}`;
+}
+
+export function addDaysIso(isoDate: string, days: number): string {
+  const [y, m, d] = isoDate.split('-').map(Number);
+  const utc = new Date(Date.UTC(y, (m || 1) - 1, (d || 1) + days));
+  const year = utc.getUTCFullYear();
+  const month = String(utc.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(utc.getUTCDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+function diffDaysIso(fromIso: string, toIso: string): number {
+  const [fy, fm, fd] = fromIso.split('-').map(Number);
+  const [ty, tm, td] = toIso.split('-').map(Number);
+  const fromUtc = Date.UTC(fy, (fm || 1) - 1, fd || 1);
+  const toUtc = Date.UTC(ty, (tm || 1) - 1, td || 1);
+  return Math.round((toUtc - fromUtc) / 86_400_000);
+}
+
+/**
+ * Evaluates whether a student can currently register or withdraw from an exam term
+ * based on the professor's lock flag, registration open date, registration deadline,
+ * and exam date.
+ */
+export function getExamWindowState(
+  term: Pick<
+    ExamTerm,
+    'examDate' | 'registrationOpenDate' | 'registrationCloseDate' | 'isOpen'
+  >,
+  referenceDateIso: string = getTodayIsoLocal()
+): ExamWindowEvaluation {
+  if (referenceDateIso > term.examDate) {
+    return {
+      state: 'held',
+      canRegisterOrCancel: false,
+      label: 'Ispit održan',
+      daysRemaining: null,
+    };
+  }
+
+  if (!term.isOpen) {
+    return {
+      state: 'locked',
+      canRegisterOrCancel: false,
+      label: 'Prijave zaključane',
+      daysRemaining: null,
+    };
+  }
+
+  if (referenceDateIso < term.registrationOpenDate) {
+    return {
+      state: 'upcoming',
+      canRegisterOrCancel: false,
+      label: 'Prijava uskoro',
+      daysRemaining: diffDaysIso(referenceDateIso, term.registrationOpenDate),
+    };
+  }
+
+  if (referenceDateIso > term.registrationCloseDate) {
+    return {
+      state: 'closed',
+      canRegisterOrCancel: false,
+      label: 'Rok za prijavu istekao',
+      daysRemaining: null,
+    };
+  }
+
+  const remaining = diffDaysIso(referenceDateIso, term.registrationCloseDate);
+  return {
+    state: 'open',
+    canRegisterOrCancel: true,
+    label: remaining === 0 ? 'Prijave otvorene · ističe danas' : 'Prijave otvorene',
+    daysRemaining: remaining,
+  };
 }
 
 /**

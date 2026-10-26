@@ -1,5 +1,10 @@
-import { initializeApp } from 'firebase/app';
-import { getAuth, GoogleAuthProvider } from 'firebase/auth';
+import { getApps, initializeApp } from 'firebase/app';
+import {
+  getAuth,
+  GoogleAuthProvider,
+  inMemoryPersistence,
+  initializeAuth,
+} from 'firebase/auth';
 import { doc, getDocFromServer, getFirestore } from 'firebase/firestore';
 import firebaseConfig from '../../firebase-applet-config.json';
 import { OperationType } from '../types/zamio';
@@ -9,6 +14,16 @@ export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
 export const auth = getAuth(app);
 export const googleProvider = new GoogleAuthProvider();
 googleProvider.setCustomParameters({ prompt: 'select_account' });
+
+// Isolated in-memory Auth instance used strictly by Administrators when creating
+// Professor or Student accounts with Email + Password so the Admin's own session
+// is never signed out or overwritten.
+const SECONDARY_APP_NAME = 'VoltraAdminProvisioningApp';
+const existingSecondary = getApps().find((a) => a.name === SECONDARY_APP_NAME);
+const secondaryApp = existingSecondary ?? initializeApp(firebaseConfig, SECONDARY_APP_NAME);
+export const secondaryAuth = existingSecondary
+  ? getAuth(secondaryApp)
+  : initializeAuth(secondaryApp, { persistence: inMemoryPersistence });
 
 export const BOOTSTRAP_ADMIN_EMAIL = 'aydinachi@gmail.com';
 

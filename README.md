@@ -1,29 +1,30 @@
-# Zamio — ETF Student Portal
+# VOLTRA — ETF Student Portal
 
-**Zamio** je moderna web platforma za evidenciju ocjena, bodova i prisustva studenata inspirisana klasičnim **Zamger** sistemom na **Elektrotehničkom fakultetu Univerziteta u Sarajevu (ETF Sarajevo)**.
+**VOLTRA** je moderna akademska web platforma za evidenciju ocjena, bodova, prisustva i prijave ispita na **Elektrotehničkom fakultetu Univerziteta u Sarajevu (ETF Sarajevo)**, inspirisana prepoznatljivom strukturom klasičnog **Zamger** sistema.
 
-Cilj aplikacije je zadržati prepoznatljivu i preglednu strukturu informacija starog Zamgera (prisustvo na vrhu, zatim zadaci, laboratorijske vježbe, parcijalni i završni ispiti, ukupni zbir bodova i kartica konačne ocjene), uz savremen, brz i responzivan korisnički interfejs te strogu kontrolu pristupa.
+Cilj aplikacije je zadržati preglednu akademsku strukturu informacija (prisustvo na vrhu, zatim zadaci, laboratorijske vježbe, parcijalni i završni ispiti, ukupni zbir bodova i kartica konačne ocjene), uz savremen, brz i intuitivan korisnički interfejs za studente i nastavnike te strogu kontrolu pristupa.
 
 ---
 
 ## 1. Pregled funkcionalnosti
 
-### Studentski portal (samo čitanje vlastitih podataka)
-- **Početna i Moji predmeti**: Brzi pregled svih upisanih predmeta, odgovornog nastavnika, osvojenih i maksimalnih bodova, procenta i statusa predmeta.
-- **Ocjene i bodovi (Zamger struktura)**:
-  1. **Prisustvo** (automatski obračun bodova na osnovu održanih termina)
-  2. **Konfigurabilne kategorije** (npr. *Zadaci*, *Vježbe*, *I parcijalni ispit*, *II parcijalni ispit*, *Završni ispit*, *Ostalo*)
-  3. **Pojedinačne stavke** sa datumima i povratnim komentarima nastavnika
-  4. **Ukupno bodova** sa vizuelnom trakom napretka i prikazom skale ocjena (6–10)
-  5. **Konačna ocjena** u posebnoj kartici (prikazuje se isključivo kada je zvanično zaključena i kada su ispunjeni pragovi predmeta)
-- **Prisustvo po datumima**: Pregled održanih, otkazanih i budućih termina bez pogrešnog oduzimanja bodova za buduće ili otkazane časove.
+### Studentski portal
+- **Pregled i bodovi**: Brzo prebacivanje između upisanih predmeta jednim klikom, pregled nastavnika, osvojenih i maksimalnih bodova, procenta, skale ocjena (`6–10`) i zaključene ocjene.
+- **Prijava ispita**:
+  - Pregled svih objavljenih parcijalnih i završnih ispitnih rokova na upisanim predmetima (termin ispita, sala, datum početka prijave i datum isteka prijave).
+  - Prijava izlaska na ispit (*Prijavi ispit*) ili odjava izlaska (*Ne izlazim* / *Odjavi prijavu*) jednim klikom dok je rok za prijavu otvoren.
+- **Prisustvo po datumima**: Automatski obračun bodova za prisustvo na osnovu održanih termina bez pogrešnog oduzimanja bodova za buduće ili otkazane časove.
+- **Zadaci i vježbe**: Filtrirani pregled svih pojedinačnih stavki ocjenjivanja i komentara predmetnog nastavnika.
 
 ### Profesorski portal
-- **Moji predmeti**: Kreiranje novih predmeta i pregled statistike prolaznosti.
-- **Studenti**: Tabela upisanih studenata sa pretragom po imenu ili broju indeksa, sortiranjem, filtriranjem, upisom novih studenata po broju indeksa, zaključivanjem ocjena (*Nacrt* / *Zaključena*) i **CSV eksportom**.
-- **Evidencija bodova (Gradebook)**: Brzi tabelarni unos bodova i povratnih komentara direktno u redovima tabele bez otvaranja modala za svakog studenta pojedinačno, uz validaciju negativnih i prekoračenih bodova.
-- **Prisustvo**: Kreiranje termina sa datumom i opcionim vremenom, opcija *"Označi sve prisutnim"*, brza pojedinačna korekcija prisustva i otkazivanje termina.
-- **Postavke predmeta**: Konfiguracija maksimalnih bodova za prisustvo (podrazumijevano `10`), uključivanje/isključivanje praćenja prisustva, bonus bodova, kategorija ocjenjivanja i pragova za ocjene `6–10`.
+- **Predmeti**: Kreiranje novih predmeta i trenutni uvid u broj upisanih studenata, izlaznost na predstojeći ispit i prolaznost.
+- **Prijava ispita**:
+  - Objavljivanje termina ispita (naziv roka, datum i vrijeme ispita, sala/amfiteatar, datum početka prijave i datum isteka prijave).
+  - Praćenje izlaznosti uživo (*Izlaze na ispit*, *Odjavili izlazak*, *Bez odgovora*), ručno zaključavanje/otključavanje prijava i **CSV eksport spiska za ispitnu salu**.
+- **Unos bodova**: Brzi tabelarni unos bodova i komentara direktno u redovima tabele uz validaciju negativnih i prekoračenih bodova.
+- **Prisustvo**: Kreiranje termina, opcija *"Označi sve prisutnim"*, brza pojedinačna korekcija i otkazivanje termina.
+- **Studenti i ocjene**: Pretraga, filtriranje i sortiranje studenata, upis po broju indeksa, zaključivanje ocjena (*Nacrt* / *Zaključena*) i **CSV eksport ocjena**.
+- **Postavke predmeta**: Konfiguracija maksimalnih bodova za prisustvo (podrazumijevano `10`), kategorija ocjenjivanja i pragova za ocjene `6–10`.
 
 ---
 
@@ -46,7 +47,7 @@ Cilj aplikacije je zadržati prepoznatljivu i preglednu strukturu informacija st
    ```bash
    npm run dev
    ```
-4. Pokrenite automatske testove (obračun bodova, prisustva i sigurnosnih pravila) te provjeru tipova:
+4. Pokrenite automatske testove (obračun bodova, prisustva, rokova za prijavu ispita i sigurnosnih pravila) te provjeru tipova:
    ```bash
    npm test
    npm run lint
@@ -57,7 +58,7 @@ Cilj aplikacije je zadržati prepoznatljivu i preglednu strukturu informacija st
 
 ## 3. Postavljanje baze podataka i autentifikacije
 
-Aplikacija u ovom okruženju koristi **Firebase Authentication (Google prijava)** i **Cloud Firestore** sa strogo tipiziranim pravilima pristupa (`firestore.rules`) i definicijom modela u `firebase-blueprint.json` (kao zamjenu za PostgreSQL / RLS sloj uz identičnu izolaciju po ulogama i dokumentima):
+Aplikacija koristi **Firebase Authentication (Google prijava)** i **Cloud Firestore** sa strogo tipiziranim pravilima pristupa (`firestore.rules`) i definicijom modela u `firebase-blueprint.json`:
 
 1. Kreirajte Firebase projekat i omogućite **Google Sign-In** u sekciji *Authentication -> Sign-in method*.
 2. Kreirajte **Cloud Firestore** bazu podataka i upišite konfiguraciju klijenta u `firebase-applet-config.json`.
@@ -69,6 +70,8 @@ Aplikacija u ovom okruženju koristi **Firebase Authentication (Google prijava)*
 - `/studentDirectory/{studentIndex}` — Imenik brojeva indeksa za siguran upis studenata na predmete.
 - `/invitations/{inviteId}` — Kontrolisane jednokratne pozivnice za profesore.
 - `/courses/{courseId}`, `/enrollments/{enrollmentId}`, `/gradingCategories/{categoryId}`, `/gradingItems/{itemId}`, `/scores/{scoreId}`, `/attendanceSessions/{sessionId}`, `/attendanceRecords/{recordId}`, `/finalGrades/{gradeId}`.
+- `/examTerms/{termId}` — Objavljeni ispitni rokovi sa datumom početka i isteka prijave.
+- `/examRegistrations/{registrationId}` — Pojedinačne prijave i odjave izlaska studenata na ispite (`${termId}_${studentId}`).
 
 ---
 
@@ -82,9 +85,9 @@ Aplikacija u ovom okruženju koristi **Firebase Authentication (Google prijava)*
    - Administrator na stranici **Profil** unosi e-mail adresu nastavnika i generiše jednokratni kod pozivnice (npr. `INV-ETF-XXXXXX`).
    - Nastavnik se prijavljuje svojim verifikovanim Google računom i na stranici **Profil** unosi kod pozivnice, čime se atomskom transakcijom (`writeBatch` + `getAfter` pravilo) njegov nalog unapređuje u ulogu `professor`.
 3. **Kreiranje studentskih naloga i upis na predmete**:
-   - Svaki novi korisnik pri prvoj prijavi dobija ulogu `student` (isključivo pravo čitanja vlastitih zapisa).
+   - Svaki novi korisnik pri prvoj prijavi dobija ulogu `student`.
    - Student na stranici **Profil** upisuje svoj **Broj indeksa** (npr. `18942`).
-   - Predmetni profesor u sekciji **Studenti -> Upiši studenta** unosi broj indeksa i upisuje studenta na predmet.
+   - Predmetni profesor u sekciji **Studenti i ocjene -> Upiši studenta** unosi broj indeksa i upisuje studenta na predmet.
 4. **Razvojni (seed) podaci**:
    - Svi razvojni demo zapisi nose oznaku `isSeed: true` i potpuno su odvojeni od produkcijskih podataka. Administrator ih može jednim klikom učitati ili obrisati na stranici **Profil**.
 
@@ -100,4 +103,4 @@ Aplikacija u ovom okruženju koristi **Firebase Authentication (Google prijava)*
    - Povežite Git repozitorij.
    - Build komanda: `npm run build`
    - Output direktorij: `dist`
-   - Dodajte produkcijsku domenu (npr. `zamio.vercel.app`) u *Firebase Console -> Authentication -> Settings -> Authorized domains*.
+   - Dodajte produkcijsku domenu (npr. `voltra-etf.vercel.app`) u *Firebase Console -> Authentication -> Settings -> Authorized domains*.

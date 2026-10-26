@@ -413,4 +413,44 @@ describe('Zamio Centralized Calculations', () => {
     expect(calculateSuggestedGrade(82, customThresholds)).toBe(9);
     expect(calculateSuggestedGrade(90, customThresholds)).toBe(10);
   });
+
+  it('evaluates exam registration window states accurately (open, upcoming, closed, locked, held)', async () => {
+    const { addDaysIso, getExamWindowState } = await import('./calculations');
+
+    expect(addDaysIso('2026-10-28', 5)).toBe('2026-11-02');
+    expect(addDaysIso('2026-11-02', -5)).toBe('2026-10-28');
+
+    const baseTerm = {
+      registrationOpenDate: '2026-10-20',
+      registrationCloseDate: '2026-10-27',
+      examDate: '2026-10-30',
+      isOpen: true,
+    };
+
+    // Upcoming before registrationOpenDate
+    const upcoming = getExamWindowState(baseTerm, '2026-10-18');
+    expect(upcoming.state).toBe('upcoming');
+    expect(upcoming.canRegisterOrCancel).toBe(false);
+
+    // Open inside window
+    const open = getExamWindowState(baseTerm, '2026-10-24');
+    expect(open.state).toBe('open');
+    expect(open.canRegisterOrCancel).toBe(true);
+    expect(open.daysRemaining).toBe(3);
+
+    // Closed after registrationCloseDate but before examDate
+    const closed = getExamWindowState(baseTerm, '2026-10-28');
+    expect(closed.state).toBe('closed');
+    expect(closed.canRegisterOrCancel).toBe(false);
+
+    // Locked manually by professor during window
+    const locked = getExamWindowState({ ...baseTerm, isOpen: false }, '2026-10-24');
+    expect(locked.state).toBe('locked');
+    expect(locked.canRegisterOrCancel).toBe(false);
+
+    // Past exam date
+    const held = getExamWindowState(baseTerm, '2026-11-01');
+    expect(held.state).toBe('held');
+    expect(held.canRegisterOrCancel).toBe(false);
+  });
 });

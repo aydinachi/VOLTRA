@@ -1,37 +1,52 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
-  Award,
+  Archive,
+  Bell,
   BookOpen,
+  Calendar,
   CalendarCheck,
+  CheckCheck,
   ClipboardList,
+  FileCheck2,
+  FolderSync,
   GraduationCap,
-  Home,
+  LayoutDashboard,
   LogOut,
+  Megaphone,
   Menu,
   Settings,
+  ShieldCheck,
   User,
   Users,
   X,
 } from 'lucide-react';
 import { ActivePortalMode, useAuth } from '../context/AuthContext';
 import { cn } from '../lib/utils';
-import { UserRole } from '../types/zamio';
+import { SmartNotificationItem, UserRole } from '../types/zamio';
+import { AdminNavKey } from './admin/AdminPortal';
 import { Button } from './ui/button';
+
+export type { AdminNavKey };
 
 export type StudentNavKey =
   | 'pocetna'
-  | 'predmeti'
-  | 'ocjene'
+  | 'raspored'
+  | 'ispiti'
   | 'prisustvo'
   | 'zadaci'
+  | 'predmeti'
+  | 'semestri'
+  | 'obavjestenja'
   | 'profil';
 
 export type ProfessorNavKey =
   | 'pocetna'
-  | 'predmeti'
-  | 'studenti'
+  | 'raspored'
+  | 'ispiti'
   | 'bodovi'
   | 'prisustvo'
+  | 'studenti'
+  | 'obavjestenja'
   | 'postavke'
   | 'profil';
 
@@ -42,29 +57,59 @@ interface NavItem<T extends string> {
 }
 
 export const STUDENT_NAV_ITEMS: NavItem<StudentNavKey>[] = [
-  { key: 'pocetna', label: 'Početna', icon: Home },
-  { key: 'predmeti', label: 'Moji predmeti', icon: BookOpen },
-  { key: 'ocjene', label: 'Ocjene i bodovi', icon: Award },
+  { key: 'pocetna', label: 'Pregled i bodovi', icon: LayoutDashboard },
+  { key: 'raspored', label: 'Raspored i rokovi', icon: Calendar },
+  { key: 'ispiti', label: 'Prijava ispita', icon: FileCheck2 },
   { key: 'prisustvo', label: 'Prisustvo', icon: CalendarCheck },
-  { key: 'zadaci', label: 'Zadaci', icon: ClipboardList },
-  { key: 'profil', label: 'Profil', icon: User },
+  { key: 'zadaci', label: 'Zadaci i provjere', icon: ClipboardList },
+  { key: 'predmeti', label: 'Svi predmeti', icon: BookOpen },
+  { key: 'semestri', label: 'Stari semestri', icon: Archive },
+  { key: 'obavjestenja', label: 'Obavještenja', icon: Megaphone },
+  { key: 'profil', label: 'Moj profil', icon: User },
 ];
 
 export const PROFESSOR_NAV_ITEMS: NavItem<ProfessorNavKey>[] = [
-  { key: 'pocetna', label: 'Početna', icon: Home },
-  { key: 'predmeti', label: 'Moji predmeti', icon: BookOpen },
-  { key: 'studenti', label: 'Studenti', icon: Users },
-  { key: 'bodovi', label: 'Evidencija bodova', icon: ClipboardList },
+  { key: 'pocetna', label: 'Pregled predmeta', icon: LayoutDashboard },
+  { key: 'raspored', label: 'Raspored nastave', icon: Calendar },
+  { key: 'ispiti', label: 'Ispitni rokovi', icon: FileCheck2 },
+  { key: 'bodovi', label: 'Unos bodova', icon: ClipboardList },
   { key: 'prisustvo', label: 'Prisustvo', icon: CalendarCheck },
+  { key: 'studenti', label: 'Studenti i ocjene', icon: Users },
+  { key: 'obavjestenja', label: 'Obavještenja', icon: Megaphone },
   { key: 'postavke', label: 'Postavke predmeta', icon: Settings },
-  { key: 'profil', label: 'Profil', icon: User },
+  { key: 'profil', label: 'Moj profil', icon: User },
 ];
+
+export const ADMIN_NAV_ITEMS: NavItem<AdminNavKey>[] = [
+  { key: 'korisnici', label: 'Korisnici i nalozi', icon: Users },
+  { key: 'predmeti', label: 'Svi predmeti', icon: BookOpen },
+  { key: 'raspored', label: 'Raspored nastave', icon: Calendar },
+  { key: 'semestri', label: 'Semestri i arhiva', icon: FolderSync },
+  { key: 'obavjestenja', label: 'Obavještenja', icon: Megaphone },
+  { key: 'profil', label: 'Moj profil', icon: User },
+];
+
+function formatNotificationTime(iso: string): string {
+  if (!iso) return '';
+  const dt = new Date(iso);
+  if (Number.isNaN(dt.getTime())) return '';
+  const dd = String(dt.getDate()).padStart(2, '0');
+  const mm = String(dt.getMonth() + 1).padStart(2, '0');
+  const hh = String(dt.getHours()).padStart(2, '0');
+  const min = String(dt.getMinutes()).padStart(2, '0');
+  return `${dd}.${mm}. ${hh}:${min}`;
+}
 
 interface AppShellProps {
   portalMode: ActivePortalMode;
   activeNav: string;
   onSelectNav: (key: string) => void;
   pageTitle: string;
+  activeAcademicYear?: string;
+  notifications?: SmartNotificationItem[];
+  onSelectNotification?: (item: SmartNotificationItem) => void;
+  onMarkAllRead?: () => void;
+  onOpenNotificationSettings?: () => void;
   children: React.ReactNode;
 }
 
@@ -73,18 +118,76 @@ export function AppShell({
   activeNav,
   onSelectNav,
   pageTitle,
+  activeAcademicYear,
+  notifications = [],
+  onSelectNotification,
+  onMarkAllRead,
+  onOpenNotificationSettings,
   children,
 }: AppShellProps) {
   const { profile, isAdminUser, setPortalMode, signOut } = useAuth();
   const [mobileOpen, setMobileOpen] = useState(false);
+  const [notifOpen, setNotifOpen] = useState(false);
+  const notifContainerRef = useRef<HTMLDivElement | null>(null);
 
   const navItems =
-    portalMode === 'professor' ? PROFESSOR_NAV_ITEMS : STUDENT_NAV_ITEMS;
+    portalMode === 'admin'
+      ? ADMIN_NAV_ITEMS
+      : portalMode === 'professor'
+        ? PROFESSOR_NAV_ITEMS
+        : STUDENT_NAV_ITEMS;
 
   const canSwitchPortal = isAdminUser || profile?.role === UserRole.ADMIN;
+  const unreadCount = notifications.filter((n) => !n.read).length;
+
+  useEffect(() => {
+    if (!notifOpen) return;
+    const handleOutside = (e: MouseEvent) => {
+      if (notifContainerRef.current && !notifContainerRef.current.contains(e.target as Node)) {
+        setNotifOpen(false);
+      }
+    };
+    const handleEsc = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setNotifOpen(false);
+    };
+    document.addEventListener('mousedown', handleOutside);
+    document.addEventListener('keydown', handleEsc);
+    return () => {
+      document.removeEventListener('mousedown', handleOutside);
+      document.removeEventListener('keydown', handleEsc);
+    };
+  }, [notifOpen]);
+
+  const formattedUserLabel =
+    (portalMode === 'professor' || profile?.role === UserRole.PROFESSOR) &&
+    profile?.academicTitle?.trim()
+      ? profile.fullName.toLowerCase().startsWith(profile.academicTitle.trim().toLowerCase())
+        ? profile.fullName
+        : `${profile.academicTitle.trim()} ${profile.fullName}`
+      : profile?.fullName || '';
+
+  const portalBreadcrumbLabel =
+    portalMode === 'admin'
+      ? 'Administratorski portal'
+      : portalMode === 'professor'
+        ? 'Nastavnički portal'
+        : 'Studentski portal';
+
+  const sidebarRoleSummary =
+    portalMode === 'admin'
+      ? 'Administrator sistema'
+      : portalMode === 'professor'
+        ? 'Nastavno osoblje'
+        : 'Student';
 
   const handleNavClick = (key: string) => {
     onSelectNav(key);
+    setMobileOpen(false);
+  };
+
+  const handlePortalModeChange = (mode: ActivePortalMode) => {
+    setPortalMode(mode);
+    onSelectNav(mode === 'admin' ? 'korisnici' : 'pocetna');
     setMobileOpen(false);
   };
 
@@ -92,16 +195,20 @@ export function AppShell({
     <div className="min-h-screen bg-slate-50 flex">
       {/* Desktop Sidebar */}
       <aside className="hidden lg:flex lg:w-64 lg:flex-col lg:fixed lg:inset-y-0 bg-white border-r border-slate-200 z-30">
-        <div className="h-16 px-5 flex items-center gap-2.5 border-b border-slate-200">
-          <div className="w-8 h-8 rounded-lg bg-blue-700 flex items-center justify-center text-white shrink-0">
-            <GraduationCap className="w-4 h-4" />
+        <div className="h-16 px-5 flex items-center gap-3 border-b border-slate-200">
+          <div className="w-8 h-8 rounded-lg bg-slate-900 flex items-center justify-center text-white shrink-0">
+            {portalMode === 'admin' ? (
+              <ShieldCheck className="w-4 h-4" />
+            ) : (
+              <GraduationCap className="w-4 h-4" />
+            )}
           </div>
           <div className="min-w-0">
             <div className="text-base font-bold tracking-tight text-slate-900 leading-none">
-              Zamio
+              VOLTRA
             </div>
             <div className="text-[11px] text-slate-500 mt-1 truncate">
-              ETF Student Portal
+              {portalMode === 'admin' ? 'ETF Uprava sistema' : 'ETF Student Portal'}
             </div>
           </div>
         </div>
@@ -138,32 +245,26 @@ export function AppShell({
         {canSwitchPortal && (
           <div className="p-3 border-t border-slate-200 bg-slate-50/70">
             <div className="text-[11px] font-medium text-slate-500 px-1 mb-1.5">
-              Aktivni prikaz portala
+              Režim prikaza portala
             </div>
-            <div className="grid grid-cols-2 gap-1 p-1 bg-slate-200/70 rounded-lg">
+            <div className="grid grid-cols-3 gap-1 p-1 bg-slate-200/70 rounded-lg">
               <button
                 type="button"
-                onClick={() => {
-                  setPortalMode('student');
-                  onSelectNav('pocetna');
-                }}
+                onClick={() => handlePortalModeChange('admin')}
                 className={cn(
-                  'py-1.5 px-2 text-xs font-medium rounded-md transition-colors cursor-pointer whitespace-nowrap',
-                  portalMode === 'student'
+                  'py-1.5 px-1.5 text-xs font-medium rounded-md transition-colors cursor-pointer whitespace-nowrap shrink-0',
+                  portalMode === 'admin'
                     ? 'bg-white text-slate-900 shadow-xs'
                     : 'text-slate-600 hover:text-slate-900'
                 )}
               >
-                Student
+                Admin
               </button>
               <button
                 type="button"
-                onClick={() => {
-                  setPortalMode('professor');
-                  onSelectNav('pocetna');
-                }}
+                onClick={() => handlePortalModeChange('professor')}
                 className={cn(
-                  'py-1.5 px-2 text-xs font-medium rounded-md transition-colors cursor-pointer whitespace-nowrap',
+                  'py-1.5 px-1.5 text-xs font-medium rounded-md transition-colors cursor-pointer whitespace-nowrap shrink-0',
                   portalMode === 'professor'
                     ? 'bg-white text-slate-900 shadow-xs'
                     : 'text-slate-600 hover:text-slate-900'
@@ -171,18 +272,36 @@ export function AppShell({
               >
                 Profesor
               </button>
+              <button
+                type="button"
+                onClick={() => handlePortalModeChange('student')}
+                className={cn(
+                  'py-1.5 px-1.5 text-xs font-medium rounded-md transition-colors cursor-pointer whitespace-nowrap shrink-0',
+                  portalMode === 'student'
+                    ? 'bg-white text-slate-900 shadow-xs'
+                    : 'text-slate-600 hover:text-slate-900'
+                )}
+              >
+                Student
+              </button>
             </div>
           </div>
         )}
 
         <div className="p-4 border-t border-slate-200 text-xs text-slate-500">
-          <div className="font-medium text-slate-800 truncate">{profile?.fullName}</div>
+          <div className="font-medium text-slate-800 truncate">{formattedUserLabel}</div>
           <div className="mt-0.5 flex items-center gap-1.5 text-slate-500 truncate">
-            <span>{portalMode === 'professor' ? 'Nastavno osoblje' : 'Student'}</span>
-            {profile?.studentIndex && portalMode === 'student' && (
+            <span>{sidebarRoleSummary}</span>
+            {portalMode === 'student' && profile?.studentIndex && (
               <>
                 <span aria-hidden="true">·</span>
-                <span className="font-mono">{profile.studentIndex}</span>
+                <span className="font-mono tabular-nums">{profile.studentIndex}</span>
+              </>
+            )}
+            {portalMode === 'professor' && profile?.officeLocation && (
+              <>
+                <span aria-hidden="true">·</span>
+                <span className="truncate">{profile.officeLocation}</span>
               </>
             )}
           </div>
@@ -200,11 +319,11 @@ export function AppShell({
             onClick={(e) => e.stopPropagation()}
           >
             <div className="h-14 px-4 flex items-center justify-between border-b border-slate-200">
-              <div className="flex items-center gap-2">
-                <div className="w-7 h-7 rounded-lg bg-blue-700 flex items-center justify-center text-white">
+              <div className="flex items-center gap-2.5">
+                <div className="w-7 h-7 rounded-lg bg-slate-900 flex items-center justify-center text-white">
                   <GraduationCap className="w-4 h-4" />
                 </div>
-                <span className="font-bold text-slate-900">Zamio</span>
+                <span className="font-bold tracking-tight text-slate-900">VOLTRA</span>
               </div>
               <button
                 type="button"
@@ -226,7 +345,7 @@ export function AppShell({
                     type="button"
                     onClick={() => handleNavClick(item.key)}
                     className={cn(
-                      'w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors cursor-pointer',
+                      'w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors cursor-pointer whitespace-nowrap',
                       isActive
                         ? 'bg-blue-50 text-blue-800 font-semibold'
                         : 'text-slate-600 hover:bg-slate-100 hover:text-slate-900'
@@ -241,32 +360,42 @@ export function AppShell({
 
             {canSwitchPortal && (
               <div className="p-3 border-t border-slate-200">
-                <div className="grid grid-cols-2 gap-1 p-1 bg-slate-100 rounded-lg">
+                <div className="grid grid-cols-3 gap-1 p-1 bg-slate-100 rounded-lg">
                   <button
                     type="button"
-                    onClick={() => {
-                      setPortalMode('student');
-                      handleNavClick('pocetna');
-                    }}
+                    onClick={() => handlePortalModeChange('admin')}
                     className={cn(
-                      'py-1.5 text-xs font-medium rounded-md cursor-pointer',
-                      portalMode === 'student' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600'
+                      'py-1.5 text-xs font-medium rounded-md cursor-pointer whitespace-nowrap shrink-0',
+                      portalMode === 'admin'
+                        ? 'bg-white text-slate-900 shadow-xs'
+                        : 'text-slate-600'
                     )}
                   >
-                    Student
+                    Admin
                   </button>
                   <button
                     type="button"
-                    onClick={() => {
-                      setPortalMode('professor');
-                      handleNavClick('pocetna');
-                    }}
+                    onClick={() => handlePortalModeChange('professor')}
                     className={cn(
-                      'py-1.5 text-xs font-medium rounded-md cursor-pointer',
-                      portalMode === 'professor' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600'
+                      'py-1.5 text-xs font-medium rounded-md cursor-pointer whitespace-nowrap shrink-0',
+                      portalMode === 'professor'
+                        ? 'bg-white text-slate-900 shadow-xs'
+                        : 'text-slate-600'
                     )}
                   >
                     Profesor
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handlePortalModeChange('student')}
+                    className={cn(
+                      'py-1.5 text-xs font-medium rounded-md cursor-pointer whitespace-nowrap shrink-0',
+                      portalMode === 'student'
+                        ? 'bg-white text-slate-900 shadow-xs'
+                        : 'text-slate-600'
+                    )}
+                  >
+                    Student
                   </button>
                 </div>
               </div>
@@ -277,7 +406,7 @@ export function AppShell({
 
       {/* Main Content Area */}
       <div className="flex-1 lg:pl-64 flex flex-col min-w-0">
-        {/* Top Bar Contract: Current Page Breadcrumb — Context — Profile & Logout */}
+        {/* Top Bar Contract: Breadcrumb Trail — Account Context, Notifications & Logout */}
         <header className="sticky top-0 z-20 h-14 sm:h-16 bg-white border-b border-slate-200 px-4 sm:px-6 flex items-center justify-between gap-4">
           <div className="flex items-center gap-3 min-w-0">
             <button
@@ -289,18 +418,134 @@ export function AppShell({
               <Menu className="w-5 h-5" />
             </button>
             <div className="flex items-center gap-2 text-sm min-w-0">
-              <span className="hidden sm:inline text-slate-400 whitespace-nowrap">Zamio</span>
-              <span aria-hidden="true" className="hidden sm:inline text-slate-300">/</span>
+              <span className="hidden sm:inline font-semibold text-slate-400 whitespace-nowrap">
+                VOLTRA
+              </span>
+              <span aria-hidden="true" className="hidden sm:inline text-slate-300">
+                /
+              </span>
+              <span className="hidden md:inline text-slate-500 whitespace-nowrap">
+                {portalBreadcrumbLabel}
+              </span>
+              <span aria-hidden="true" className="hidden md:inline text-slate-300">
+                /
+              </span>
               <h1 className="font-semibold text-slate-900 truncate">{pageTitle}</h1>
             </div>
           </div>
 
-          <div className="flex items-center gap-3 sm:gap-5 shrink-0">
-            <div className="hidden md:flex items-center gap-2 text-xs text-slate-500">
-              <span>Akademska godina</span>
+          <div className="flex items-center gap-3 sm:gap-4 shrink-0">
+            <div className="hidden md:flex items-center gap-1.5 text-xs text-slate-500 whitespace-nowrap">
+              <span>Akademska</span>
               <span className="font-mono font-medium text-slate-800 tabular-nums">
-                {profile?.academicYear || '2026/2027'}
+                {activeAcademicYear || profile?.academicYear || '2026/2027'}
               </span>
+            </div>
+
+            {/* Smart Notifications Popover */}
+            <div className="relative" ref={notifContainerRef}>
+              <button
+                type="button"
+                onClick={() => setNotifOpen((prev) => !prev)}
+                className={cn(
+                  'relative h-9 px-2.5 rounded-lg border text-xs font-medium flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap shrink-0',
+                  notifOpen
+                    ? 'border-blue-600 bg-blue-50/70 text-blue-800'
+                    : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
+                )}
+                aria-label="Pametne notifikacije"
+              >
+                <Bell className="w-4 h-4 shrink-0" />
+                {unreadCount > 0 && (
+                  <span className="font-mono font-bold text-blue-700 tabular-nums">
+                    {unreadCount}
+                  </span>
+                )}
+              </button>
+
+              {notifOpen && (
+                <div className="absolute right-0 mt-2 w-80 sm:w-96 bg-white border border-slate-200 rounded-xl shadow-lg z-50 overflow-hidden">
+                  <div className="px-4 py-3 border-b border-slate-200 flex items-center justify-between gap-2">
+                    <div className="text-xs font-semibold text-slate-900">
+                      Pametne notifikacije{' '}
+                      <span className="font-mono text-slate-500 tabular-nums">
+                        ({unreadCount} nepročitano)
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-3 text-xs">
+                      {unreadCount > 0 && onMarkAllRead && (
+                        <button
+                          type="button"
+                          onClick={() => onMarkAllRead()}
+                          className="inline-flex items-center gap-1 text-blue-700 hover:underline font-medium cursor-pointer whitespace-nowrap"
+                        >
+                          <CheckCheck className="w-3.5 h-3.5" />
+                          Pročitaj sve
+                        </button>
+                      )}
+                      {onOpenNotificationSettings && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setNotifOpen(false);
+                            onOpenNotificationSettings();
+                          }}
+                          className="text-slate-500 hover:text-slate-900 hover:underline cursor-pointer whitespace-nowrap"
+                        >
+                          Postavke
+                        </button>
+                      )}
+                    </div>
+                  </div>
+
+                  {notifications.length === 0 ? (
+                    <div className="p-6 text-center text-xs text-slate-500 leading-relaxed">
+                      Trenutno nema novih obavijesti. Kada profesor objavi rezultate, promijeni
+                      bodove, unese prisustvo ili objavi ispitni rok, obavijest će se pojaviti ovdje.
+                    </div>
+                  ) : (
+                    <div className="max-h-80 overflow-y-auto divide-y divide-slate-100">
+                      {notifications.map((item) => (
+                        <button
+                          key={item.id}
+                          type="button"
+                          onClick={() => {
+                            setNotifOpen(false);
+                            if (onSelectNotification) {
+                              onSelectNotification(item);
+                            }
+                          }}
+                          className={cn(
+                            'w-full text-left px-4 py-3 transition-colors cursor-pointer block',
+                            item.read
+                              ? 'bg-white hover:bg-slate-50'
+                              : 'bg-blue-50/45 hover:bg-blue-50/80'
+                          )}
+                        >
+                          <div className="flex items-baseline justify-between gap-2">
+                            <span
+                              className={cn(
+                                'text-xs truncate',
+                                item.read
+                                  ? 'font-medium text-slate-800'
+                                  : 'font-semibold text-slate-900'
+                              )}
+                            >
+                              {item.title}
+                            </span>
+                            <span className="font-mono text-[11px] text-slate-400 tabular-nums shrink-0">
+                              {formatNotificationTime(item.createdAtIso)}
+                            </span>
+                          </div>
+                          <p className="text-xs text-slate-600 mt-0.5 line-clamp-2 leading-relaxed">
+                            {item.description}
+                          </p>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
 
             <button
@@ -309,10 +554,10 @@ export function AppShell({
               className="hidden sm:flex items-center gap-2 text-xs font-medium text-slate-700 hover:text-blue-700 transition-colors cursor-pointer whitespace-nowrap"
             >
               <User className="w-3.5 h-3.5 text-slate-400" />
-              <span className="max-w-[150px] truncate">{profile?.fullName}</span>
+              <span className="max-w-[180px] truncate">{formattedUserLabel}</span>
             </button>
 
-            <Button variant="outline" size="sm" onClick={signOut}>
+            <Button variant="outline" size="sm" onClick={signOut} className="whitespace-nowrap">
               <LogOut className="w-3.5 h-3.5" />
               <span className="hidden sm:inline">Odjava</span>
             </Button>
