@@ -30,12 +30,8 @@ export type { AdminNavKey };
 
 export type StudentNavKey =
   | 'pocetna'
-  | 'raspored'
-  | 'ispiti'
-  | 'prisustvo'
-  | 'zadaci'
   | 'predmeti'
-  | 'semestri'
+  | 'raspored'
   | 'obavjestenja'
   | 'profil';
 
@@ -57,15 +53,11 @@ interface NavItem<T extends string> {
 }
 
 export const STUDENT_NAV_ITEMS: NavItem<StudentNavKey>[] = [
-  { key: 'pocetna', label: 'Pregled i bodovi', icon: LayoutDashboard },
-  { key: 'raspored', label: 'Raspored i rokovi', icon: Calendar },
-  { key: 'ispiti', label: 'Prijava ispita', icon: FileCheck2 },
-  { key: 'prisustvo', label: 'Prisustvo', icon: CalendarCheck },
-  { key: 'zadaci', label: 'Zadaci i provjere', icon: ClipboardList },
-  { key: 'predmeti', label: 'Svi predmeti', icon: BookOpen },
-  { key: 'semestri', label: 'Stari semestri', icon: Archive },
-  { key: 'obavjestenja', label: 'Obavještenja', icon: Megaphone },
-  { key: 'profil', label: 'Moj profil', icon: User },
+  { key: 'pocetna', label: 'Početna', icon: LayoutDashboard },
+  { key: 'predmeti', label: 'Moji predmeti', icon: BookOpen },
+  { key: 'raspored', label: 'Kalendar', icon: Calendar },
+  { key: 'obavjestenja', label: 'Obavještenja', icon: Bell },
+  { key: 'profil', label: 'Profil i postavke', icon: User },
 ];
 
 export const PROFESSOR_NAV_ITEMS: NavItem<ProfessorNavKey>[] = [

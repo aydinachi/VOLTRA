@@ -13,8 +13,9 @@ import { AdminPortal } from './components/admin/AdminPortal';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { LoginPage } from './components/LoginPage';
 import { ProfessorPortal } from './components/professor/ProfessorPortal';
-import { StudentPortal } from './components/student/StudentPortal';
+import { StudentDeepLinkTarget, StudentPortal } from './components/student/StudentPortal';
 import {
+  NotificationNavigateOptions,
   saveStoredSmartNotifications,
   StudentSmartNotifier,
 } from './components/student/StudentSmartNotifier';
@@ -25,6 +26,7 @@ import { AcademicState, SmartNotificationItem } from './types/zamio';
 function VoltraContent() {
   const { firebaseUser, profile, authReady, portalMode } = useAuth();
   const [studentNav, setStudentNav] = useState<StudentNavKey>('pocetna');
+  const [studentDeepLink, setStudentDeepLink] = useState<StudentDeepLinkTarget | null>(null);
   const [professorNav, setProfessorNav] = useState<ProfessorNavKey>('pocetna');
   const [adminNav, setAdminNav] = useState<AdminNavKey>('korisnici');
   const [notifications, setNotifications] = useState<SmartNotificationItem[]>([]);
@@ -51,16 +53,67 @@ function VoltraContent() {
     return <LoginPage />;
   }
 
-  const navigateInCurrentMode = (key: string) => {
+  const navigateInCurrentMode = (key: string, options?: NotificationNavigateOptions) => {
     if (portalMode === 'admin') {
       const validAdminKeys = ADMIN_NAV_ITEMS.map((i) => i.key) as string[];
       setAdminNav(validAdminKeys.includes(key) ? (key as AdminNavKey) : 'obavjestenja');
-    } else if (portalMode === 'professor') {
+      return;
+    }
+
+    if (portalMode === 'professor') {
       const validProfKeys = PROFESSOR_NAV_ITEMS.map((i) => i.key) as string[];
       setProfessorNav(validProfKeys.includes(key) ? (key as ProfessorNavKey) : 'pocetna');
-    } else {
-      const validStudentKeys = STUDENT_NAV_ITEMS.map((i) => i.key) as string[];
-      setStudentNav(validStudentKeys.includes(key) ? (key as StudentNavKey) : 'pocetna');
+      return;
+    }
+
+    // Student navigation + graceful mapping for legacy notification keys
+    if (key === 'ispiti') {
+      setStudentNav('predmeti');
+      setStudentDeepLink({
+        subTab: 'exams',
+        courseId: options?.courseId,
+        nonce: Date.now(),
+      });
+      return;
+    }
+    if (key === 'semestri') {
+      setStudentNav('predmeti');
+      setStudentDeepLink({
+        subTab: 'history',
+        courseId: options?.courseId,
+        nonce: Date.now(),
+      });
+      return;
+    }
+    if (key === 'prisustvo' || key === 'zadaci') {
+      setStudentNav('predmeti');
+      setStudentDeepLink({
+        subTab: 'courses',
+        courseId: options?.courseId,
+        nonce: Date.now(),
+      });
+      return;
+    }
+
+    const validStudentKeys = STUDENT_NAV_ITEMS.map((i) => i.key) as string[];
+    const nextStudentKey: StudentNavKey = validStudentKeys.includes(key)
+      ? (key as StudentNavKey)
+      : 'pocetna';
+
+    setStudentNav(nextStudentKey);
+    if (options?.courseId || options?.subTab) {
+      setStudentDeepLink({
+        subTab: options.subTab || 'courses',
+        courseId: options.courseId,
+        nonce: Date.now(),
+      });
+    } else if (nextStudentKey === 'predmeti') {
+      // Clicking "Moji predmeti" in sidebar resets to main course overview list
+      setStudentDeepLink({
+        subTab: 'courses',
+        courseId: undefined,
+        nonce: Date.now(),
+      });
     }
   };
 
@@ -76,15 +129,24 @@ function VoltraContent() {
       ? ADMIN_NAV_ITEMS.find((i) => i.key === adminNav)?.label || 'Administratorski portal'
       : portalMode === 'professor'
         ? PROFESSOR_NAV_ITEMS.find((i) => i.key === professorNav)?.label || 'Pregled predmeta'
-        : STUDENT_NAV_ITEMS.find((i) => i.key === studentNav)?.label || 'Pregled i bodovi';
+        : STUDENT_NAV_ITEMS.find((i) => i.key === studentNav)?.label || 'Početna';
 
   const handleSelectNotification = (item: SmartNotificationItem) => {
     const updated = notifications.map((n) => (n.id === item.id ? { ...n, read: true } : n));
     setNotifications(updated);
     saveStoredSmartNotifications(profile.uid, updated);
     if (item.targetNav) {
-      navigateInCurrentMode(item.targetNav);
+      navigateInCurrentMode(item.targetNav, {
+        courseId: item.targetCourseId,
+        subTab: item.targetSubTab,
+      });
     }
+  };
+
+  const handleMarkSingleNotificationRead = (itemId: string) => {
+    const updated = notifications.map((n) => (n.id === itemId ? { ...n, read: true } : n));
+    setNotifications(updated);
+    saveStoredSmartNotifications(profile.uid, updated);
   };
 
   const handleMarkAllRead = () => {
@@ -105,7 +167,7 @@ function VoltraContent() {
       <AppShell
         portalMode={portalMode}
         activeNav={activeKey}
-        onSelectNav={navigateInCurrentMode}
+        onSelectNav={(k) => navigateInCurrentMode(k)}
         pageTitle={pageTitle}
         activeAcademicYear={academicState?.activeAcademicYear || profile.academicYear}
         notifications={notifications}
@@ -118,7 +180,15 @@ function VoltraContent() {
         ) : portalMode === 'professor' ? (
           <ProfessorPortal activeNav={professorNav} onNavigate={(k) => setProfessorNav(k)} />
         ) : (
-          <StudentPortal activeNav={studentNav} onNavigate={(k) => setStudentNav(k)} />
+          <StudentPortal
+            activeNav={studentNav}
+            onNavigate={(k) => setStudentNav(k)}
+            deepLink={studentDeepLink}
+            notifications={notifications}
+            onSelectNotification={handleSelectNotification}
+            onMarkNotificationRead={handleMarkSingleNotificationRead}
+            onMarkAllNotificationsRead={handleMarkAllRead}
+          />
         )}
       </AppShell>
     </>

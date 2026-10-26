@@ -39,10 +39,12 @@ import {
   validateExamTermDates,
   validateGradeThresholds,
   validateScoreInput,
+  validateActivityAwardInput,
   VALIDATION_CONSTRAINTS,
 } from '../lib/validation';
 import {
   AcademicState,
+  ActivityAward,
   Announcement,
   AnnouncementAudience,
   AnnouncementCategory,
@@ -818,6 +820,22 @@ export function subscribeStudentExamRegistrations(
   );
 }
 
+export function subscribeStudentActivityAwards(
+  studentId: string,
+  onData: (awards: ActivityAward[]) => void
+): Unsubscribe {
+  const q = query(collection(db, 'activityAwards'), where('studentId', '==', studentId));
+  return onSnapshot(
+    q,
+    (snap) => {
+      onData(
+        snap.docs.map((d) => ({ ...(d.data() as Omit<ActivityAward, 'id'>), id: d.id }))
+      );
+    },
+    (error) => handleFirestoreError(error, OperationType.LIST, 'activityAwards')
+  );
+}
+
 export interface StudentCourseBundle {
   course: Course | null;
   categories: GradingCategory[];
@@ -1163,6 +1181,7 @@ export function subscribeProfessorCourseData(
     onSessions: (rows: AttendanceSession[]) => void;
     onAttendanceRecords: (rows: AttendanceRecord[]) => void;
     onFinalGrades: (rows: FinalGrade[]) => void;
+    onActivityAwards?: (rows: ActivityAward[]) => void;
   }
 ): Unsubscribe {
   const unsubs: Unsubscribe[] = [];
@@ -1271,6 +1290,24 @@ export function subscribeProfessorCourseData(
       (err) => handleFirestoreError(err, OperationType.LIST, 'finalGrades')
     )
   );
+
+  if (callbacks.onActivityAwards) {
+    const onAwards = callbacks.onActivityAwards;
+    unsubs.push(
+      onSnapshot(
+        query(
+          collection(db, 'activityAwards'),
+          where('professorIds', 'array-contains', professorUid),
+          where('courseId', '==', courseId)
+        ),
+        (snap) =>
+          onAwards(
+            snap.docs.map((d) => ({ ...(d.data() as Omit<ActivityAward, 'id'>), id: d.id }))
+          ),
+        (err) => handleFirestoreError(err, OperationType.LIST, 'activityAwards')
+      )
+    );
+  }
 
   return () => {
     for (const u of unsubs) u();
@@ -1543,6 +1580,7 @@ async function syncCourseProfessorIdsAcrossChildren(params: {
     'examRegistrations',
     'scheduleEvents',
     'scores',
+    'activityAwards',
     'attendanceRecords',
   ] as const;
 
@@ -4511,6 +4549,7 @@ export async function clearEtfDemoData(professorUid: string): Promise<number> {
     'scheduleEvents',
     'examRegistrations',
     'examTerms',
+    'activityAwards',
     'scores',
     'attendanceRecords',
     'finalGrades',
@@ -5555,4 +5594,111 @@ export async function adminEnrollStudentInCourse(params: {
     handleFirestoreError(error, OperationType.CREATE, `enrollments/${enrId}`);
   }
 }
+
+// ============================================================================
+// Activity Awards (Bodovi za aktivnost) Mutations
+// ============================================================================
+
+export async function createActivityAward(params: {
+  course: Course;
+  studentId: string;
+  points: number;
+  maxPoints?: number;
+  date: string;
+  description: string;
+  professorUid: string;
+}): Promise<string> {
+  const { course, studentId, points, maxPoints = 0, date, description, professorUid } = params;
+
+  if (!isValidResourceId(studentId, VALIDATION_CONSTRAINTS.STUDENT_ID_MAX_LENGTH)) {
+    throw new Error('Odaberite ispravnog studenta sa predmeta.');
+  }
+
+  const cleanDesc = sanitizeText(description, VALIDATION_CONSTRAINTS.ACTIVITY_DESC_MAX_LENGTH);
+  const roundedPts = Math.round((points + Number.EPSILON) * 100) / 100;
+  const roundedMax = Math.round((Math.max(0, maxPoints) + Number.EPSILON) * 100) / 100;
+
+  const check = validateActivityAwardInput({
+    points: roundedPts,
+    maxPoints: roundedMax,
+    date,
+    description: cleanDesc,
+    allowBonusPoints: course.allowBonusPoints,
+  });
+  if (!check.valid) {
+    throw new Error(check.error || 'Neispravni podaci za bodove aktivnosti.');
+  }
+
+  const awardRef = doc(collection(db, 'activityAwards'));
+  const awardId = awardRef.id;
+
+  try {
+    await setDoc(awardRef, {
+      courseId: course.id,
+      studentId,
+      points: roundedPts,
+      maxPoints: roundedMax,
+      date,
+      description: cleanDesc,
+      awardedBy: professorUid,
+      professorIds: course.professorIds,
+      isSeed: false,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+    return awardId;
+  } catch (error) {
+    handleFirestoreError(error, OperationType.CREATE, `activityAwards/${awardId}`);
+  }
+}
+
+export async function updateActivityAward(params: {
+  awardId: string;
+  course: Course;
+  points: number;
+  maxPoints?: number;
+  date: string;
+  description: string;
+  professorUid: string;
+}): Promise<void> {
+  const { awardId, course, points, maxPoints = 0, date, description, professorUid } = params;
+
+  const cleanDesc = sanitizeText(description, VALIDATION_CONSTRAINTS.ACTIVITY_DESC_MAX_LENGTH);
+  const roundedPts = Math.round((points + Number.EPSILON) * 100) / 100;
+  const roundedMax = Math.round((Math.max(0, maxPoints) + Number.EPSILON) * 100) / 100;
+
+  const check = validateActivityAwardInput({
+    points: roundedPts,
+    maxPoints: roundedMax,
+    date,
+    description: cleanDesc,
+    allowBonusPoints: course.allowBonusPoints,
+  });
+  if (!check.valid) {
+    throw new Error(check.error || 'Neispravni podaci za bodove aktivnosti.');
+  }
+
+  try {
+    await updateDoc(doc(db, 'activityAwards', awardId), {
+      points: roundedPts,
+      maxPoints: roundedMax,
+      date,
+      description: cleanDesc,
+      awardedBy: professorUid,
+      professorIds: course.professorIds,
+      updatedAt: serverTimestamp(),
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `activityAwards/${awardId}`);
+  }
+}
+
+export async function deleteActivityAward(awardId: string): Promise<void> {
+  try {
+    await deleteDoc(doc(db, 'activityAwards', awardId));
+  } catch (error) {
+    handleFirestoreError(error, OperationType.DELETE, `activityAwards/${awardId}`);
+  }
+}
+
 

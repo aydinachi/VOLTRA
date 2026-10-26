@@ -357,6 +357,21 @@ export interface AcademicState {
   updatedAt?: unknown;
 }
 
+export interface ActivityAward {
+  id: string;
+  courseId: string;
+  studentId: string;
+  points: number;
+  maxPoints: number; // 0 when awarded as pure activity/bonus without fixed item max
+  date: string; // YYYY-MM-DD
+  description: string;
+  awardedBy: string;
+  professorIds: string[];
+  isSeed: boolean;
+  createdAt?: unknown;
+  updatedAt?: unknown;
+}
+
 export interface SmartNotificationItem {
   id: string;
   category:
@@ -370,4 +385,7 @@ export interface SmartNotificationItem {
   createdAtIso: string;
   read: boolean;
   targetNav?: string;
+  targetCourseId?: string;
+  targetSubTab?: 'courses' | 'exams' | 'history';
 }
+

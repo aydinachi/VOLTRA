@@ -57,6 +57,9 @@ export const VALIDATION_CONSTRAINTS = {
   SCHEDULE_DESC_MAX_LENGTH: 300,
   SCHEDULE_DESCRIPTION_MAX_LENGTH: 300,
   SEMESTER_LABEL_MAX_LENGTH: 80,
+  ACTIVITY_DESC_MAX_LENGTH: 300,
+  PASSWORD_MIN_LENGTH: 6,
+  PASSWORD_MAX_LENGTH: 64,
 } as const;
 
 export function sanitizeText(value: string, maxLength: number): string {
@@ -209,3 +212,78 @@ export function validateGradeThresholds(thresholds: {
   }
   return { valid: true };
 }
+
+export function validateActivityAwardInput(params: {
+  points: number;
+  maxPoints: number;
+  date: string;
+  description: string;
+  allowBonusPoints: boolean;
+}): ScoreValidationResult {
+  const { points, maxPoints, date, description, allowBonusPoints } = params;
+  if (typeof points !== 'number' || Number.isNaN(points) || !Number.isFinite(points)) {
+    return { valid: false, error: 'Broj bodova za aktivnost mora biti ispravan broj.' };
+  }
+  if (points <= 0) {
+    return { valid: false, error: 'Bodovi za aktivnost moraju biti veći od 0.' };
+  }
+  if (points > 100) {
+    return { valid: false, error: 'Pojedinačni unos aktivnosti ne može preći 100 bodova.' };
+  }
+  if (typeof maxPoints !== 'number' || Number.isNaN(maxPoints) || !Number.isFinite(maxPoints) || maxPoints < 0 || maxPoints > 100) {
+    return { valid: false, error: 'Maksimalni broj bodova mora biti između 0 i 100.' };
+  }
+  if (maxPoints > 0 && !allowBonusPoints && points > maxPoints) {
+    return {
+      valid: false,
+      error: `Osvojeni bodovi (${points}) ne mogu preći maksimalni iznos (${maxPoints}) dok bonus bodovi nisu uključeni na predmetu.`,
+    };
+  }
+  if (!isValidIsoDate(date)) {
+    return { valid: false, error: 'Unesite ispravan datum aktivnosti (YYYY-MM-DD).' };
+  }
+  const cleanDesc = sanitizeText(description, VALIDATION_CONSTRAINTS.ACTIVITY_DESC_MAX_LENGTH);
+  if (!cleanDesc) {
+    return { valid: false, error: 'Unesite kratak opis ili razlog dodjele bodova za aktivnost.' };
+  }
+  return { valid: true };
+}
+
+export function validatePasswordChangeInput(params: {
+  requireCurrentPassword: boolean;
+  currentPassword: string;
+  newPassword: string;
+  confirmPassword: string;
+}): ScoreValidationResult {
+  const { requireCurrentPassword, currentPassword, newPassword, confirmPassword } = params;
+
+  if (requireCurrentPassword && currentPassword.length === 0) {
+    return { valid: false, error: 'Unesite trenutnu šifru radi sigurnosne potvrde identiteta.' };
+  }
+  if (newPassword.length < VALIDATION_CONSTRAINTS.PASSWORD_MIN_LENGTH) {
+    return {
+      valid: false,
+      error: `Nova šifra mora sadržavati najmanje ${VALIDATION_CONSTRAINTS.PASSWORD_MIN_LENGTH} karaktera.`,
+    };
+  }
+  if (newPassword.length > VALIDATION_CONSTRAINTS.PASSWORD_MAX_LENGTH) {
+    return {
+      valid: false,
+      error: `Nova šifra ne može imati više od ${VALIDATION_CONSTRAINTS.PASSWORD_MAX_LENGTH} karaktera.`,
+    };
+  }
+  if (requireCurrentPassword && newPassword === currentPassword) {
+    return {
+      valid: false,
+      error: 'Nova šifra mora biti različita od trenutne šifre.',
+    };
+  }
+  if (confirmPassword.length === 0) {
+    return { valid: false, error: 'Potvrdite novu šifru u drugom polju.' };
+  }
+  if (newPassword !== confirmPassword) {
+    return { valid: false, error: 'Polja za novu šifru i potvrdu šifre se ne podudaraju.' };
+  }
+  return { valid: true };
+}
+

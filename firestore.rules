@@ -567,6 +567,30 @@ service cloud.firestore {
         data.updatedAt is timestamp;
     }
 
+    function isValidActivityAward(data) {
+      return data.keys().hasAll([
+          'courseId', 'studentId', 'points', 'maxPoints', 'date',
+          'description', 'awardedBy', 'professorIds', 'isSeed',
+          'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'courseId', 'studentId', 'points', 'maxPoints', 'date',
+          'description', 'awardedBy', 'professorIds', 'isSeed',
+          'createdAt', 'updatedAt'
+        ]) &&
+        isValidCourseId(data.courseId) &&
+        isValidStudentId(data.studentId) &&
+        data.points is number && data.points > 0 && data.points <= 100 &&
+        data.maxPoints is number && data.maxPoints >= 0 && data.maxPoints <= 100 &&
+        data.date is string && data.date.size() == 10 && data.date.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$') &&
+        data.description is string && data.description.size() >= 1 && data.description.size() <= 300 &&
+        isValidId(data.awardedBy) &&
+        isValidBoundedIdList(data.professorIds, 1, 10) &&
+        data.isSeed is bool &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
     // =========================================================================
     // Collection Match Blocks
     // =========================================================================
@@ -1326,5 +1350,50 @@ service cloud.firestore {
         ]);
       allow delete: if isAdmin() && isValidId(stateId);
     }
+
+    match /activityAwards/{awardId} {
+      allow get: if isSignedIn() && isValidId(awardId) && (
+        isAdmin() ||
+        (resource != null && (
+          resource.data.studentId == request.auth.uid ||
+          request.auth.uid in resource.data.professorIds
+        ))
+      );
+      allow list: if isSignedIn() && (
+        resource.data.studentId == request.auth.uid ||
+        request.auth.uid in resource.data.professorIds ||
+        isBootstrapAdmin()
+      );
+      allow create: if isAuthorizedUser() && isValidId(awardId) && isValidActivityAward(incoming()) &&
+        incoming().awardedBy == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        (isAdmin() || isCourseProfessor(incoming().courseId)) &&
+        exists(/databases/$(database)/documents/enrollments/$(incoming().courseId + '_' + incoming().studentId)) &&
+        (
+          incoming().maxPoints == 0 ||
+          get(/databases/$(database)/documents/courses/$(incoming().courseId)).data.allowBonusPoints == true ||
+          incoming().points <= incoming().maxPoints
+        );
+      allow update: if isValidActivityAward(incoming()) && isAuthorizedUser() && isValidId(awardId) &&
+        incoming().courseId == existing().courseId &&
+        incoming().studentId == existing().studentId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().isSeed == existing().isSeed &&
+        incoming().updatedAt == request.time &&
+        (isAdmin() || (isCourseProfessor(existing().courseId) && incoming().awardedBy == request.auth.uid)) &&
+        (
+          incoming().maxPoints == 0 ||
+          get(/databases/$(database)/documents/courses/$(existing().courseId)).data.allowBonusPoints == true ||
+          incoming().points <= incoming().maxPoints
+        ) &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'points', 'maxPoints', 'date', 'description', 'awardedBy', 'professorIds', 'updatedAt'
+        ]);
+      allow delete: if isAuthorizedUser() && isValidId(awardId) && (
+        (resource != null && request.auth.uid in resource.data.professorIds) || isAdmin()
+      );
+    }
   }
 }
+

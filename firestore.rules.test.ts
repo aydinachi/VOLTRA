@@ -41,6 +41,8 @@ describe('Firestore Security Rules — Structural & Dirty Dozen Verification', (
     expect(rulesContent).toContain('match /announcements/{announcementId}');
     expect(rulesContent).toContain('match /scheduleEvents/{eventId}');
     expect(rulesContent).toContain('match /academicState/{stateId}');
+    expect(rulesContent).toContain('match /activityAwards/{awardId}');
+    expect(rulesContent).toContain('isValidActivityAward');
     expect(rulesContent).toContain('isValidBoundedStringList');
     expect(rulesContent).toContain('isValidNotificationPrefs');
     expect(rulesContent).toContain('professorNames');

@@ -52,6 +52,7 @@ import {
 } from '../../services/zamioService';
 import {
   AcademicState,
+  ActivityAward,
   AttendanceRecord,
   AttendanceSession,
   Course,
@@ -106,6 +107,7 @@ export function ProfessorPortal({ activeNav, onNavigate }: ProfessorPortalProps)
   const [sessions, setSessions] = useState<AttendanceSession[]>([]);
   const [attendanceRecords, setAttendanceRecords] = useState<AttendanceRecord[]>([]);
   const [finalGrades, setFinalGrades] = useState<FinalGrade[]>([]);
+  const [activityAwards, setActivityAwards] = useState<ActivityAward[]>([]);
 
   // Search, Filter & Sort on Student List / Course List
   const [courseSearch, setCourseSearch] = useState('');
@@ -189,6 +191,7 @@ export function ProfessorPortal({ activeNav, onNavigate }: ProfessorPortalProps)
       setSessions([]);
       setAttendanceRecords([]);
       setFinalGrades([]);
+      setActivityAwards([]);
       return;
     }
 
@@ -200,6 +203,7 @@ export function ProfessorPortal({ activeNav, onNavigate }: ProfessorPortalProps)
       onSessions: setSessions,
       onAttendanceRecords: setAttendanceRecords,
       onFinalGrades: setFinalGrades,
+      onActivityAwards: setActivityAwards,
     });
 
     return () => unsub();
@@ -233,6 +237,7 @@ export function ProfessorPortal({ activeNav, onNavigate }: ProfessorPortalProps)
         scores,
         sessions,
         attendanceRecords,
+        activityAwards,
         finalGradeRecord: fg,
         studentId: enr.studentId,
       });
@@ -246,6 +251,7 @@ export function ProfessorPortal({ activeNav, onNavigate }: ProfessorPortalProps)
     scores,
     sessions,
     attendanceRecords,
+    activityAwards,
     finalGrades,
   ]);
 
@@ -395,6 +401,9 @@ export function ProfessorPortal({ activeNav, onNavigate }: ProfessorPortalProps)
   const handleExportCsv = () => {
     if (!activeCourse) return;
     const sortedCats = [...categories].sort((a, b) => a.order - b.order);
+    const hasStandaloneActivity = Object.values(studentSummaries).some(
+      (s) => s.activity.awards.length > 0 && !s.activity.linkedCategoryId
+    );
     const headers = [
       'Broj indeksa',
       'Ime i prezime',
@@ -403,6 +412,7 @@ export function ProfessorPortal({ activeNav, onNavigate }: ProfessorPortalProps)
         ? [`Prisustvo (/${activeCourse.attendanceMaxPoints})`]
         : []),
       ...sortedCats.map((c) => `${c.name} (/${c.maxPoints})`),
+      ...(hasStandaloneActivity ? ['Aktivnost'] : []),
       'Ukupno bodova',
       'Procenat (%)',
       'Konačna ocjena',
@@ -424,6 +434,7 @@ export function ProfessorPortal({ activeNav, onNavigate }: ProfessorPortalProps)
           enr.studentDepartment,
           ...(activeCourse.attendanceEnabled ? [sum?.attendance.earnedPoints ?? 0] : []),
           ...catCells,
+          ...(hasStandaloneActivity ? [sum?.activity.earnedPoints ?? 0] : []),
           sum?.totalEarnedPoints ?? 0,
           sum?.percentageAchieved ?? 0,
           sum?.officialFinalGrade ? sum.officialFinalGrade.finalGrade : '—',
@@ -1173,6 +1184,7 @@ export function ProfessorPortal({ activeNav, onNavigate }: ProfessorPortalProps)
           categories={categories}
           items={items}
           scores={scores}
+          activityAwards={activityAwards}
         />
         {createCourseDialog}
       </div>
@@ -1349,10 +1361,12 @@ export function ProfessorPortal({ activeNav, onNavigate }: ProfessorPortalProps)
               <tbody className="divide-y divide-slate-100">
                 {filteredAndSortedStudents.map((enr) => {
                   const sum = studentSummaries[enr.studentId];
+                  const standaloneActPts =
+                    sum && !sum.activity.linkedCategoryId ? sum.activity.earnedPoints : 0;
                   const courseworkPts =
-                    sum?.categories
+                    (sum?.categories
                       .filter((c) => !isExamCategory(c.category.name))
-                      .reduce((s, c) => s + c.earnedPoints, 0) ?? 0;
+                      .reduce((s, c) => s + c.earnedPoints, 0) ?? 0) + standaloneActPts;
                   const examPts =
                     sum?.categories
                       .filter((c) => isExamCategory(c.category.name))
@@ -1378,6 +1392,11 @@ export function ProfessorPortal({ activeNav, onNavigate }: ProfessorPortalProps)
                       </td>
                       <td className="py-3 px-4 text-right font-mono text-xs tabular-nums text-slate-800">
                         {formatPoints(courseworkPts)}
+                        {standaloneActPts > 0 && (
+                          <div className="text-[11px] text-emerald-700">
+                            uklj. +{formatPoints(standaloneActPts)} akt.
+                          </div>
+                        )}
                       </td>
                       <td className="py-3 px-4 text-right font-mono text-xs tabular-nums text-slate-800">
                         {formatPoints(examPts)}

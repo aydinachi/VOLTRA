@@ -453,4 +453,157 @@ describe('Zamio Centralized Calculations', () => {
     expect(held.state).toBe('held');
     expect(held.canRegisterOrCancel).toBe(false);
   });
+
+  it('includes Activity Points once without double-counting and computes remainingAvailablePoints accurately', () => {
+    const course = makeBaseCourse({ attendanceEnabled: false });
+    const categories: GradingCategory[] = [
+      {
+        id: 'cat_zadaci',
+        courseId: 'crs_ar',
+        name: 'Zadaci',
+        maxPoints: 30,
+        order: 1,
+        professorIds: ['prof_1'],
+        isSeed: true,
+      },
+      {
+        id: 'cat_ispit',
+        courseId: 'crs_ar',
+        name: 'Ispiti',
+        maxPoints: 60,
+        order: 2,
+        professorIds: ['prof_1'],
+        isSeed: true,
+      },
+    ];
+    const items: GradingItem[] = [
+      {
+        id: 'item_z1',
+        courseId: 'crs_ar',
+        categoryId: 'cat_zadaci',
+        name: 'Zadaća 1',
+        maxPoints: 15,
+        date: '2026-10-10',
+        description: '',
+        order: 1,
+        professorIds: ['prof_1'],
+        isSeed: true,
+      },
+      {
+        id: 'item_z2',
+        courseId: 'crs_ar',
+        categoryId: 'cat_zadaci',
+        name: 'Zadaća 2',
+        maxPoints: 15,
+        date: '2026-11-10',
+        description: '',
+        order: 2,
+        professorIds: ['prof_1'],
+        isSeed: true,
+      },
+      {
+        id: 'item_exam',
+        courseId: 'crs_ar',
+        categoryId: 'cat_ispit',
+        name: 'Završni ispit',
+        maxPoints: 60,
+        date: '2026-12-20',
+        description: '',
+        order: 1,
+        professorIds: ['prof_1'],
+        isSeed: true,
+      },
+    ];
+    const scores: Score[] = [
+      {
+        id: 'item_z1_stu_1',
+        courseId: 'crs_ar',
+        categoryId: 'cat_zadaci',
+        itemId: 'item_z1',
+        studentId: 'stu_1',
+        points: 13,
+        feedback: 'Odlično',
+        gradedBy: 'prof_1',
+        professorIds: ['prof_1'],
+        isSeed: true,
+      },
+    ];
+
+    const summaryStandalone = calculateCourseStudentSummary({
+      course,
+      categories,
+      items,
+      scores,
+      sessions: [],
+      attendanceRecords: [],
+      activityAwards: [
+        {
+          id: 'act_1',
+          courseId: 'crs_ar',
+          studentId: 'stu_1',
+          points: 4,
+          maxPoints: 5,
+          date: '2026-10-18',
+          description: 'Rješavanje zadatka na tabli',
+          awardedBy: 'prof_1',
+          professorIds: ['prof_1'],
+          isSeed: false,
+        },
+      ],
+      studentId: 'stu_1',
+      referenceDateIso: '2026-10-23',
+    });
+
+    // 13 (Zadaća 1) + 4 (Activity) = 17 earned; 30 + 60 + 5 = 95 max; remaining = 15 (Zadaća 2) + 60 (Ispit) = 75
+    expect(summaryStandalone.activity.earnedPoints).toBe(4);
+    expect(summaryStandalone.activity.linkedCategoryId).toBeNull();
+    expect(summaryStandalone.totalEarnedPoints).toBe(17);
+    expect(summaryStandalone.maxPossiblePoints).toBe(95);
+    expect(summaryStandalone.remainingAvailablePoints).toBe(75);
+    expect(summaryStandalone.pointsNeededToPass).toBe(38);
+
+    // When an empty "Aktivnost" category exists, activity points absorb into it without double counting maxPoints
+    const summaryLinked = calculateCourseStudentSummary({
+      course,
+      categories: [
+        ...categories,
+        {
+          id: 'cat_akt',
+          courseId: 'crs_ar',
+          name: 'Aktivnost na nastavi',
+          maxPoints: 10,
+          order: 3,
+          professorIds: ['prof_1'],
+          isSeed: true,
+        },
+      ],
+      items,
+      scores,
+      sessions: [],
+      attendanceRecords: [],
+      activityAwards: [
+        {
+          id: 'act_1',
+          courseId: 'crs_ar',
+          studentId: 'stu_1',
+          points: 4,
+          maxPoints: 0,
+          date: '2026-10-18',
+          description: 'Aktivno učešće u diskusiji',
+          awardedBy: 'prof_1',
+          professorIds: ['prof_1'],
+          isSeed: false,
+        },
+      ],
+      studentId: 'stu_1',
+      referenceDateIso: '2026-10-23',
+    });
+
+    expect(summaryLinked.activity.linkedCategoryId).toBe('cat_akt');
+    expect(summaryLinked.totalEarnedPoints).toBe(17);
+    expect(summaryLinked.maxPossiblePoints).toBe(100);
+    // Remaining = 15 (Z2) + 60 (Ispit) + 6 (remaining room in 10pt Aktivnost category) = 81
+    expect(summaryLinked.remainingAvailablePoints).toBe(81);
+  });
 });
+

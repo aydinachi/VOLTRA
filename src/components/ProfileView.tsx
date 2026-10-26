@@ -6,9 +6,12 @@ import {
   Briefcase,
   Building2,
   Check,
+  CheckCircle2,
   Clock,
   Copy,
   Database,
+  Eye,
+  EyeOff,
   GraduationCap,
   KeyRound,
   Lock,
@@ -22,10 +25,12 @@ import { useAuth } from '../context/AuthContext';
 import { getTodayIsoLocal } from '../lib/calculations';
 import { ETF_DEPARTMENTS, normalizeStudyTrack } from '../lib/programs';
 import {
+  cn,
   formatCourseAssistants,
   formatCourseProfessors,
   getCourseAssistants,
 } from '../lib/utils';
+import { validatePasswordChangeInput } from '../lib/validation';
 import {
   clearEtfDemoData,
   fetchCourseBundleByIds,
@@ -106,6 +111,13 @@ export function ProfileView() {
   const [currentPassword, setCurrentPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
+  const [showCurrentPassword, setShowCurrentPassword] = useState(false);
+  const [showNewPassword, setShowNewPassword] = useState(false);
+  const [showConfirmPassword, setShowConfirmPassword] = useState(false);
+  const [passwordFeedback, setPasswordFeedback] = useState<{
+    type: 'error' | 'success';
+    message: string;
+  } | null>(null);
   const [changingPassword, setChangingPassword] = useState(false);
 
   // Live Student Academic Carton Data
@@ -299,12 +311,20 @@ export function ProfileView() {
 
   const handlePasswordSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (newPassword.trim().length < 6) {
-      toast.error('Nova lozinka mora imati najmanje 6 znakova.');
-      return;
-    }
-    if (newPassword !== confirmPassword) {
-      toast.error('Nova lozinka i potvrda lozinke se ne podudaraju.');
+    if (changingPassword) return;
+    setPasswordFeedback(null);
+
+    const validation = validatePasswordChangeInput({
+      requireCurrentPassword: hasPasswordProvider,
+      currentPassword,
+      newPassword,
+      confirmPassword,
+    });
+
+    if (!validation.valid) {
+      const msg = validation.error || 'Provjerite unesene podatke za promjenu šifre.';
+      setPasswordFeedback({ type: 'error', message: msg });
+      toast.error(msg);
       return;
     }
 
@@ -317,16 +337,34 @@ export function ProfileView() {
       setCurrentPassword('');
       setNewPassword('');
       setConfirmPassword('');
-      toast.success(
-        hasPasswordProvider
-          ? 'Lozinka za prijavu je uspješno promijenjena.'
-          : 'Lozinka je postavljena! Sada se možete prijavljivati i pomoću e-maila i lozinke.'
-      );
+      setShowCurrentPassword(false);
+      setShowNewPassword(false);
+      setShowConfirmPassword(false);
+      const successMsg = hasPasswordProvider
+        ? 'Šifra za prijavu je uspješno promijenjena.'
+        : 'Šifra je postavljena! Sada se možete prijavljivati i pomoću e-maila i šifre.';
+      setPasswordFeedback({ type: 'success', message: successMsg });
+      toast.success(successMsg);
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Promjena lozinke nije uspjela.');
+      const errMsg = err instanceof Error ? err.message : 'Promjena šifre nije uspjela.';
+      setPasswordFeedback({ type: 'error', message: errMsg });
+      toast.error(errMsg);
     } finally {
       setChangingPassword(false);
     }
+  };
+
+  const scrollToPasswordSection = () => {
+    const el = document.getElementById('password-security-section');
+    if (el) {
+      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+    setTimeout(() => {
+      const inputEl = document.getElementById(
+        hasPasswordProvider ? 'pwd-current' : 'pwd-new'
+      ) as HTMLInputElement | null;
+      inputEl?.focus();
+    }, 220);
   };
 
   const handleCopyFacultyUid = async () => {
@@ -385,75 +423,184 @@ export function ProfileView() {
     }
   };
 
+  const pwdMeetsLength = newPassword.length >= 6 && newPassword.length <= 64;
+  const pwdDifferentFromCurrent =
+    !hasPasswordProvider ||
+    (newPassword.length > 0 && currentPassword.length > 0 && newPassword !== currentPassword);
+  const pwdMatchesConfirm =
+    newPassword.length > 0 && confirmPassword.length > 0 && newPassword === confirmPassword;
+  const pwdMismatchError =
+    confirmPassword.length > 0 && newPassword !== confirmPassword;
+
   const PasswordSecurityCard = (
-    <section className="bg-white border border-slate-200 rounded-xl p-6">
+    <section
+      id="password-security-section"
+      className="bg-white border border-slate-200 rounded-xl p-6 scroll-mt-20"
+    >
       <div className="pb-4 border-b border-slate-100 flex items-center justify-between gap-2">
         <div>
           <h3 className="text-base font-semibold text-slate-900">
-            Sigurnost naloga i promjena šifre
+            Promjena šifre i sigurnost naloga
           </h3>
           <p className="text-xs text-slate-500 mt-0.5">
             {hasPasswordProvider
-              ? 'U svakom trenutku možete promijeniti lozinku koju vam je dodijelio administrator.'
-              : 'Prijavljeni ste putem Google računa — možete postaviti i lozinku za direktnu prijavu e-mailom.'}
+              ? 'Radi sigurnosti je obavezna provjera trenutne šifre prije postavljanja nove šifre.'
+              : 'Prijavljeni ste putem Google računa — ovdje možete postaviti šifru za direktnu prijavu e-mailom.'}
           </p>
         </div>
         <KeyRound className="w-5 h-5 text-slate-400 shrink-0" />
       </div>
 
       <form onSubmit={handlePasswordSubmit} className="pt-4 space-y-4">
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+        {passwordFeedback && (
+          <div
+            role="alert"
+            className={cn(
+              'rounded-lg border px-3.5 py-2.5 text-xs flex items-center gap-2',
+              passwordFeedback.type === 'success'
+                ? 'border-emerald-200 bg-emerald-50/70 text-emerald-800'
+                : 'border-red-200 bg-red-50/70 text-red-800'
+            )}
+          >
+            {passwordFeedback.type === 'success' ? (
+              <CheckCircle2 className="w-4 h-4 text-emerald-700 shrink-0" />
+            ) : (
+              <Lock className="w-4 h-4 text-red-700 shrink-0" />
+            )}
+            <span className="font-medium">{passwordFeedback.message}</span>
+          </div>
+        )}
+
+        <div
+          className={cn(
+            'grid grid-cols-1 gap-4',
+            hasPasswordProvider ? 'sm:grid-cols-3' : 'sm:grid-cols-2'
+          )}
+        >
           {hasPasswordProvider && (
             <div>
               <Label htmlFor="pwd-current">Trenutna šifra</Label>
-              <Input
-                id="pwd-current"
-                type="password"
-                autoComplete="current-password"
-                value={currentPassword}
-                onChange={(e) => setCurrentPassword(e.target.value)}
-                placeholder="Unesite trenutnu šifru"
-                required
-              />
+              <div className="relative">
+                <Input
+                  id="pwd-current"
+                  type={showCurrentPassword ? 'text' : 'password'}
+                  autoComplete="current-password"
+                  value={currentPassword}
+                  onChange={(e) => {
+                    setCurrentPassword(e.target.value);
+                    if (passwordFeedback) setPasswordFeedback(null);
+                  }}
+                  placeholder="Unesite trenutnu šifru"
+                  className="pr-10"
+                  required
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowCurrentPassword((v) => !v)}
+                  className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-700 p-1 rounded cursor-pointer"
+                  aria-label={showCurrentPassword ? 'Sakrij trenutnu šifru' : 'Prikaži trenutnu šifru'}
+                >
+                  {showCurrentPassword ? (
+                    <EyeOff className="w-4 h-4" />
+                  ) : (
+                    <Eye className="w-4 h-4" />
+                  )}
+                </button>
+              </div>
             </div>
           )}
 
           <div>
-            <Label htmlFor="pwd-new">Nova šifra (najmanje 6 znakova)</Label>
-            <Input
-              id="pwd-new"
-              type="password"
-              autoComplete="new-password"
-              value={newPassword}
-              onChange={(e) => setNewPassword(e.target.value)}
-              placeholder="Nova šifra"
-              minLength={6}
-              maxLength={64}
-              required
-            />
+            <Label htmlFor="pwd-new">Nova šifra</Label>
+            <div className="relative">
+              <Input
+                id="pwd-new"
+                type={showNewPassword ? 'text' : 'password'}
+                autoComplete="new-password"
+                value={newPassword}
+                onChange={(e) => {
+                  setNewPassword(e.target.value);
+                  if (passwordFeedback) setPasswordFeedback(null);
+                }}
+                placeholder="Najmanje 6 karaktera"
+                minLength={6}
+                maxLength={64}
+                className="pr-10"
+                required
+              />
+              <button
+                type="button"
+                onClick={() => setShowNewPassword((v) => !v)}
+                className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-700 p-1 rounded cursor-pointer"
+                aria-label={showNewPassword ? 'Sakrij novu šifru' : 'Prikaži novu šifru'}
+              >
+                {showNewPassword ? (
+                  <EyeOff className="w-4 h-4" />
+                ) : (
+                  <Eye className="w-4 h-4" />
+                )}
+              </button>
+            </div>
           </div>
 
           <div>
             <Label htmlFor="pwd-confirm">Potvrdi novu šifru</Label>
-            <Input
-              id="pwd-confirm"
-              type="password"
-              autoComplete="new-password"
-              value={confirmPassword}
-              onChange={(e) => setConfirmPassword(e.target.value)}
-              placeholder="Ponovite novu šifru"
-              minLength={6}
-              maxLength={64}
-              required
-            />
+            <div className="relative">
+              <Input
+                id="pwd-confirm"
+                type={showConfirmPassword ? 'text' : 'password'}
+                autoComplete="new-password"
+                value={confirmPassword}
+                onChange={(e) => {
+                  setConfirmPassword(e.target.value);
+                  if (passwordFeedback) setPasswordFeedback(null);
+                }}
+                placeholder="Ponovite novu šifru"
+                minLength={6}
+                maxLength={64}
+                className={cn('pr-10', pwdMismatchError && 'border-red-400')}
+                required
+              />
+              <button
+                type="button"
+                onClick={() => setShowConfirmPassword((v) => !v)}
+                className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-700 p-1 rounded cursor-pointer"
+                aria-label={showConfirmPassword ? 'Sakrij potvrdu šifre' : 'Prikaži potvrdu šifre'}
+              >
+                {showConfirmPassword ? (
+                  <EyeOff className="w-4 h-4" />
+                ) : (
+                  <Eye className="w-4 h-4" />
+                )}
+              </button>
+            </div>
+            {pwdMismatchError && (
+              <p className="text-[11px] text-red-600 mt-1">
+                Unesene nove šifre se trenutno ne podudaraju.
+              </p>
+            )}
           </div>
         </div>
 
-        <div className="flex justify-end">
-          <Button type="submit" variant="secondary" disabled={changingPassword}>
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pt-1">
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-500">
+            <span className={cn(pwdMeetsLength && 'text-emerald-700 font-medium')}>
+              {pwdMeetsLength ? '✓' : '·'} Dužina 6–64 karaktera
+            </span>
+            {hasPasswordProvider && (
+              <span className={cn(pwdDifferentFromCurrent && 'text-emerald-700 font-medium')}>
+                {pwdDifferentFromCurrent ? '✓' : '·'} Različita od trenutne šifre
+              </span>
+            )}
+            <span className={cn(pwdMatchesConfirm && 'text-emerald-700 font-medium')}>
+              {pwdMatchesConfirm ? '✓' : '·'} Podudaranje nove šifre
+            </span>
+          </div>
+
+          <Button type="submit" disabled={changingPassword} className="shrink-0 self-end sm:self-auto">
             <KeyRound className="w-4 h-4" />
             {changingPassword
-              ? 'Ažuriranje šifre...'
+              ? 'Provjera i čuvanje...'
               : hasPasswordProvider
                 ? 'Promijeni šifru'
                 : 'Postavi šifru za prijavu'}
@@ -506,11 +653,17 @@ export function ProfileView() {
               </div>
             </div>
 
-            <div className="text-xs text-slate-500 sm:text-right shrink-0">
-              <div>Aktivna akademska godina</div>
-              <div className="font-mono text-sm font-semibold text-slate-900 tabular-nums mt-0.5">
-                {profile.academicYear || '2026/2027'}
+            <div className="flex flex-wrap items-center gap-4 shrink-0">
+              <div className="text-xs text-slate-500 sm:text-right">
+                <div>Aktivna akademska godina</div>
+                <div className="font-mono text-sm font-semibold text-slate-900 tabular-nums mt-0.5">
+                  {profile.academicYear || '2026/2027'}
+                </div>
               </div>
+              <Button variant="outline" size="sm" onClick={scrollToPasswordSection}>
+                <KeyRound className="w-3.5 h-3.5" />
+                Promijeni šifru
+              </Button>
             </div>
           </div>
 

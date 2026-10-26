@@ -6,6 +6,7 @@ import {
   getSeenExamRegsStorageKey,
   StudentCourseBundle,
   subscribePublishedAnnouncements,
+  subscribeStudentActivityAwards,
   subscribeStudentAttendanceRecords,
   subscribeStudentEnrolledCourseLive,
   subscribeStudentEnrollments,
@@ -14,6 +15,7 @@ import {
   subscribeStudentScores,
 } from '../../services/zamioService';
 import {
+  ActivityAward,
   Announcement,
   AnnouncementAudience,
   AttendanceRecord,
@@ -45,6 +47,11 @@ interface SeenExamTermSnapshot {
 interface SeenScoreSnapshot {
   points: number;
   feedback: string;
+}
+
+interface SeenActivitySnapshot {
+  points: number;
+  description: string;
 }
 
 interface SeenGradeSnapshot {
@@ -88,7 +95,7 @@ export function saveStoredSmartNotifications(
   items: SmartNotificationItem[]
 ): void {
   if (!uid) return;
-  writeJson(getSmartFeedStorageKey(uid), items.slice(0, 25));
+  writeJson(getSmartFeedStorageKey(uid), items.slice(0, 30));
 }
 
 function toTermSnapshot(term: ExamTerm): SeenExamTermSnapshot {
@@ -103,11 +110,16 @@ function toTermSnapshot(term: ExamTerm): SeenExamTermSnapshot {
   };
 }
 
+export interface NotificationNavigateOptions {
+  courseId?: string;
+  subTab?: 'courses' | 'exams' | 'history';
+}
+
 interface StudentSmartNotifierProps {
   studentUid: string;
   portalMode: ActivePortalMode;
   preferences?: NotificationPreferences;
-  onNavigateTab: (navKey: string) => void;
+  onNavigateTab: (navKey: string, options?: NotificationNavigateOptions) => void;
   onNotificationsChange: (items: SmartNotificationItem[]) => void;
 }
 
@@ -132,6 +144,9 @@ export function StudentSmartNotifier({
   const [scores, setScores] = useState<Score[]>([]);
   const [scoresLoaded, setScoresLoaded] = useState(false);
 
+  const [activityAwards, setActivityAwards] = useState<ActivityAward[]>([]);
+  const [activityLoaded, setActivityLoaded] = useState(false);
+
   const [attendanceRecords, setAttendanceRecords] = useState<AttendanceRecord[]>([]);
   const [attLoaded, setAttLoaded] = useState(false);
 
@@ -155,6 +170,8 @@ export function StudentSmartNotifier({
     title: string;
     description: string;
     targetNav: string;
+    targetCourseId?: string;
+    targetSubTab?: 'courses' | 'exams' | 'history';
     variant?: 'info' | 'success' | 'warning';
     actionLabel?: string;
   }) => {
@@ -166,10 +183,12 @@ export function StudentSmartNotifier({
       createdAtIso: new Date().toISOString(),
       read: false,
       targetNav: params.targetNav,
+      targetCourseId: params.targetCourseId,
+      targetSubTab: params.targetSubTab,
     };
 
     const current = readStoredSmartNotifications(studentUid);
-    const updated = [newItem, ...current].slice(0, 25);
+    const updated = [newItem, ...current].slice(0, 30);
     saveStoredSmartNotifications(studentUid, updated);
     onFeedChangeRef.current(updated);
 
@@ -185,7 +204,11 @@ export function StudentSmartNotifier({
       duration: 7500,
       action: {
         label: params.actionLabel || 'Otvori',
-        onClick: () => onNavigateRef.current(params.targetNav),
+        onClick: () =>
+          onNavigateRef.current(params.targetNav, {
+            courseId: params.targetCourseId,
+            subTab: params.targetSubTab,
+          }),
       },
     });
   };
@@ -201,6 +224,7 @@ export function StudentSmartNotifier({
     if (!studentUid) return;
     setEnrollmentsLoaded(false);
     setScoresLoaded(false);
+    setActivityLoaded(false);
     setAttLoaded(false);
     setGradesLoaded(false);
     setRegsLoaded(false);
@@ -218,6 +242,10 @@ export function StudentSmartNotifier({
     const uScr = subscribeStudentScores(studentUid, (rows) => {
       setScores(rows);
       setScoresLoaded(true);
+    });
+    const uAct = subscribeStudentActivityAwards(studentUid, (rows) => {
+      setActivityAwards(rows);
+      setActivityLoaded(true);
     });
     const uAtt = subscribeStudentAttendanceRecords(studentUid, (rows) => {
       setAttendanceRecords(rows);
@@ -239,6 +267,7 @@ export function StudentSmartNotifier({
     return () => {
       uEnr();
       uScr();
+      uAct();
       uAtt();
       uGrd();
       uReg();
@@ -348,9 +377,11 @@ export function StudentSmartNotifier({
             category: 'resultsPublished',
             title: `Objavljeni konačni rezultati — ${crsCode}`,
             description: `${crsName ? `${crsName}: ` : ''}Zaključena ocjena ${g.finalGrade} (${formatPoints(g.totalPoints)} bodova).`,
-            targetNav: 'pocetna',
+            targetNav: 'predmeti',
+            targetCourseId: g.courseId,
+            targetSubTab: 'courses',
             variant: 'success',
-            actionLabel: 'Pregled ocjene',
+            actionLabel: 'Pregled predmeta',
           });
         }
       }
@@ -403,9 +434,11 @@ export function StudentSmartNotifier({
             category: 'pointsChanged',
             title: `Upisani novi bodovi — ${crsCode}`,
             description: `${itemLabel}: osvojeno ${formatPoints(s.points)}${maxLabel}${s.feedback ? ` (${s.feedback})` : ''}.`,
-            targetNav: 'pocetna',
+            targetNav: 'predmeti',
+            targetCourseId: s.courseId,
+            targetSubTab: 'courses',
             variant: 'success',
-            actionLabel: 'Bodovi',
+            actionLabel: 'Detalji predmeta',
           });
         }
       } else if (prev.points !== s.points || prev.feedback !== s.feedback) {
@@ -414,15 +447,84 @@ export function StudentSmartNotifier({
             category: 'pointsChanged',
             title: `Izmjena bodova — ${crsCode}`,
             description: `${itemLabel}: novi broj bodova ${formatPoints(s.points)}${maxLabel} (ranije ${formatPoints(prev.points)} b).`,
-            targetNav: 'pocetna',
+            targetNav: 'predmeti',
+            targetCourseId: s.courseId,
+            targetSubTab: 'courses',
             variant: 'info',
-            actionLabel: 'Bodovi',
+            actionLabel: 'Detalji predmeta',
           });
         }
       }
     }
     writeJson(key, updated);
   }, [studentUid, scoresLoaded, allCoursesReady, scores, portalMode, coursesById, itemsById, prefs.pointsChanged]);
+
+  // 2B. Activity Points Awarded or Updated ("Bodovi za aktivnost")
+  useEffect(() => {
+    if (!studentUid || !activityLoaded || !allCoursesReady) return;
+    const key = getStorageKey('seen_activity_awards', studentUid);
+    const existing = readJson<Record<string, SeenActivitySnapshot>>(key);
+
+    if (!existing) {
+      const init: Record<string, SeenActivitySnapshot> = {};
+      for (const a of activityAwards) {
+        init[a.id] = { points: a.points, description: a.description };
+      }
+      writeJson(key, init);
+      return;
+    }
+
+    if (portalMode !== 'student') {
+      const silent = { ...existing };
+      let changed = false;
+      for (const a of activityAwards) {
+        if (!silent[a.id] && a.isSeed) {
+          silent[a.id] = { points: a.points, description: a.description };
+          changed = true;
+        }
+      }
+      if (changed) writeJson(key, silent);
+      return;
+    }
+
+    const updated: Record<string, SeenActivitySnapshot> = {};
+    for (const a of activityAwards) {
+      const prev = existing[a.id];
+      updated[a.id] = { points: a.points, description: a.description };
+      if (!prev && a.isSeed) continue;
+
+      const crsCode = coursesById[a.courseId]?.code || 'Predmet';
+
+      if (!prev) {
+        if (prefs.pointsChanged) {
+          pushSmartNotification({
+            category: 'pointsChanged',
+            title: `Dodijeljeni bodovi za aktivnost — ${crsCode}`,
+            description: `${a.description}: +${formatPoints(a.points)} bodova (${formatBosnianDate(a.date)}).`,
+            targetNav: 'predmeti',
+            targetCourseId: a.courseId,
+            targetSubTab: 'courses',
+            variant: 'success',
+            actionLabel: 'Detalji predmeta',
+          });
+        }
+      } else if (prev.points !== a.points || prev.description !== a.description) {
+        if (prefs.pointsChanged) {
+          pushSmartNotification({
+            category: 'pointsChanged',
+            title: `Ažurirani bodovi za aktivnost — ${crsCode}`,
+            description: `${a.description}: +${formatPoints(a.points)} bodova.`,
+            targetNav: 'predmeti',
+            targetCourseId: a.courseId,
+            targetSubTab: 'courses',
+            variant: 'info',
+            actionLabel: 'Detalji predmeta',
+          });
+        }
+      }
+    }
+    writeJson(key, updated);
+  }, [studentUid, activityLoaded, allCoursesReady, activityAwards, portalMode, coursesById, prefs.pointsChanged]);
 
   // 3. Attendance Recorded ("Unos ili promjena prisustva")
   useEffect(() => {
@@ -467,7 +569,9 @@ export function StudentSmartNotifier({
             category: 'attendanceRecorded',
             title: `Evidentirano prisustvo — ${crsCode}`,
             description: `Status za termin${dateInfo}: ${r.present ? 'Prisutan' : 'Odsutan'}${r.note ? ` · ${r.note}` : ''}.`,
-            targetNav: 'prisustvo',
+            targetNav: 'predmeti',
+            targetCourseId: r.courseId,
+            targetSubTab: 'courses',
             variant: r.present ? 'success' : 'warning',
             actionLabel: 'Prisustvo',
           });
@@ -517,7 +621,9 @@ export function StudentSmartNotifier({
             category: 'newExamTerm',
             title: `Novi ispitni rok — ${term.courseCode}`,
             description: `${term.title} (${formatBosnianDate(term.examDate)}${term.examTime ? ` u ${term.examTime}` : ''}) · Prijava do ${formatBosnianDate(term.registrationCloseDate)}.`,
-            targetNav: 'ispiti',
+            targetNav: 'predmeti',
+            targetCourseId: term.courseId,
+            targetSubTab: 'exams',
             variant: 'info',
             actionLabel: 'Prijava ispita',
           });
@@ -535,7 +641,9 @@ export function StudentSmartNotifier({
             description: term.isOpen
               ? `${term.title} · Možete prijaviti izlazak do ${formatBosnianDate(term.registrationCloseDate)}.`
               : `Profesor je zaključao prijave za rok „${term.title}“ (${formatBosnianDate(term.examDate)}).`,
-            targetNav: 'ispiti',
+            targetNav: 'predmeti',
+            targetCourseId: term.courseId,
+            targetSubTab: 'exams',
             variant: term.isOpen ? 'success' : 'warning',
             actionLabel: 'Ispiti',
           });
@@ -555,7 +663,9 @@ export function StudentSmartNotifier({
           category: 'newExamTerm',
           title: `Ažuriran termin ili rok prijave — ${term.courseCode}`,
           description: `${term.title}: ispit ${formatBosnianDate(term.examDate)}${term.examTime ? ` u ${term.examTime}` : ''}, prijava do ${formatBosnianDate(term.registrationCloseDate)}.`,
-          targetNav: 'ispiti',
+          targetNav: 'predmeti',
+          targetCourseId: term.courseId,
+          targetSubTab: 'exams',
           variant: 'info',
           actionLabel: 'Detalji roka',
         });
@@ -607,7 +717,9 @@ export function StudentSmartNotifier({
           description: isNowRegistered
             ? `Evidentirana je prijava za „${reg.termTitle}“ (${formatBosnianDate(reg.examDate)}).`
             : `Status vaše prijave za „${reg.termTitle}“ promijenjen je u: Odjavljen.`,
-          targetNav: 'ispiti',
+          targetNav: 'predmeti',
+          targetCourseId: reg.courseId,
+          targetSubTab: 'exams',
           variant: isNowRegistered ? 'success' : 'warning',
           actionLabel: 'Moje prijave',
         });

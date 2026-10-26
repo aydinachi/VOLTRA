@@ -37,7 +37,10 @@ interface AuthContextValue {
 
 const AuthContext = createContext<AuthContextValue | undefined>(undefined);
 
-function translateFirebaseAuthError(err: unknown): string {
+function translateFirebaseAuthError(
+  err: unknown,
+  context: 'login' | 'reauth' = 'login'
+): string {
   const code = (err as { code?: string })?.code || '';
   if (
     code === 'auth/invalid-credential' ||
@@ -45,22 +48,25 @@ function translateFirebaseAuthError(err: unknown): string {
     code === 'auth/user-not-found' ||
     code === 'auth/invalid-email'
   ) {
+    if (context === 'reauth') {
+      return 'Trenutna šifra nije tačna. Provjerite unos i pokušajte ponovo.';
+    }
     return 'Pogrešna e-mail adresa ili lozinka. Provjerite pristupne podatke koje vam je dodijelio administrator.';
   }
   if (code === 'auth/operation-not-allowed') {
     return 'Prijava putem e-maila i lozinke trenutno nije uključena u Firebase konzoli (Authentication → Sign-in method → Email/Password).';
   }
   if (code === 'auth/too-many-requests') {
-    return 'Previše neuspješnih pokušaja prijave. Sačekajte nekoliko minuta pa pokušajte ponovo.';
+    return 'Previše neuspješnih pokušaja potvrde lozinke. Sačekajte nekoliko minuta pa pokušajte ponovo.';
   }
   if (code === 'auth/weak-password') {
-    return 'Nova lozinka mora sadržavati najmanje 6 znakova.';
+    return 'Nova šifra mora sadržavati najmanje 6 karaktera.';
   }
   if (code === 'auth/requires-recent-login') {
-    return 'Radi sigurnosti je potrebna ponovna prijava prije promjene lozinke.';
+    return 'Radi sigurnosti je potrebna ponovna potvrda trenutne šifre prije izmjene.';
   }
   if (code === 'auth/provider-already-linked') {
-    return 'Lozinka je već povezana sa ovim nalogom. Unesite trenutnu lozinku za promjenu.';
+    return 'Šifra je već povezana sa ovim nalogom. Unesite trenutnu šifru za promjenu.';
   }
   return err instanceof Error
     ? err.message
@@ -200,28 +206,31 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     if (!user || !user.email) {
       throw new Error('Korisnik nije prijavljen ili nema registrovanu e-mail adresu.');
     }
-    const cleanNew = params.newPassword.trim();
-    if (cleanNew.length < 6 || cleanNew.length > 64) {
-      throw new Error('Nova lozinka mora imati između 6 i 64 znaka.');
+    const rawNewPassword = params.newPassword;
+    if (rawNewPassword.length < 6 || rawNewPassword.length > 64) {
+      throw new Error('Nova šifra mora imati između 6 i 64 karaktera.');
     }
 
     const alreadyHasPassword = computeHasPassword(user);
 
     try {
       if (alreadyHasPassword) {
-        if (!params.currentPassword) {
-          throw new Error('Unesite trenutnu lozinku radi potvrde identiteta.');
+        if (!params.currentPassword || params.currentPassword.length === 0) {
+          throw new Error('Unesite trenutnu šifru radi sigurnosne potvrde identiteta.');
+        }
+        if (rawNewPassword === params.currentPassword) {
+          throw new Error('Nova šifra mora biti različita od trenutne šifre.');
         }
         const credential = EmailAuthProvider.credential(user.email, params.currentPassword);
         await reauthenticateWithCredential(user, credential);
-        await updatePassword(user, cleanNew);
+        await updatePassword(user, rawNewPassword);
       } else {
-        const credential = EmailAuthProvider.credential(user.email, cleanNew);
+        const credential = EmailAuthProvider.credential(user.email, rawNewPassword);
         await linkWithCredential(user, credential);
       }
       setHasPasswordProvider(true);
     } catch (err: unknown) {
-      throw new Error(translateFirebaseAuthError(err));
+      throw new Error(translateFirebaseAuthError(err, 'reauth'));
     }
   };
 

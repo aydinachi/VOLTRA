@@ -1,4 +1,5 @@
 import {
+  ActivityAward,
   AttendanceRecord,
   AttendanceSession,
   Course,
@@ -58,13 +59,29 @@ export interface CategoryBreakdown {
   items: ItemBreakdownRow[];
 }
 
+export interface ActivityAwardBreakdownRow {
+  award: ActivityAward;
+  effectivePoints: number;
+}
+
+export interface ActivitySummary {
+  awards: ActivityAwardBreakdownRow[];
+  earnedPoints: number;
+  maxPoints: number;
+  /** Non-null when awards are absorbed into an empty "Aktivnost" category so maxPoints aren't double-counted */
+  linkedCategoryId: string | null;
+}
+
 export interface CourseStudentSummary {
   courseId: string;
   studentId: string;
   attendance: AttendanceSummary;
   categories: CategoryBreakdown[];
+  activity: ActivitySummary;
   totalEarnedPoints: number;
   maxPossiblePoints: number;
+  remainingAvailablePoints: number;
+  pointsNeededToPass: number;
   percentageAchieved: number;
   suggestedGrade: number | null;
   passedThreshold: boolean;
@@ -341,6 +358,7 @@ export function calculateCourseStudentSummary(params: {
   scores: Score[];
   sessions: AttendanceSession[];
   attendanceRecords: AttendanceRecord[];
+  activityAwards?: ActivityAward[];
   finalGradeRecord?: FinalGrade | null;
   studentId: string;
   referenceDateIso?: string;
@@ -352,6 +370,7 @@ export function calculateCourseStudentSummary(params: {
     scores,
     sessions,
     attendanceRecords,
+    activityAwards = [],
     finalGradeRecord = null,
     studentId,
     referenceDateIso = getTodayIsoLocal(),
@@ -377,6 +396,41 @@ export function calculateCourseStudentSummary(params: {
     }
   }
 
+  // Deduplicate activity awards by id for this course & student
+  const awardMap = new Map<string, ActivityAward>();
+  for (const aw of activityAwards) {
+    if (aw.courseId === course.id && aw.studentId === studentId) {
+      awardMap.set(aw.id, aw);
+    }
+  }
+  const studentAwards = [...awardMap.values()].sort((a, b) => b.date.localeCompare(a.date));
+
+  let rawActivityEarned = 0;
+  let rawActivityMax = 0;
+  const awardRows: ActivityAwardBreakdownRow[] = studentAwards.map((award) => {
+    const safeMax = Math.max(0, award.maxPoints || 0);
+    const effective = Math.max(
+      0,
+      safeMax > 0 && !course.allowBonusPoints
+        ? Math.min(award.points, safeMax)
+        : award.points
+    );
+    rawActivityEarned = roundTo2(rawActivityEarned + effective);
+    rawActivityMax = roundTo2(rawActivityMax + safeMax);
+    return {
+      award,
+      effectivePoints: roundTo2(effective),
+    };
+  });
+
+  // Check if the course already defines an empty "Aktivnost" category so we don't double-count max points
+  const emptyActivityCat = courseCategories.find((cat) => {
+    const hasItems = [...activeItemMap.values()].some((it) => it.categoryId === cat.id);
+    return !hasItems && /aktivnost|activity/i.test(cat.name);
+  });
+  const linkedActivityCategoryId =
+    emptyActivityCat && awardRows.length > 0 ? emptyActivityCat.id : null;
+
   const attendance = calculateAttendance({
     attendanceEnabled: course.attendanceEnabled,
     attendanceMaxPoints: course.attendanceMaxPoints,
@@ -386,6 +440,8 @@ export function calculateCourseStudentSummary(params: {
     referenceDateIso,
   });
 
+  let remainingAssessmentPoints = 0;
+
   const categoryBreakdowns: CategoryBreakdown[] = courseCategories.map((category) => {
     const categoryItems = [...activeItemMap.values()]
       .filter((item) => item.categoryId === category.id)
@@ -393,11 +449,13 @@ export function calculateCourseStudentSummary(params: {
 
     let rawEarned = 0;
     let itemsMaxSum = 0;
+    let ungradedItemsMaxSum = 0;
 
     const itemRows: ItemBreakdownRow[] = categoryItems.map((item) => {
       itemsMaxSum = roundTo2(itemsMaxSum + item.maxPoints);
       const score = scoreByItemId.get(item.id);
       if (!score) {
+        ungradedItemsMaxSum = roundTo2(ungradedItemsMaxSum + Math.max(0, item.maxPoints));
         return {
           item,
           earnedPoints: null,
@@ -422,11 +480,37 @@ export function calculateCourseStudentSummary(params: {
       };
     });
 
+    const catMax = Math.max(0, category.maxPoints);
+
+    if (linkedActivityCategoryId === category.id) {
+      const cappedAct = course.allowBonusPoints
+        ? rawActivityEarned
+        : Math.min(rawActivityEarned, catMax);
+      const actPct = catMax > 0 ? roundTo1((cappedAct / catMax) * 100) : 0;
+      const unallocatedRoom = Math.max(0, roundTo2(catMax - cappedAct));
+      remainingAssessmentPoints = roundTo2(remainingAssessmentPoints + unallocatedRoom);
+      return {
+        category,
+        earnedPoints: roundTo2(cappedAct),
+        maxPoints: catMax,
+        itemsMaxSum: roundTo2(rawActivityMax),
+        percentage: actPct,
+        items: [],
+      };
+    }
+
     const cappedEarned = course.allowBonusPoints
       ? rawEarned
-      : Math.min(rawEarned, Math.max(0, category.maxPoints));
+      : Math.min(rawEarned, catMax);
 
-    const catMax = Math.max(0, category.maxPoints);
+    // Remaining available points in this category: ungraded items + any unscheduled category points, capped by remaining category room when bonus is off
+    const unscheduledCatPoints = Math.max(0, roundTo2(catMax - itemsMaxSum));
+    const rawCatRemaining = roundTo2(ungradedItemsMaxSum + unscheduledCatPoints);
+    const effectiveCatRemaining = course.allowBonusPoints
+      ? rawCatRemaining
+      : Math.min(rawCatRemaining, Math.max(0, roundTo2(catMax - cappedEarned)));
+    remainingAssessmentPoints = roundTo2(remainingAssessmentPoints + effectiveCatRemaining);
+
     const catPct = catMax > 0 ? roundTo1((cappedEarned / catMax) * 100) : 0;
 
     return {
@@ -439,6 +523,21 @@ export function calculateCourseStudentSummary(params: {
     };
   });
 
+  const standaloneActivityEarned = linkedActivityCategoryId ? 0 : roundTo2(rawActivityEarned);
+  const standaloneActivityMax = linkedActivityCategoryId ? 0 : roundTo2(rawActivityMax);
+
+  const activitySummary: ActivitySummary = {
+    awards: awardRows,
+    earnedPoints: linkedActivityCategoryId
+      ? categoryBreakdowns.find((c) => c.category.id === linkedActivityCategoryId)?.earnedPoints ??
+        roundTo2(rawActivityEarned)
+      : standaloneActivityEarned,
+    maxPoints: linkedActivityCategoryId
+      ? categoryBreakdowns.find((c) => c.category.id === linkedActivityCategoryId)?.maxPoints ?? 0
+      : standaloneActivityMax,
+    linkedCategoryId: linkedActivityCategoryId,
+  };
+
   const categoriesEarnedSum = categoryBreakdowns.reduce(
     (acc, c) => roundTo2(acc + c.earnedPoints),
     0
@@ -449,10 +548,27 @@ export function calculateCourseStudentSummary(params: {
   );
 
   const totalEarnedPoints = roundTo2(
-    (course.attendanceEnabled ? attendance.earnedPoints : 0) + categoriesEarnedSum
+    (course.attendanceEnabled ? attendance.earnedPoints : 0) +
+      categoriesEarnedSum +
+      standaloneActivityEarned
   );
   const maxPossiblePoints = roundTo2(
-    (course.attendanceEnabled ? attendance.maxPoints : 0) + categoriesMaxSum
+    (course.attendanceEnabled ? attendance.maxPoints : 0) +
+      categoriesMaxSum +
+      standaloneActivityMax
+  );
+
+  // If attendance has future/unrecorded sessions and hasn't been held yet, include potential remaining attendance points only if heldCount === 0
+  const remainingAttendancePoints =
+    course.attendanceEnabled && attendance.heldCount === 0 && attendance.futureCount > 0
+      ? attendance.maxPoints
+      : 0;
+  const remainingAvailablePoints = roundTo2(
+    remainingAssessmentPoints + remainingAttendancePoints
+  );
+  const pointsNeededToPass = Math.max(
+    0,
+    roundTo2(course.grade6Threshold - totalEarnedPoints)
   );
 
   const percentageAchieved =
@@ -477,8 +593,11 @@ export function calculateCourseStudentSummary(params: {
     studentId,
     attendance,
     categories: categoryBreakdowns,
+    activity: activitySummary,
     totalEarnedPoints,
     maxPossiblePoints,
+    remainingAvailablePoints,
+    pointsNeededToPass,
     percentageAchieved,
     suggestedGrade,
     passedThreshold,
@@ -486,3 +605,4 @@ export function calculateCourseStudentSummary(params: {
     studentVisibleFinalGrade,
   };
 }
+

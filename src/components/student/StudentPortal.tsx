@@ -1,20 +1,21 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import {
-  AlertCircle,
   Archive,
   ArrowRight,
   ArrowUpDown,
-  Award,
+  Bell,
   BookOpen,
   Calendar,
   CalendarCheck2,
+  CalendarClock,
+  CheckCheck,
   CheckCircle2,
-  Clock,
-  Info,
-  MessageSquare,
-  MinusCircle,
+  ExternalLink,
+  FileCheck2,
+  FlaskConical,
+  FolderKanban,
+  Megaphone,
   Search,
-  XCircle,
 } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
 import {
@@ -30,11 +31,12 @@ import {
   formatCourseAssistants,
   formatCourseProfessors,
   formatPoints,
-  getCourseAssistants,
   getCourseProfessors,
 } from '../../lib/utils';
 import {
   StudentCourseBundle,
+  subscribePublishedAnnouncements,
+  subscribeStudentActivityAwards,
   subscribeStudentAttendanceRecords,
   subscribeStudentEnrolledCourseLive,
   subscribeStudentEnrollments,
@@ -43,6 +45,9 @@ import {
   subscribeStudentScores,
 } from '../../services/zamioService';
 import {
+  ActivityAward,
+  Announcement,
+  AnnouncementAudience,
   AttendanceRecord,
   AttendanceSession,
   Course,
@@ -54,15 +59,33 @@ import {
   GradingCategory,
   GradingItem,
   ScheduleEvent,
+  ScheduleEventType,
   Score,
+  SmartNotificationItem,
 } from '../../types/zamio';
-import { AnnouncementsView } from '../AnnouncementsView';
+import {
+  ANNOUNCEMENT_CATEGORY_LABELS,
+  AnnouncementsView,
+  formatAnnouncementTimestamp,
+  readAnnouncementReadMap,
+  saveAnnouncementReadMap,
+} from '../AnnouncementsView';
 import { StudentNavKey } from '../AppShell';
 import { ProfileView } from '../ProfileView';
-import { ScheduleView } from '../ScheduleView';
+import {
+  addDaysLocal,
+  buildUpcomingScheduleEntries,
+  DAY_NAMES_BS,
+  getIsoDayOfWeek,
+  SCHEDULE_TYPE_LABELS_BS,
+  ScheduleView,
+  UnifiedScheduleEntry,
+} from '../ScheduleView';
 import { Button } from '../ui/button';
+import { Dialog } from '../ui/dialog';
 import { Input } from '../ui/input';
 import { Progress } from '../ui/progress';
+import { StudentCourseDetailsView } from './StudentCourseDetailsView';
 import { StudentExamsView } from './StudentExamsView';
 
 interface CourseBundle {
@@ -74,25 +97,79 @@ interface CourseBundle {
   scheduleEvents: ScheduleEvent[];
 }
 
+export interface StudentDeepLinkTarget {
+  subTab?: 'courses' | 'exams' | 'history';
+  courseId?: string;
+  nonce: number;
+}
+
+interface CombinedHomeNotification {
+  key: string;
+  kind: 'smart' | 'official';
+  title: string;
+  subtitle: string;
+  body: string;
+  timestampMs: number;
+  timeLabel: string;
+  unread: boolean;
+  smartItem?: SmartNotificationItem;
+  officialItem?: Announcement;
+}
+
+function formatShortIsoTime(iso: string): string {
+  if (!iso) return '';
+  const dt = new Date(iso);
+  if (Number.isNaN(dt.getTime())) return '';
+  const dd = String(dt.getDate()).padStart(2, '0');
+  const mm = String(dt.getMonth() + 1).padStart(2, '0');
+  const hh = String(dt.getHours()).padStart(2, '0');
+  const min = String(dt.getMinutes()).padStart(2, '0');
+  return `${dd}.${mm}. ${hh}:${min}`;
+}
+
+function getRelativeDayPrefix(isoDate: string, todayIso: string): string {
+  if (isoDate === todayIso) return 'Danas';
+  if (isoDate === addDaysLocal(todayIso, 1)) return 'Sutra';
+  return DAY_NAMES_BS[getIsoDayOfWeek(isoDate)] || '';
+}
+
 interface StudentPortalProps {
   activeNav: StudentNavKey;
   onNavigate: (nav: StudentNavKey) => void;
+  deepLink?: StudentDeepLinkTarget | null;
+  notifications?: SmartNotificationItem[];
+  onSelectNotification?: (item: SmartNotificationItem) => void;
+  onMarkNotificationRead?: (itemId: string) => void;
+  onMarkAllNotificationsRead?: () => void;
 }
 
-export function StudentPortal({ activeNav, onNavigate }: StudentPortalProps) {
+export function StudentPortal({
+  activeNav,
+  onNavigate,
+  deepLink,
+  notifications = [],
+  onSelectNotification,
+  onMarkNotificationRead,
+  onMarkAllNotificationsRead,
+}: StudentPortalProps) {
   const { profile } = useAuth();
   const studentUid = profile?.uid || '';
 
   const [enrollments, setEnrollments] = useState<Enrollment[]>([]);
   const [bundlesByCourseId, setBundlesByCourseId] = useState<Record<string, CourseBundle>>({});
   const [scores, setScores] = useState<Score[]>([]);
+  const [activityAwards, setActivityAwards] = useState<ActivityAward[]>([]);
   const [attendanceRecords, setAttendanceRecords] = useState<AttendanceRecord[]>([]);
   const [finalGrades, setFinalGrades] = useState<FinalGrade[]>([]);
   const [examRegistrations, setExamRegistrations] = useState<ExamRegistration[]>([]);
+  const [publishedAnnouncements, setPublishedAnnouncements] = useState<Announcement[]>([]);
+  const [readOfficialMap, setReadOfficialMap] = useState<Record<string, boolean>>({});
   const [loading, setLoading] = useState(true);
 
-  const [selectedCourseId, setSelectedCourseId] = useState<string>('');
-  const [selectedHistoryCourseId, setSelectedHistoryCourseId] = useState<string>('');
+  // Courses Hub ("Moji predmeti") state
+  const [coursesSubTab, setCoursesSubTab] = useState<'courses' | 'exams' | 'history'>('courses');
+  const [detailCourseId, setDetailCourseId] = useState<string | null>(null);
+  const [selectedHistoryCourseId, setSelectedHistoryCourseId] = useState<string | null>(null);
   const [historyFilter, setHistoryFilter] = useState<'archived' | 'passed' | 'all_history'>(
     'all_history'
   );
@@ -100,8 +177,32 @@ export function StudentPortal({ activeNav, onNavigate }: StudentPortalProps) {
 
   const [courseSearch, setCourseSearch] = useState('');
   const [programFilter, setProgramFilter] = useState<StudyCycleKey>('all');
-  const [itemFilterCat, setItemFilterCat] = useState<string>('all');
   const [courseSortBy, setCourseSortBy] = useState<'name' | 'points' | 'pct'>('name');
+
+  // Home page modals (Event details & Notification reader)
+  const [selectedHomeEvent, setSelectedHomeEvent] = useState<UnifiedScheduleEntry | null>(null);
+  const [selectedHomeNotif, setSelectedHomeNotif] = useState<CombinedHomeNotification | null>(null);
+
+  useEffect(() => {
+    if (!studentUid) return;
+    setReadOfficialMap(readAnnouncementReadMap(studentUid));
+  }, [studentUid, activeNav]);
+
+  // Apply deepLink transitions from notifications or AppShell
+  useEffect(() => {
+    if (!deepLink) return;
+    if (deepLink.subTab) {
+      setCoursesSubTab(deepLink.subTab);
+    }
+    if (deepLink.subTab === 'history') {
+      setSelectedHistoryCourseId(deepLink.courseId || null);
+      setDetailCourseId(null);
+    } else if (deepLink.subTab === 'exams') {
+      setDetailCourseId(null);
+    } else {
+      setDetailCourseId(deepLink.courseId || null);
+    }
+  }, [deepLink]);
 
   useEffect(() => {
     if (!studentUid) return;
@@ -115,20 +216,23 @@ export function StudentPortal({ activeNav, onNavigate }: StudentPortalProps) {
       }
     });
     const unsubScores = subscribeStudentScores(studentUid, setScores);
+    const unsubActivity = subscribeStudentActivityAwards(studentUid, setActivityAwards);
     const unsubAtt = subscribeStudentAttendanceRecords(studentUid, setAttendanceRecords);
     const unsubGrades = subscribeStudentFinalGrades(studentUid, setFinalGrades);
     const unsubExamRegs = subscribeStudentExamRegistrations(studentUid, setExamRegistrations);
+    const unsubAnn = subscribePublishedAnnouncements(setPublishedAnnouncements);
 
     return () => {
       unsubEnroll();
       unsubScores();
+      unsubActivity();
       unsubAtt();
       unsubGrades();
       unsubExamRegs();
+      unsubAnn();
     };
   }, [studentUid]);
 
-  // Live subscriptions to each enrolled course, its exam terms & schedule events
   const enrolledCourseKey = useMemo(
     () => enrollments.map((e) => e.courseId).sort().join(','),
     [enrollments]
@@ -192,16 +296,6 @@ export function StudentPortal({ activeNav, onNavigate }: StudentPortalProps) {
     [enrollments, bundlesByCourseId]
   );
 
-  // Keep selectedCourseId synced to active enrollments
-  useEffect(() => {
-    setSelectedCourseId((prev) => {
-      if (prev && activeEnrollments.some((e) => e.courseId === prev)) {
-        return prev;
-      }
-      return activeEnrollments[0]?.courseId || '';
-    });
-  }, [activeEnrollments]);
-
   const summariesByCourseId = useMemo(() => {
     const map: Record<string, CourseStudentSummary> = {};
     for (const enr of enrollments) {
@@ -213,6 +307,7 @@ export function StudentPortal({ activeNav, onNavigate }: StudentPortalProps) {
         categories: bundle.categories,
         items: bundle.items,
         scores,
+        activityAwards,
         sessions: bundle.sessions,
         attendanceRecords,
         finalGradeRecord: fg,
@@ -220,9 +315,16 @@ export function StudentPortal({ activeNav, onNavigate }: StudentPortalProps) {
       });
     }
     return map;
-  }, [enrollments, bundlesByCourseId, scores, attendanceRecords, finalGrades, studentUid]);
+  }, [
+    enrollments,
+    bundlesByCourseId,
+    scores,
+    activityAwards,
+    attendanceRecords,
+    finalGrades,
+    studentUid,
+  ]);
 
-  // Historical / Passed enrollments for "Stari semestri i položeni predmeti"
   const historicalEnrollments = useMemo(() => {
     return enrollments
       .filter((enr) => {
@@ -242,14 +344,23 @@ export function StudentPortal({ activeNav, onNavigate }: StudentPortalProps) {
       });
   }, [enrollments, bundlesByCourseId, summariesByCourseId]);
 
-  useEffect(() => {
-    setSelectedHistoryCourseId((prev) => {
-      if (prev && historicalEnrollments.some((e) => e.courseId === prev)) {
-        return prev;
-      }
-      return historicalEnrollments[0]?.courseId || '';
-    });
-  }, [historicalEnrollments]);
+  const passedEnrollmentsAll = useMemo(
+    () =>
+      enrollments.filter((enr) => {
+        const g = summariesByCourseId[enr.courseId]?.studentVisibleFinalGrade;
+        return g !== null && g !== undefined && g >= 6;
+      }),
+    [enrollments, summariesByCourseId]
+  );
+
+  const earnedEctsTotal = useMemo(
+    () =>
+      passedEnrollmentsAll.reduce(
+        (acc, enr) => acc + (bundlesByCourseId[enr.courseId]?.course.ects ?? 0),
+        0
+      ),
+    [passedEnrollmentsAll, bundlesByCourseId]
+  );
 
   const activeExamTerms = useMemo(() => {
     const list: ExamTerm[] = [];
@@ -302,6 +413,34 @@ export function StudentPortal({ activeNav, onNavigate }: StudentPortalProps) {
 
   const todayIso = getTodayIsoLocal();
 
+  // Nearest upcoming events for Student Home Page
+  const upcomingHomeEvents = useMemo(
+    () =>
+      buildUpcomingScheduleEntries({
+        courses: activeCoursesList,
+        scheduleEvents: activeScheduleEvents,
+        examTerms: activeExamTerms,
+        gradingItems: activeGradingItems,
+        fromDateIso: todayIso,
+        daysAhead: 21,
+        limit: 6,
+      }),
+    [activeCoursesList, activeScheduleEvents, activeExamTerms, activeGradingItems, todayIso]
+  );
+
+  const next7DaysCount = useMemo(() => {
+    const sevenDaysIso = addDaysLocal(todayIso, 6);
+    return buildUpcomingScheduleEntries({
+      courses: activeCoursesList,
+      scheduleEvents: activeScheduleEvents,
+      examTerms: activeExamTerms,
+      gradingItems: activeGradingItems,
+      fromDateIso: todayIso,
+      daysAhead: 6,
+      limit: 50,
+    }).filter((e) => e.date <= sevenDaysIso).length;
+  }, [activeCoursesList, activeScheduleEvents, activeExamTerms, activeGradingItems, todayIso]);
+
   const openExamStats = useMemo(() => {
     const openTerms = activeExamTerms.filter(
       (t) => getExamWindowState(t, todayIso).state === 'open'
@@ -319,634 +458,149 @@ export function StudentPortal({ activeNav, onNavigate }: StudentPortalProps) {
     };
   }, [activeExamTerms, examRegistrations, todayIso]);
 
+  // Combined real notifications (personal smart notifications + official student announcements)
+  const combinedHomeNotifications = useMemo<CombinedHomeNotification[]>(() => {
+    const items: CombinedHomeNotification[] = [];
+
+    for (const sn of notifications) {
+      const parsedMs = Date.parse(sn.createdAtIso);
+      items.push({
+        key: `smart_${sn.id}`,
+        kind: 'smart',
+        title: sn.title,
+        subtitle: 'Obavijest sa predmeta',
+        body: sn.description,
+        timestampMs: Number.isNaN(parsedMs) ? 0 : parsedMs,
+        timeLabel: formatShortIsoTime(sn.createdAtIso),
+        unread: !sn.read,
+        smartItem: sn,
+      });
+    }
+
+    for (const ann of publishedAnnouncements) {
+      if (
+        ann.audience !== AnnouncementAudience.ALL &&
+        ann.audience !== AnnouncementAudience.STUDENTS
+      ) {
+        continue;
+      }
+      const sec = (ann.createdAt as { seconds?: number })?.seconds ?? 0;
+      items.push({
+        key: `ann_${ann.id}`,
+        kind: 'official',
+        title: ann.title,
+        subtitle: ANNOUNCEMENT_CATEGORY_LABELS[ann.category] || 'Zvanično obavještenje',
+        body: ann.body,
+        timestampMs: sec * 1000,
+        timeLabel: formatAnnouncementTimestamp(ann.createdAt),
+        unread: !readOfficialMap[ann.id],
+        officialItem: ann,
+      });
+    }
+
+    return items
+      .sort((a, b) => {
+        if (a.unread !== b.unread) return a.unread ? -1 : 1;
+        return b.timestampMs - a.timestampMs;
+      })
+      .slice(0, 6);
+  }, [notifications, publishedAnnouncements, readOfficialMap]);
+
+  const totalUnreadHomeNotifications = useMemo(() => {
+    const unreadSmart = notifications.filter((n) => !n.read).length;
+    const unreadOfficial = publishedAnnouncements.filter(
+      (a) =>
+        (a.audience === AnnouncementAudience.ALL ||
+          a.audience === AnnouncementAudience.STUDENTS) &&
+        !readOfficialMap[a.id]
+    ).length;
+    return unreadSmart + unreadOfficial;
+  }, [notifications, publishedAnnouncements, readOfficialMap]);
+
+  const handleOpenCourseDetails = (courseId: string) => {
+    setCoursesSubTab('courses');
+    setDetailCourseId(courseId);
+    onNavigate('predmeti');
+  };
+
+  const handleOpenExamRegistrations = () => {
+    setCoursesSubTab('exams');
+    setDetailCourseId(null);
+    onNavigate('predmeti');
+  };
+
+  const handleOpenArchivedHistory = () => {
+    setCoursesSubTab('history');
+    setDetailCourseId(null);
+    onNavigate('predmeti');
+  };
+
+  const handleMarkHomeNotifRead = (item: CombinedHomeNotification) => {
+    if (item.kind === 'smart' && item.smartItem && onMarkNotificationRead) {
+      onMarkNotificationRead(item.smartItem.id);
+    } else if (item.kind === 'official' && item.officialItem && studentUid) {
+      const next = { ...readOfficialMap, [item.officialItem.id]: true };
+      setReadOfficialMap(next);
+      saveAnnouncementReadMap(studentUid, next);
+    }
+  };
+
+  const handleMarkAllHomeNotifsRead = () => {
+    if (onMarkAllNotificationsRead) {
+      onMarkAllNotificationsRead();
+    }
+    if (studentUid) {
+      const next = { ...readOfficialMap };
+      for (const a of publishedAnnouncements) {
+        if (
+          a.audience === AnnouncementAudience.ALL ||
+          a.audience === AnnouncementAudience.STUDENTS
+        ) {
+          next[a.id] = true;
+        }
+      }
+      setReadOfficialMap(next);
+      saveAnnouncementReadMap(studentUid, next);
+    }
+  };
+
+  // =========================================================================
+  // ROUTE: PROFILE & SETTINGS
+  // =========================================================================
   if (activeNav === 'profil') {
     return <ProfileView />;
   }
 
+  // =========================================================================
+  // ROUTE: NOTIFICATIONS & ANNOUNCEMENTS
+  // =========================================================================
   if (activeNav === 'obavjestenja') {
-    return <AnnouncementsView viewerMode="student" canManage={false} />;
+    return (
+      <AnnouncementsView
+        viewerMode="student"
+        canManage={false}
+        smartNotifications={notifications}
+        onSelectSmartNotification={onSelectNotification}
+        onMarkSmartReadOnly={onMarkNotificationRead}
+        onMarkAllSmartRead={onMarkAllNotificationsRead}
+      />
+    );
   }
 
   if (loading) {
     return (
       <div className="space-y-4">
-        <div className="h-12 bg-white border border-slate-200 rounded-xl animate-pulse" />
+        <div className="h-24 bg-white border border-slate-200 rounded-xl animate-pulse" />
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-          <div className="lg:col-span-8 h-80 bg-white border border-slate-200 rounded-xl animate-pulse" />
-          <div className="lg:col-span-4 h-64 bg-white border border-slate-200 rounded-xl animate-pulse" />
-        </div>
-      </div>
-    );
-  }
-
-  // Reusable Zamger-inspired Grade Breakdown Component (supports both active & archived courses)
-  const renderCourseBreakdown = (
-    targetBundle?: CourseBundle,
-    targetSummary?: CourseStudentSummary,
-    isReadOnlyArchive = false
-  ) => {
-    if (!targetBundle || !targetSummary) return null;
-    const { course } = targetBundle;
-    const {
-      attendance,
-      categories,
-      totalEarnedPoints,
-      maxPossiblePoints,
-      percentageAchieved,
-      studentVisibleFinalGrade,
-      passedThreshold,
-    } = targetSummary;
-
-    return (
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-        {/* Left 8 Columns: Structured Grade Table (Attendance -> Categories -> Items -> Total) */}
-        <div className="lg:col-span-8 bg-white border border-slate-200 rounded-xl overflow-hidden">
-          <div className="px-5 py-4 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-            <div>
-              <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500 mb-0.5">
-                <span className="font-mono font-semibold text-blue-700">{course.code}</span>
-                <span aria-hidden="true">·</span>
-                <span className="font-mono tabular-nums">{course.academicYear}</span>
-                <span aria-hidden="true">·</span>
-                <span>{course.semester}</span>
-                {isReadOnlyArchive && (
-                  <>
-                    <span aria-hidden="true">·</span>
-                    <span className="font-medium text-slate-700">Arhivirana evidencija</span>
-                  </>
-                )}
-              </div>
-              <h2 className="text-base font-semibold text-slate-900">
-                Struktura bodova — {course.name}
-              </h2>
-              <p className="text-xs text-slate-500 mt-0.5">
-                Prag za prolaz:{' '}
-                <span className="font-mono font-semibold text-slate-700 tabular-nums">
-                  {course.grade6Threshold}
-                </span>{' '}
-                bodova · Maksimalno:{' '}
-                <span className="font-mono font-semibold text-slate-700 tabular-nums">
-                  {formatPoints(maxPossiblePoints)}
-                </span>{' '}
-                bodova
-              </p>
-            </div>
-            {!isReadOnlyArchive && (
-              <div className="flex items-center gap-2 self-start sm:self-auto">
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => onNavigate('prisustvo')}
-                  className="text-blue-700 hover:text-blue-800"
-                >
-                  Detalji prisustva
-                </Button>
-              </div>
-            )}
-          </div>
-
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm border-collapse">
-              <thead>
-                <tr className="bg-slate-50 border-b border-slate-200 text-xs font-semibold text-slate-600">
-                  <th className="text-left py-2.5 px-4">Kategorija / Stavka</th>
-                  <th className="text-right py-2.5 px-4 whitespace-nowrap">Osvojeno</th>
-                  <th className="text-right py-2.5 px-4 whitespace-nowrap">Maksimum</th>
-                  <th className="text-left py-2.5 px-4">Status</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-100">
-                {/* 1. Prisustvo First */}
-                {course.attendanceEnabled ? (
-                  <tr className="bg-slate-50/60">
-                    <td className="py-3 px-4">
-                      <div className="font-semibold text-slate-900">1. Prisustvo nastavi</div>
-                      <div className="text-xs text-slate-500 mt-0.5 font-mono tabular-nums">
-                        Prisustvovao: {attendance.attendedCount}/{attendance.heldCount} održanih termina
-                        {attendance.absentCount > 0 ? ` · Izostanci: ${attendance.absentCount}` : ''}
-                        {attendance.percentage !== null ? ` (${attendance.percentage}%)` : ''}
-                      </div>
-                    </td>
-                    <td className="py-3 px-4 text-right font-mono font-semibold text-slate-900 tabular-nums">
-                      {formatPoints(attendance.earnedPoints)}
-                    </td>
-                    <td className="py-3 px-4 text-right font-mono text-slate-500 tabular-nums">
-                      {formatPoints(attendance.maxPoints)}
-                    </td>
-                    <td className="py-3 px-4 text-xs">
-                      {attendance.heldCount === 0 ? (
-                        <span className="text-slate-500">Nema održanih termina</span>
-                      ) : (attendance.percentage ?? 0) >= 70 ? (
-                        <span className="inline-flex items-center gap-1.5 text-emerald-700 font-medium">
-                          <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
-                          Uredno prisustvo
-                        </span>
-                      ) : (
-                        <span className="inline-flex items-center gap-1.5 text-red-700 font-medium">
-                          <AlertCircle className="w-3.5 h-3.5 shrink-0" />
-                          Povećan broj izostanaka
-                        </span>
-                      )}
-                    </td>
-                  </tr>
-                ) : (
-                  <tr className="bg-slate-50/40">
-                    <td className="py-2.5 px-4 text-xs text-slate-500" colSpan={4}>
-                      <span className="inline-flex items-center gap-1.5">
-                        <Info className="w-3.5 h-3.5 text-slate-400 shrink-0" />
-                        Prisustvo se ne boduje na ovom predmetu — bodovi se ne oduzimaju.
-                      </span>
-                    </td>
-                  </tr>
-                )}
-
-                {/* 2..N. Configurable Categories & Individual Items */}
-                {categories.map((catBreakdown, idx) => {
-                  const sectionNumber = course.attendanceEnabled ? idx + 2 : idx + 1;
-                  return (
-                    <React.Fragment key={catBreakdown.category.id}>
-                      <tr className="bg-slate-50/60">
-                        <td className="py-2.5 px-4 font-semibold text-slate-900">
-                          {sectionNumber}. {catBreakdown.category.name}
-                        </td>
-                        <td className="py-2.5 px-4 text-right font-mono font-semibold text-slate-900 tabular-nums">
-                          {formatPoints(catBreakdown.earnedPoints)}
-                        </td>
-                        <td className="py-2.5 px-4 text-right font-mono text-slate-500 tabular-nums">
-                          {formatPoints(catBreakdown.maxPoints)}
-                        </td>
-                        <td className="py-2.5 px-4 text-xs font-mono text-slate-600 tabular-nums">
-                          {catBreakdown.percentage}% kategorije
-                        </td>
-                      </tr>
-
-                      {catBreakdown.items.length === 0 ? (
-                        <tr>
-                          <td className="py-2 px-4 pl-8 text-xs text-slate-400 italic" colSpan={4}>
-                            Nema unesenih stavki u ovoj kategoriji.
-                          </td>
-                        </tr>
-                      ) : (
-                        catBreakdown.items.map((row) => (
-                          <tr
-                            key={row.item.id}
-                            className="hover:bg-slate-50/80 transition-colors"
-                          >
-                            <td className="py-2.5 px-4 pl-8">
-                              <div className="text-slate-800 font-medium">{row.item.name}</div>
-                              <div className="text-[11px] text-slate-500 flex flex-wrap items-center gap-1.5 mt-0.5">
-                                <span className="font-mono tabular-nums">
-                                  {formatBosnianDate(row.item.date)}
-                                </span>
-                                {row.feedback && (
-                                  <>
-                                    <span aria-hidden="true">·</span>
-                                    <span className="inline-flex items-center gap-1 text-blue-700">
-                                      <MessageSquare className="w-3 h-3 shrink-0" />
-                                      {row.feedback}
-                                    </span>
-                                  </>
-                                )}
-                              </div>
-                            </td>
-                            <td className="py-2.5 px-4 text-right font-mono tabular-nums text-slate-900">
-                              {row.graded ? formatPoints(row.earnedPoints) : '—'}
-                            </td>
-                            <td className="py-2.5 px-4 text-right font-mono tabular-nums text-slate-500">
-                              {formatPoints(row.maxPoints)}
-                            </td>
-                            <td className="py-2.5 px-4 text-xs">
-                              {!row.graded ? (
-                                <span className="text-slate-400">Nije ocijenjeno</span>
-                              ) : (row.earnedPoints ?? 0) >= row.maxPoints * 0.5 ? (
-                                <span className="inline-flex items-center gap-1 text-emerald-700">
-                                  <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
-                                  Upisano
-                                </span>
-                              ) : (
-                                <span className="inline-flex items-center gap-1 text-amber-700">
-                                  <AlertCircle className="w-3.5 h-3.5 shrink-0" />
-                                  Upisano
-                                </span>
-                              )}
-                            </td>
-                          </tr>
-                        ))
-                      )}
-                    </React.Fragment>
-                  );
-                })}
-
-                {/* Ukupno bodova Row */}
-                <tr className="bg-slate-900 text-white font-semibold">
-                  <td className="py-3.5 px-4">Ukupno bodova</td>
-                  <td className="py-3.5 px-4 text-right font-mono text-base tabular-nums">
-                    {formatPoints(totalEarnedPoints)}
-                  </td>
-                  <td className="py-3.5 px-4 text-right font-mono text-slate-300 tabular-nums">
-                    {formatPoints(maxPossiblePoints)}
-                  </td>
-                  <td className="py-3.5 px-4 font-mono text-xs text-slate-200 tabular-nums">
-                    {percentageAchieved}% ostvareno
-                  </td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
-        </div>
-
-        {/* Right 4 Columns: Single-Elevation Final Grade & Progress Panel */}
-        <div className="lg:col-span-4 space-y-5">
-          <div className="bg-white border border-slate-200 rounded-xl p-5">
-            <div className="flex items-center justify-between gap-4">
-              <div>
-                <div className="text-xs font-medium text-slate-500">Konačna ocjena</div>
-                <div className="mt-1 text-sm text-slate-700">
-                  {studentVisibleFinalGrade !== null ? (
-                    <span className="inline-flex items-center gap-1.5 text-emerald-700 font-semibold">
-                      <Award className="w-4 h-4 shrink-0" />
-                      Ocjena zaključena
-                    </span>
-                  ) : (
-                    <span className="text-slate-600">Ocjena još nije zaključena</span>
-                  )}
-                </div>
-              </div>
-
-              <div
-                className={cn(
-                  'font-mono text-4xl font-bold tabular-nums shrink-0',
-                  studentVisibleFinalGrade !== null ? 'text-emerald-700' : 'text-slate-300'
-                )}
-              >
-                {studentVisibleFinalGrade !== null ? studentVisibleFinalGrade : '—'}
-              </div>
-            </div>
-
-            {targetSummary.officialFinalGrade?.status === 'finalized' &&
-              targetSummary.officialFinalGrade.comment && (
-                <p className="mt-3 pt-3 border-t border-slate-100 text-xs text-slate-600">
-                  Napomena nastavnika: {targetSummary.officialFinalGrade.comment}
-                </p>
-              )}
-
-            {studentVisibleFinalGrade === null && (
-              <p className="mt-3 pt-3 border-t border-slate-100 text-xs text-slate-500 leading-relaxed">
-                Konačna ocjena se prikazuje tek nakon što predmetni nastavnik zvanično zaključi
-                ocjenu u skladu sa pravilima predmeta.
-              </p>
-            )}
-          </div>
-
-          <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
-            <div className="p-5 space-y-4">
-              <div className="flex items-baseline justify-between gap-2">
-                <span className="text-xs font-semibold text-slate-700">Ostvareni napredak</span>
-                <span className="font-mono text-sm font-bold text-slate-900 tabular-nums">
-                  {formatPoints(totalEarnedPoints)} / {formatPoints(maxPossiblePoints)} b (
-                  {percentageAchieved}%)
-                </span>
-              </div>
-
-              <Progress
-                value={percentageAchieved}
-                indicatorClassName={passedThreshold ? 'bg-emerald-600' : 'bg-blue-700'}
-              />
-
-              <div className="text-xs text-slate-600 flex items-center justify-between">
-                <span>Status praga ({course.grade6Threshold} b):</span>
-                {passedThreshold ? (
-                  <span className="font-semibold text-emerald-700">Ostvaren prag prolaza</span>
-                ) : (
-                  <span className="font-mono text-slate-700 tabular-nums">
-                    Nedostaje još {formatPoints(course.grade6Threshold - totalEarnedPoints)} b
-                  </span>
-                )}
-              </div>
-            </div>
-
-            <div className="border-t border-slate-200 bg-slate-50/50">
-              <div className="px-5 py-2 text-[11px] font-medium text-slate-500 border-b border-slate-100">
-                Skala ocjenjivanja na predmetu
-              </div>
-              <div className="grid grid-cols-5 divide-x divide-slate-200 text-center font-mono text-xs">
-                {[
-                  { g: 6, min: course.grade6Threshold },
-                  { g: 7, min: course.grade7Threshold },
-                  { g: 8, min: course.grade8Threshold },
-                  { g: 9, min: course.grade9Threshold },
-                  { g: 10, min: course.grade10Threshold },
-                ].map((tier) => {
-                  const reached = totalEarnedPoints >= tier.min;
-                  return (
-                    <div
-                      key={tier.g}
-                      className={cn(
-                        'py-2.5 px-1 tabular-nums',
-                        reached
-                          ? 'bg-blue-50/70 text-blue-900 font-semibold'
-                          : 'text-slate-500'
-                      )}
-                    >
-                      <div className="text-xs font-bold">{tier.g}</div>
-                      <div className="text-[10px] opacity-80">≥{tier.min}</div>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-    );
-  };
-
-  // =========================================================================
-  // VIEW: STARI SEMESTRI I POLOŽENI PREDMETI (Accessible even if 0 active courses)
-  // =========================================================================
-  if (activeNav === 'semestri') {
-    const passedEnrollmentsAll = enrollments.filter((enr) => {
-      const g = summariesByCourseId[enr.courseId]?.studentVisibleFinalGrade;
-      return g !== null && g !== undefined && g >= 6;
-    });
-
-    const earnedEcts = passedEnrollmentsAll.reduce((acc, enr) => {
-      const ects = bundlesByCourseId[enr.courseId]?.course.ects ?? 0;
-      return acc + ects;
-    }, 0);
-
-    const avgFinalGrade =
-      passedEnrollmentsAll.length > 0
-        ? passedEnrollmentsAll.reduce(
-            (acc, enr) =>
-              acc + (summariesByCourseId[enr.courseId]?.studentVisibleFinalGrade ?? 0),
-            0
-          ) / passedEnrollmentsAll.length
-        : 0;
-
-    const distinctYears = Array.from(
-      new Set(
-        historicalEnrollments
-          .map((e) => bundlesByCourseId[e.courseId]?.course.academicYear || e.academicYear)
-          .filter(Boolean)
-      )
-    ).sort((a, b) => b.localeCompare(a));
-
-    const visibleHistory = historicalEnrollments.filter((enr) => {
-      const crs = bundlesByCourseId[enr.courseId]?.course;
-      const isArch = Boolean(enr.isArchived || crs?.isArchived);
-      const g = summariesByCourseId[enr.courseId]?.studentVisibleFinalGrade;
-      const isPassed = g !== null && g !== undefined && g >= 6;
-      const yearStr = crs?.academicYear || enr.academicYear;
-
-      if (historyFilter === 'archived' && !isArch) return false;
-      if (historyFilter === 'passed' && !isPassed) return false;
-      if (historyYearFilter !== 'all' && yearStr !== historyYearFilter) return false;
-      return true;
-    });
-
-    const selectedHistBundle = selectedHistoryCourseId
-      ? bundlesByCourseId[selectedHistoryCourseId]
-      : undefined;
-    const selectedHistSummary = selectedHistoryCourseId
-      ? summariesByCourseId[selectedHistoryCourseId]
-      : undefined;
-
-    return (
-      <div className="space-y-6">
-        {/* Historical KPI Strip */}
-        <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
-          <div className="grid grid-cols-2 lg:grid-cols-4 divide-y lg:divide-y-0 sm:divide-x divide-slate-200">
-            <div className="p-4 sm:p-5">
-              <div className="text-xs text-slate-500">Arhivirani predmeti</div>
-              <div className="mt-1 font-mono text-2xl font-bold text-slate-900 tabular-nums">
-                {archivedEnrollments.length}
-              </div>
-              <div className="text-[11px] text-slate-500 mt-0.5">Stari semestri u dosjeu</div>
-            </div>
-
-            <div className="p-4 sm:p-5">
-              <div className="text-xs text-slate-500">Ukupno položeno predmeta</div>
-              <div className="mt-1 font-mono text-2xl font-bold text-emerald-700 tabular-nums">
-                {passedEnrollmentsAll.length}
-              </div>
-              <div className="text-[11px] text-slate-500 mt-0.5">Sa zaključenom ocjenom ≥ 6</div>
-            </div>
-
-            <div className="p-4 sm:p-5">
-              <div className="text-xs text-slate-500">Ostvareno ECTS kredita</div>
-              <div className="mt-1 font-mono text-2xl font-bold text-blue-700 tabular-nums">
-                {earnedEcts} ECTS
-              </div>
-              <div className="text-[11px] text-slate-500 mt-0.5">Zbir položenih predmeta</div>
-            </div>
-
-            <div className="p-4 sm:p-5">
-              <div className="text-xs text-slate-500">Prosjek zaključenih ocjena</div>
-              <div className="mt-1 font-mono text-2xl font-bold text-slate-900 tabular-nums">
-                {passedEnrollmentsAll.length > 0 ? avgFinalGrade.toFixed(2) : '—'}
-              </div>
-              <div className="text-[11px] text-slate-500 mt-0.5">Na osnovu položenih ispita</div>
-            </div>
-          </div>
-        </div>
-
-        {/* Filter Bar */}
-        <div className="bg-white border border-slate-200 rounded-xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-          <div className="flex flex-wrap items-center gap-1 p-1 bg-slate-100 rounded-lg">
-            {[
-              { key: 'all_history', label: `Sva historija (${historicalEnrollments.length})` },
-              { key: 'archived', label: `Arhivirani semestri (${archivedEnrollments.length})` },
-              { key: 'passed', label: `Položeni predmeti (${passedEnrollmentsAll.length})` },
-            ].map((tab) => (
-              <button
-                key={tab.key}
-                type="button"
-                onClick={() =>
-                  setHistoryFilter(tab.key as 'archived' | 'passed' | 'all_history')
-                }
-                className={cn(
-                  'px-3 py-1.5 text-xs font-medium rounded-md transition-colors cursor-pointer whitespace-nowrap shrink-0 tabular-nums',
-                  historyFilter === tab.key
-                    ? 'bg-white text-slate-900 shadow-xs'
-                    : 'text-slate-600 hover:text-slate-900'
-                )}
-              >
-                {tab.label}
-              </button>
-            ))}
-          </div>
-
-          {distinctYears.length > 0 && (
-            <div className="flex items-center gap-2 text-xs">
-              <span className="text-slate-500 whitespace-nowrap">Akademska godina:</span>
-              <select
-                value={historyYearFilter}
-                onChange={(e) => setHistoryYearFilter(e.target.value)}
-                className="h-8 rounded-lg border border-slate-300 bg-white px-2.5 font-mono text-xs text-slate-800 tabular-nums"
-              >
-                <option value="all">Sve godine</option>
-                {distinctYears.map((yr) => (
-                  <option key={yr} value={yr}>
-                    {yr}
-                  </option>
-                ))}
-              </select>
-            </div>
-          )}
-        </div>
-
-        {/* Historical Courses Table */}
-        <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
-          {visibleHistory.length === 0 ? (
-            <div className="p-8 text-center">
-              <Archive className="w-7 h-7 text-slate-400 mx-auto mb-2" />
-              <h3 className="text-sm font-semibold text-slate-900">
-                Nema arhiviranih semestara ili položenih predmeta za izabrani filter
-              </h3>
-              <p className="text-xs text-slate-500 mt-1 max-w-md mx-auto leading-relaxed">
-                Kada uprava fakulteta arhivira završeni semestar ili nastavnik zaključi prolaznu
-                ocjenu, cjelokupna evidencija predmeta trajno ostaje dostupna na ovoj stranici.
-              </p>
-            </div>
-          ) : (
-            <div className="overflow-x-auto">
-              <table className="w-full text-sm border-collapse">
-                <thead>
-                  <tr className="bg-slate-50 border-b border-slate-200 text-xs font-semibold text-slate-600">
-                    <th className="text-left py-3 px-4">Predmet</th>
-                    <th className="text-left py-3 px-4 whitespace-nowrap">Godina i semestar</th>
-                    <th className="text-left py-3 px-4">Nastavnik</th>
-                    <th className="text-right py-3 px-4 whitespace-nowrap">Bodovi</th>
-                    <th className="text-left py-3 px-4 whitespace-nowrap">Konačna ocjena</th>
-                    <th className="text-right py-3 px-4">Detalji</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-100">
-                  {visibleHistory.map((enr) => {
-                    const bundle = bundlesByCourseId[enr.courseId];
-                    const crs = bundle?.course;
-                    const sum = summariesByCourseId[enr.courseId];
-                    const isSelected = enr.courseId === selectedHistoryCourseId;
-                    const isArch = Boolean(enr.isArchived || crs?.isArchived);
-                    return (
-                      <tr
-                        key={enr.id}
-                        className={cn(
-                          'transition-colors',
-                          isSelected ? 'bg-blue-50/45' : 'hover:bg-slate-50/80'
-                        )}
-                      >
-                        <td className="py-3 px-4">
-                          <div className="font-semibold text-slate-900">{enr.courseName}</div>
-                          <div className="text-xs text-slate-500 mt-0.5 flex flex-wrap items-center gap-1.5">
-                            <span className="font-mono text-blue-700">{enr.courseCode}</span>
-                            {crs && (
-                              <>
-                                <span aria-hidden="true">·</span>
-                                <span className="font-mono tabular-nums">{crs.ects} ECTS</span>
-                              </>
-                            )}
-                            {isArch && (
-                              <>
-                                <span aria-hidden="true">·</span>
-                                <span>Arhiviran semestar</span>
-                              </>
-                            )}
-                          </div>
-                        </td>
-                        <td className="py-3 px-4 text-xs text-slate-700">
-                          <div className="font-mono font-semibold text-slate-900 tabular-nums">
-                            {crs?.academicYear || enr.academicYear}
-                          </div>
-                          <div className="text-slate-500 mt-0.5">
-                            {crs?.semester || enr.semester || 'Završen semestar'}
-                          </div>
-                        </td>
-                        <td className="py-3 px-4 text-xs text-slate-700">
-                          {formatCourseProfessors(crs, enr.leadProfessorName)}
-                        </td>
-                        <td className="py-3 px-4 text-right font-mono font-semibold text-slate-900 tabular-nums">
-                          {sum
-                            ? `${formatPoints(sum.totalEarnedPoints)} / ${formatPoints(sum.maxPossiblePoints)}`
-                            : '—'}
-                        </td>
-                        <td className="py-3 px-4 text-xs whitespace-nowrap">
-                          {sum?.studentVisibleFinalGrade !== null && sum !== undefined ? (
-                            <span className="inline-flex items-center gap-1.5 text-emerald-700 font-semibold font-mono tabular-nums">
-                              <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
-                              Ocjena {sum.studentVisibleFinalGrade}
-                            </span>
-                          ) : (
-                            <span className="text-slate-500">Arhivirano bez ocjene</span>
-                          )}
-                        </td>
-                        <td className="py-3 px-4 text-right whitespace-nowrap">
-                          <Button
-                            variant={isSelected ? 'default' : 'outline'}
-                            size="sm"
-                            onClick={() => setSelectedHistoryCourseId(enr.courseId)}
-                          >
-                            {isSelected ? 'Prikazano ispod' : 'Pregled bodova'}
-                          </Button>
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </div>
-
-        {/* Detailed Breakdown for Selected Historical Course */}
-        {selectedHistBundle &&
-          selectedHistSummary &&
-          renderCourseBreakdown(selectedHistBundle, selectedHistSummary, true)}
-      </div>
-    );
-  }
-
-  // Empty state for active semester views if student has 0 active courses
-  if (activeEnrollments.length === 0) {
-    return (
-      <div className="bg-white border border-slate-200 rounded-xl p-8 text-center max-w-xl mx-auto my-8">
-        <BookOpen className="w-8 h-8 text-slate-400 mx-auto mb-3" />
-        <h2 className="text-base font-semibold text-slate-900">
-          Trenutno nemate aktivnih predmeta u tekućem semestru
-        </h2>
-        <p className="text-sm text-slate-600 mt-1.5 leading-relaxed">
-          Studentska služba (administrator) ili predmetni nastavnik vrši upis na predmete prema
-          vašem dodijeljenom broju indeksa{' '}
-          {profile?.studentIndex ? (
-            <strong className="font-mono text-slate-900 tabular-nums">
-              ({profile.studentIndex})
-            </strong>
-          ) : (
-            ''
-          )}
-          .
-        </p>
-        <div className="mt-5 flex flex-wrap items-center justify-center gap-2.5">
-          {archivedEnrollments.length > 0 && (
-            <Button onClick={() => onNavigate('semestri')}>
-              <Archive className="w-4 h-4" />
-              Pregledaj stare semestre ({archivedEnrollments.length})
-            </Button>
-          )}
-          <Button variant="outline" onClick={() => onNavigate('obavjestenja')}>
-            Obavještenja uprave
-          </Button>
-          <Button variant="outline" onClick={() => onNavigate('profil')}>
-            Otvori moj profil
-          </Button>
+          <div className="lg:col-span-7 h-72 bg-white border border-slate-200 rounded-xl animate-pulse" />
+          <div className="lg:col-span-5 h-72 bg-white border border-slate-200 rounded-xl animate-pulse" />
         </div>
       </div>
     );
   }
 
   // =========================================================================
-  // VIEW: RASPORED PREDAVANJA, LABOVA, ISPITA I ROKOVA ("Danas", "Ove sedmice", "Cijeli semestar")
+  // ROUTE: INTERACTIVE TIMETABLE & CALENDAR ("Kalendar")
   // =========================================================================
   if (activeNav === 'raspored') {
     return (
@@ -956,671 +610,1256 @@ export function StudentPortal({ activeNav, onNavigate }: StudentPortalProps) {
         examTerms={activeExamTerms}
         gradingItems={activeGradingItems}
         canEdit={false}
+        onOpenCourse={(cId) => handleOpenCourseDetails(cId)}
       />
     );
   }
 
   // =========================================================================
-  // VIEW: PRIJAVA ISPITA
-  // =========================================================================
-  if (activeNav === 'ispiti' && profile) {
-    return (
-      <StudentExamsView
-        studentProfile={profile}
-        examTerms={activeExamTerms}
-        examRegistrations={examRegistrations}
-        coursesById={activeCoursesById}
-      />
-    );
-  }
-
-  const activeBundle = selectedCourseId ? bundlesByCourseId[selectedCourseId] : undefined;
-  const activeSummary = selectedCourseId ? summariesByCourseId[selectedCourseId] : undefined;
-
-  // Fast 1-click horizontal course switcher bar across active semester courses
-  const CourseTabsBar = () => (
-    <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
-      <div className="px-3 py-2.5 flex items-center gap-1.5 overflow-x-auto">
-        {activeEnrollments.map((enr) => {
-          const isSelected = enr.courseId === selectedCourseId;
-          const sum = summariesByCourseId[enr.courseId];
-          return (
-            <button
-              key={enr.id}
-              type="button"
-              onClick={() => {
-                setSelectedCourseId(enr.courseId);
-                setItemFilterCat('all');
-              }}
-              className={cn(
-                'px-3.5 py-2 rounded-lg text-left transition-colors cursor-pointer shrink-0 flex items-center gap-3',
-                isSelected
-                  ? 'bg-slate-900 text-white'
-                  : 'text-slate-700 hover:bg-slate-100'
-              )}
-            >
-              <div className="flex items-center gap-2 whitespace-nowrap">
-                <span
-                  className={cn(
-                    'font-mono text-xs font-semibold',
-                    isSelected ? 'text-blue-300' : 'text-blue-700'
-                  )}
-                >
-                  {enr.courseCode}
-                </span>
-                <span className="text-sm font-semibold">{enr.courseName}</span>
-              </div>
-
-              {sum && (
-                <span
-                  className={cn(
-                    'font-mono text-xs tabular-nums whitespace-nowrap',
-                    isSelected ? 'text-slate-300' : 'text-slate-500'
-                  )}
-                >
-                  {sum.studentVisibleFinalGrade !== null
-                    ? `Ocjena ${sum.studentVisibleFinalGrade}`
-                    : `${formatPoints(sum.totalEarnedPoints)}b`}
-                </span>
-              )}
-            </button>
-          );
-        })}
-      </div>
-
-      {activeBundle && (
-        <div className="px-4 py-2.5 bg-slate-50/70 border-t border-slate-100 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-600">
-          <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-            {activeBundle.course.studyProgram && (
-              <>
-                <span className="font-medium text-blue-700">
-                  {activeBundle.course.studyProgram}
-                </span>
-                <span aria-hidden="true" className="text-slate-300">·</span>
-              </>
-            )}
-            <span>
-              {getCourseProfessors(activeBundle.course).length > 1 ? 'Profesori: ' : 'Profesor: '}
-              <strong className="font-medium text-slate-900">
-                {formatCourseProfessors(activeBundle.course)}
-              </strong>
-            </span>
-            {getCourseAssistants(activeBundle.course).length > 0 && (
-              <>
-                <span aria-hidden="true" className="text-slate-300">·</span>
-                <span>
-                  Asistenti:{' '}
-                  <strong className="font-medium text-slate-800">
-                    {formatCourseAssistants(activeBundle.course)}
-                  </strong>
-                </span>
-              </>
-            )}
-            <span aria-hidden="true" className="text-slate-300">·</span>
-            <span>{activeBundle.course.semester}</span>
-            <span aria-hidden="true" className="text-slate-300">·</span>
-            <span className="font-mono tabular-nums">{activeBundle.course.ects} ECTS</span>
-          </div>
-
-          <div className="flex items-center gap-4">
-            <button
-              type="button"
-              onClick={() => onNavigate('raspored')}
-              className="font-medium text-slate-600 hover:text-slate-900 hover:underline cursor-pointer whitespace-nowrap"
-            >
-              Raspored
-            </button>
-            <button
-              type="button"
-              onClick={() => onNavigate('ispiti')}
-              className="font-medium text-blue-700 hover:underline cursor-pointer whitespace-nowrap tabular-nums"
-            >
-              Prijava ispita ({activeBundle.examTerms.length})
-            </button>
-            <button
-              type="button"
-              onClick={() => onNavigate('predmeti')}
-              className="font-medium text-slate-600 hover:text-slate-900 hover:underline cursor-pointer whitespace-nowrap"
-            >
-              Svi predmeti
-            </button>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-
-  // =========================================================================
-  // VIEW 1: POČETNA — PREGLED I BODOVI
+  // ROUTE: NEW STUDENT HOME PAGE / OVERVIEW ("Početna")
+  // Answers immediately:
+  //   1. What is coming up? (Upcoming events)
+  //   2. What has changed? (Recent notifications)
+  //   3. What should I pay attention to? (Open exams & compact course overview)
   // =========================================================================
   if (activeNav === 'pocetna') {
+    const firstName = profile?.fullName?.trim().split(/\s+/)[0] || 'studente';
+    const currentAcademicYear =
+      activeCoursesList[0]?.academicYear || profile?.academicYear || '2026/2027';
+
     return (
-      <div className="space-y-5">
-        {openExamStats.openCount > 0 && (
+      <div className="space-y-6">
+        {/* A. WELCOME SECTION + COMPACT ACADEMIC ACTIVITY SUMMARY */}
+        <section className="bg-white border border-slate-200 rounded-xl overflow-hidden">
+          <div className="p-5 sm:p-6 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+            <div className="space-y-1">
+              <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-slate-500">
+                <span>Studentski pregled</span>
+                <span aria-hidden="true">·</span>
+                <span className="font-mono tabular-nums">
+                  {DAY_NAMES_BS[getIsoDayOfWeek(todayIso)]}, {formatBosnianDate(todayIso)}
+                </span>
+                {profile?.studentIndex && (
+                  <>
+                    <span aria-hidden="true">·</span>
+                    <span className="font-mono font-semibold text-slate-700 tabular-nums">
+                      Indeks {profile.studentIndex}
+                    </span>
+                  </>
+                )}
+                {profile?.department && (
+                  <>
+                    <span aria-hidden="true">·</span>
+                    <span>{profile.department}</span>
+                  </>
+                )}
+              </div>
+
+              <h2 className="text-xl sm:text-2xl font-bold text-slate-900 tracking-tight">
+                Dobrodošli, {firstName}
+              </h2>
+              <p className="text-xs sm:text-sm text-slate-600">
+                Pregled nadolazećih obaveza, najnovijih obavijesti i aktivnih predmeta za akademsku{' '}
+                <span className="font-mono font-medium text-slate-800 tabular-nums">
+                  {currentAcademicYear}
+                </span>
+                .
+              </p>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2 shrink-0">
+              {openExamStats.openCount > 0 && (
+                <Button size="sm" onClick={handleOpenExamRegistrations} className="whitespace-nowrap">
+                  <FileCheck2 className="w-4 h-4" />
+                  Prijava ispita ({openExamStats.openCount})
+                </Button>
+              )}
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => onNavigate('raspored')}
+                className="whitespace-nowrap"
+              >
+                <Calendar className="w-4 h-4" />
+                Otvori kalendar
+              </Button>
+            </div>
+          </div>
+
+          <div className="border-t border-slate-200 bg-slate-50/50 grid grid-cols-2 lg:grid-cols-4 divide-y lg:divide-y-0 sm:divide-x divide-slate-200">
+            <div className="px-5 py-3.5">
+              <div className="text-xs text-slate-500">Aktivni predmeti</div>
+              <div className="mt-0.5 font-mono text-xl font-bold text-slate-900 tabular-nums">
+                {activeEnrollments.length}
+              </div>
+            </div>
+            <div className="px-5 py-3.5">
+              <div className="text-xs text-slate-500">Obaveze u 7 dana</div>
+              <div className="mt-0.5 font-mono text-xl font-bold text-blue-700 tabular-nums">
+                {next7DaysCount}
+              </div>
+            </div>
+            <div className="px-5 py-3.5">
+              <div className="text-xs text-slate-500">Otvorene prijave ispita</div>
+              <div className="mt-0.5 font-mono text-xl font-bold text-slate-900 tabular-nums">
+                {openExamStats.openCount}
+                {openExamStats.unansweredCount > 0 && (
+                  <span className="ml-1.5 text-xs font-sans font-medium text-amber-700">
+                    ({openExamStats.unansweredCount} čeka prijavu)
+                  </span>
+                )}
+              </div>
+            </div>
+            <div className="px-5 py-3.5">
+              <div className="text-xs text-slate-500">Položeno ukupno</div>
+              <div className="mt-0.5 font-mono text-xl font-bold text-emerald-700 tabular-nums">
+                {passedEnrollmentsAll.length}{' '}
+                <span className="text-xs font-normal text-slate-500">
+                  ({earnedEctsTotal} ECTS)
+                </span>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        {/* Attention Banner if an Exam Registration Window is Open & Unanswered */}
+        {openExamStats.unansweredCount > 0 && openExamStats.firstOpenTerm && (
           <div className="bg-white border border-blue-200 rounded-xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
             <div className="flex items-start sm:items-center gap-3 min-w-0">
               <CalendarCheck2 className="w-5 h-5 text-blue-700 shrink-0 mt-0.5 sm:mt-0" />
               <div className="min-w-0">
-                <div className="text-sm font-semibold text-slate-900 tabular-nums">
-                  {openExamStats.unansweredCount > 0
-                    ? `Otvorena je prijava za ${openExamStats.unansweredCount} ${openExamStats.unansweredCount === 1 ? 'ispitni rok' : 'ispitna roka'}`
-                    : `Aktivna prijava ispita (${openExamStats.registeredCount} prijavljeno)`}
+                <div className="text-sm font-semibold text-slate-900">
+                  Otvorena prijava ispita: {openExamStats.firstOpenTerm.courseCode} —{' '}
+                  {openExamStats.firstOpenTerm.title}
                 </div>
-                {openExamStats.firstOpenTerm && (
-                  <p className="text-xs text-slate-600 mt-0.5 truncate">
-                    {openExamStats.firstOpenTerm.courseCode} · {openExamStats.firstOpenTerm.title}{' '}
-                    — rok za prijavu do{' '}
-                    <span className="font-mono font-semibold text-slate-800 tabular-nums">
-                      {formatBosnianDate(openExamStats.firstOpenTerm.registrationCloseDate)}
-                    </span>
-                  </p>
-                )}
+                <p className="text-xs text-slate-600 mt-0.5 font-mono tabular-nums">
+                  Ispit: {formatBosnianDate(openExamStats.firstOpenTerm.examDate)} · Rok za prijavu
+                  do {formatBosnianDate(openExamStats.firstOpenTerm.registrationCloseDate)}
+                </p>
               </div>
             </div>
-
             <Button
               size="sm"
-              onClick={() => onNavigate('ispiti')}
-              className="shrink-0 self-start sm:self-auto"
+              onClick={handleOpenExamRegistrations}
+              className="shrink-0 self-start sm:self-auto whitespace-nowrap"
             >
-              Prijava ispita
+              Prijavi izlazak
               <ArrowRight className="w-3.5 h-3.5" />
             </Button>
           </div>
         )}
 
-        <CourseTabsBar />
-        {renderCourseBreakdown(activeBundle, activeSummary, false)}
+        {/* MAIN 2-COLUMN DASHBOARD SPLIT: B. UPCOMING EVENTS & C. RECENT NOTIFICATIONS */}
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-stretch">
+          {/* B. UPCOMING EVENTS ("Šta slijedi?") */}
+          <section className="lg:col-span-7 bg-white border border-slate-200 rounded-xl overflow-hidden flex flex-col">
+            <div className="px-5 py-4 border-b border-slate-200 flex items-center justify-between gap-2">
+              <div>
+                <h3 className="text-base font-semibold text-slate-900">Nadolazeće obaveze</h3>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Najbliža predavanja, laboratorijske vježbe, ispiti i rokovi predaje
+                </p>
+              </div>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => onNavigate('raspored')}
+                className="text-xs text-blue-700 hover:text-blue-800 whitespace-nowrap shrink-0"
+              >
+                Cijeli kalendar
+                <ArrowRight className="w-3.5 h-3.5" />
+              </Button>
+            </div>
+
+            {upcomingHomeEvents.length === 0 ? (
+              <div className="p-8 text-center flex-1 flex flex-col items-center justify-center">
+                <CalendarClock className="w-7 h-7 text-slate-400 mb-2" />
+                <h4 className="text-sm font-semibold text-slate-900">
+                  Trenutno nema zakazanih nadolazećih obaveza
+                </h4>
+                <p className="text-xs text-slate-500 mt-1 max-w-sm leading-relaxed">
+                  Kada nastavnici unesu sedmični raspored nastave, ispitne rokove ili rokove za
+                  zadaće, najbliže obaveze će se automatski prikazati ovdje.
+                </p>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => onNavigate('raspored')}
+                  className="mt-4"
+                >
+                  Otvori kalendar
+                </Button>
+              </div>
+            ) : (
+              <div className="divide-y divide-slate-100 flex-1">
+                {upcomingHomeEvents.map((ev) => {
+                  const TypeIcon =
+                    ev.eventType === ScheduleEventType.EXAM
+                      ? FileCheck2
+                      : ev.eventType === ScheduleEventType.PROJECT_DEADLINE
+                        ? FolderKanban
+                        : ev.eventType === ScheduleEventType.LAB
+                          ? FlaskConical
+                          : BookOpen;
+
+                  const typeColor =
+                    ev.eventType === ScheduleEventType.EXAM
+                      ? 'text-red-700 font-semibold'
+                      : ev.eventType === ScheduleEventType.PROJECT_DEADLINE
+                        ? 'text-amber-700 font-semibold'
+                        : ev.eventType === ScheduleEventType.LAB
+                          ? 'text-emerald-700 font-medium'
+                          : 'text-blue-700 font-medium';
+
+                  const dayPrefix = getRelativeDayPrefix(ev.date, todayIso);
+
+                  return (
+                    <button
+                      key={`${ev.key}_${ev.date}`}
+                      type="button"
+                      onClick={() => setSelectedHomeEvent(ev)}
+                      className="w-full text-left px-5 py-3.5 flex items-start justify-between gap-4 hover:bg-slate-50/80 transition-colors cursor-pointer"
+                    >
+                      <div className="min-w-0 space-y-0.5">
+                        <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs">
+                          <span className="font-mono font-bold text-slate-900">
+                            {ev.courseCode}
+                          </span>
+                          <span aria-hidden="true" className="text-slate-300">
+                            ·
+                          </span>
+                          <span className={cn('inline-flex items-center gap-1', typeColor)}>
+                            <TypeIcon className="w-3.5 h-3.5 shrink-0" />
+                            {SCHEDULE_TYPE_LABELS_BS[ev.eventType]}
+                          </span>
+                          {ev.location && (
+                            <>
+                              <span aria-hidden="true" className="text-slate-300">
+                                ·
+                              </span>
+                              <span className="text-slate-500 truncate">{ev.location}</span>
+                            </>
+                          )}
+                        </div>
+
+                        <div className="text-sm font-semibold text-slate-900 truncate">
+                          {ev.title}{' '}
+                          <span className="font-normal text-slate-500">— {ev.courseName}</span>
+                        </div>
+                      </div>
+
+                      <div className="text-right shrink-0 font-mono text-xs tabular-nums">
+                        <div
+                          className={cn(
+                            'font-semibold',
+                            ev.date === todayIso ? 'text-blue-700' : 'text-slate-900'
+                          )}
+                        >
+                          {dayPrefix ? `${dayPrefix}, ` : ''}
+                          {formatBosnianDate(ev.date)}
+                        </div>
+                        <div className="text-slate-500 mt-0.5">
+                          {ev.startTime}
+                          {ev.endTime ? `–${ev.endTime}` : ''}
+                        </div>
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </section>
+
+          {/* C. RECENT NOTIFICATIONS ("Šta se promijenilo?") */}
+          <section className="lg:col-span-5 bg-white border border-slate-200 rounded-xl overflow-hidden flex flex-col">
+            <div className="px-5 py-4 border-b border-slate-200 flex items-center justify-between gap-2">
+              <div className="min-w-0">
+                <div className="flex items-center gap-2">
+                  <h3 className="text-base font-semibold text-slate-900 truncate">
+                    Nedavne obavijesti
+                  </h3>
+                  {totalUnreadHomeNotifications > 0 && (
+                    <span className="font-mono text-xs font-bold text-blue-700 tabular-nums shrink-0">
+                      ({totalUnreadHomeNotifications} novo)
+                    </span>
+                  )}
+                </div>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Promjene bodova, rokovi i obavještenja uprave
+                </p>
+              </div>
+
+              <div className="flex items-center gap-2 shrink-0">
+                {totalUnreadHomeNotifications > 0 && (
+                  <button
+                    type="button"
+                    onClick={handleMarkAllHomeNotifsRead}
+                    className="text-xs font-medium text-slate-600 hover:text-slate-900 cursor-pointer whitespace-nowrap"
+                    title="Označi sve obavijesti pročitanim"
+                  >
+                    <CheckCheck className="w-4 h-4" />
+                  </button>
+                )}
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => onNavigate('obavjestenja')}
+                  className="text-xs text-blue-700 hover:text-blue-800 whitespace-nowrap"
+                >
+                  Sve
+                  <ArrowRight className="w-3.5 h-3.5" />
+                </Button>
+              </div>
+            </div>
+
+            {combinedHomeNotifications.length === 0 ? (
+              <div className="p-8 text-center flex-1 flex flex-col items-center justify-center">
+                <Bell className="w-7 h-7 text-slate-400 mb-2" />
+                <h4 className="text-sm font-semibold text-slate-900">
+                  Nema novih obavijesti
+                </h4>
+                <p className="text-xs text-slate-500 mt-1 max-w-xs leading-relaxed">
+                  Ovdje se prikazuju samo stvarna zvanična obavještenja i promjene na vašim
+                  predmetima.
+                </p>
+              </div>
+            ) : (
+              <div className="divide-y divide-slate-100 flex-1">
+                {combinedHomeNotifications.map((item) => (
+                  <button
+                    key={item.key}
+                    type="button"
+                    onClick={() => {
+                      handleMarkHomeNotifRead(item);
+                      setSelectedHomeNotif({ ...item, unread: false });
+                    }}
+                    className={cn(
+                      'w-full text-left px-5 py-3.5 transition-colors cursor-pointer block',
+                      item.unread
+                        ? 'bg-blue-50/45 hover:bg-blue-50/80'
+                        : 'bg-white hover:bg-slate-50/70'
+                    )}
+                  >
+                    <div className="flex items-center justify-between gap-2 text-[11px] text-slate-500">
+                      <div className="flex items-center gap-1.5 min-w-0 truncate">
+                        {item.unread && (
+                          <>
+                            <span className="font-semibold text-blue-700 shrink-0">
+                              Nepročitano
+                            </span>
+                            <span aria-hidden="true">·</span>
+                          </>
+                        )}
+                        <span className="truncate">{item.subtitle}</span>
+                      </div>
+                      <span className="font-mono tabular-nums shrink-0">{item.timeLabel}</span>
+                    </div>
+
+                    <div
+                      className={cn(
+                        'text-sm mt-0.5 truncate',
+                        item.unread ? 'font-bold text-slate-900' : 'font-semibold text-slate-800'
+                      )}
+                    >
+                      {item.title}
+                    </div>
+                    <p className="text-xs text-slate-600 mt-0.5 line-clamp-2 leading-relaxed">
+                      {item.body}
+                    </p>
+                  </button>
+                ))}
+              </div>
+            )}
+          </section>
+        </div>
+
+        {/* D. QUICK OVERVIEW OF ENROLLED COURSES ("Na šta trebam obratiti pažnju?") */}
+        <section className="bg-white border border-slate-200 rounded-xl overflow-hidden">
+          <div className="px-5 py-4 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+            <div>
+              <h3 className="text-base font-semibold text-slate-900">
+                Brzi pregled upisanih predmeta
+              </h3>
+              <p className="text-xs text-slate-500 mt-0.5">
+                Kliknite na predmet za detaljan pregled bodova, prisustva, provjera znanja i
+                aktivnosti
+              </p>
+            </div>
+            <div className="flex items-center gap-2 self-start sm:self-auto">
+              {archivedEnrollments.length > 0 && (
+                <Button variant="ghost" size="sm" onClick={handleOpenArchivedHistory}>
+                  Stari semestri ({archivedEnrollments.length})
+                </Button>
+              )}
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => {
+                  setCoursesSubTab('courses');
+                  setDetailCourseId(null);
+                  onNavigate('predmeti');
+                }}
+              >
+                Svi predmeti
+                <ArrowRight className="w-3.5 h-3.5" />
+              </Button>
+            </div>
+          </div>
+
+          {activeEnrollments.length === 0 ? (
+            <div className="p-8 text-center">
+              <BookOpen className="w-7 h-7 text-slate-400 mx-auto mb-2" />
+              <h4 className="text-sm font-semibold text-slate-900">
+                Nemate aktivnih upisanih predmeta u tekućem semestru
+              </h4>
+              <p className="text-xs text-slate-500 mt-1 max-w-md mx-auto">
+                Studentska služba ili predmetni nastavnik vrši upis na aktivne predmete. Ako imate
+                ranije položene ili arhivirane predmete, možete ih otvoriti u sekciji Moji predmeti.
+              </p>
+              {historicalEnrollments.length > 0 && (
+                <Button size="sm" variant="outline" onClick={handleOpenArchivedHistory} className="mt-4">
+                  <Archive className="w-3.5 h-3.5" />
+                  Pregledaj stare semestre ({historicalEnrollments.length})
+                </Button>
+              )}
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 divide-y md:divide-y-0 gap-0 md:gap-4 md:p-5">
+              {activeEnrollments.map((enr) => {
+                const bundle = bundlesByCourseId[enr.courseId];
+                const crs = bundle?.course;
+                const sum = summariesByCourseId[enr.courseId];
+                const openTermsForCourse = (bundle?.examTerms || []).filter(
+                  (t) => getExamWindowState(t, todayIso).state === 'open'
+                );
+
+                return (
+                  <button
+                    key={enr.id}
+                    type="button"
+                    onClick={() => handleOpenCourseDetails(enr.courseId)}
+                    className="text-left p-5 md:rounded-xl md:border md:border-slate-200 hover:bg-slate-50/80 md:hover:border-blue-300 transition-colors cursor-pointer flex flex-col justify-between gap-4"
+                  >
+                    <div className="space-y-1.5">
+                      <div className="flex items-center justify-between gap-2 text-xs text-slate-500">
+                        <span className="font-mono font-bold text-blue-700">{enr.courseCode}</span>
+                        <span className="font-mono tabular-nums">
+                          {crs ? `${crs.ects} ECTS` : ''}
+                        </span>
+                      </div>
+
+                      <h4 className="text-sm font-bold text-slate-900 leading-snug">
+                        {enr.courseName}
+                      </h4>
+
+                      <div className="text-xs text-slate-500 truncate">
+                        {formatCourseProfessors(crs, enr.leadProfessorName)}
+                      </div>
+                    </div>
+
+                    {sum && (
+                      <div className="space-y-2 pt-1">
+                        <div className="flex items-baseline justify-between gap-2 text-xs">
+                          <span className="text-slate-600">
+                            {sum.studentVisibleFinalGrade !== null ? (
+                              <strong className="text-emerald-700 font-semibold">
+                                Zaključena ocjena {sum.studentVisibleFinalGrade}
+                              </strong>
+                            ) : sum.passedThreshold ? (
+                              <span className="text-emerald-700 font-medium">Ostvaren prag</span>
+                            ) : (
+                              <span>
+                                Još {formatPoints(sum.pointsNeededToPass)} b do praga
+                              </span>
+                            )}
+                          </span>
+                          <span className="font-mono font-bold text-slate-900 tabular-nums">
+                            {formatPoints(sum.totalEarnedPoints)} /{' '}
+                            {formatPoints(sum.maxPossiblePoints)} b
+                          </span>
+                        </div>
+
+                        <Progress
+                          value={sum.percentageAchieved}
+                          indicatorClassName={
+                            sum.passedThreshold ? 'bg-emerald-600' : 'bg-blue-700'
+                          }
+                        />
+
+                        {openTermsForCourse.length > 0 && (
+                          <div className="pt-1 text-[11px] font-medium text-blue-700 flex items-center gap-1">
+                            <CalendarCheck2 className="w-3.5 h-3.5 shrink-0" />
+                            <span>
+                              Otvorena prijava ispita ({openTermsForCourse.length})
+                            </span>
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          )}
+        </section>
+
+        {/* Home Event Details Modal */}
+        <Dialog
+          open={Boolean(selectedHomeEvent)}
+          onOpenChange={(o) => !o && setSelectedHomeEvent(null)}
+          title={selectedHomeEvent?.title || 'Detalji obaveze'}
+          description={
+            selectedHomeEvent
+              ? `${selectedHomeEvent.courseCode} — ${selectedHomeEvent.courseName}`
+              : undefined
+          }
+        >
+          {selectedHomeEvent && (
+            <div className="space-y-4 text-left text-sm">
+              <div className="bg-slate-50 border border-slate-200 rounded-lg p-3.5 space-y-2 text-xs">
+                <div className="flex justify-between gap-2">
+                  <span className="text-slate-500">Vrsta obaveze:</span>
+                  <span className="font-semibold text-slate-900">
+                    {SCHEDULE_TYPE_LABELS_BS[selectedHomeEvent.eventType]}
+                  </span>
+                </div>
+                <div className="flex justify-between gap-2">
+                  <span className="text-slate-500">Datum i vrijeme:</span>
+                  <span className="font-mono font-semibold text-slate-900 tabular-nums">
+                    {DAY_NAMES_BS[getIsoDayOfWeek(selectedHomeEvent.date)]},{' '}
+                    {formatBosnianDate(selectedHomeEvent.date)} u {selectedHomeEvent.startTime}
+                    {selectedHomeEvent.endTime ? `–${selectedHomeEvent.endTime}` : ''}
+                  </span>
+                </div>
+                {selectedHomeEvent.location && (
+                  <div className="flex justify-between gap-2">
+                    <span className="text-slate-500">Lokacija / Sala:</span>
+                    <span className="font-medium text-slate-900">
+                      {selectedHomeEvent.location}
+                    </span>
+                  </div>
+                )}
+              </div>
+
+              {selectedHomeEvent.description && (
+                <p className="text-xs text-slate-600 leading-relaxed">
+                  {selectedHomeEvent.description}
+                </p>
+              )}
+
+              <div className="flex items-center justify-between gap-2 pt-2 border-t border-slate-100">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => {
+                    const cId = selectedHomeEvent.courseId;
+                    setSelectedHomeEvent(null);
+                    handleOpenCourseDetails(cId);
+                  }}
+                >
+                  <ExternalLink className="w-3.5 h-3.5" />
+                  Otvori predmet
+                </Button>
+                <div className="flex items-center gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      setSelectedHomeEvent(null);
+                      onNavigate('raspored');
+                    }}
+                  >
+                    Kalendar
+                  </Button>
+                  <Button size="sm" onClick={() => setSelectedHomeEvent(null)}>
+                    Zatvori
+                  </Button>
+                </div>
+              </div>
+            </div>
+          )}
+        </Dialog>
+
+        {/* Home Notification Reader Modal */}
+        <Dialog
+          open={Boolean(selectedHomeNotif)}
+          onOpenChange={(o) => !o && setSelectedHomeNotif(null)}
+          title={selectedHomeNotif?.title || 'Obavijest'}
+          description={
+            selectedHomeNotif
+              ? `${selectedHomeNotif.subtitle} · ${selectedHomeNotif.timeLabel}`
+              : undefined
+          }
+        >
+          {selectedHomeNotif && (
+            <div className="space-y-4 text-left">
+              <p className="text-sm text-slate-700 leading-relaxed whitespace-pre-line">
+                {selectedHomeNotif.body}
+              </p>
+
+              <div className="pt-3 border-t border-slate-100 flex items-center justify-between gap-2">
+                {selectedHomeNotif.kind === 'smart' &&
+                selectedHomeNotif.smartItem &&
+                onSelectNotification ? (
+                  <Button
+                    size="sm"
+                    onClick={() => {
+                      const target = selectedHomeNotif.smartItem!;
+                      setSelectedHomeNotif(null);
+                      onSelectNotification(target);
+                    }}
+                  >
+                    <ExternalLink className="w-3.5 h-3.5" />
+                    Otvori vezanu stranicu
+                  </Button>
+                ) : (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      setSelectedHomeNotif(null);
+                      onNavigate('obavjestenja');
+                    }}
+                  >
+                    <Megaphone className="w-3.5 h-3.5" />
+                    Sva obavještenja
+                  </Button>
+                )}
+
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => setSelectedHomeNotif(null)}
+                >
+                  Zatvori
+                </Button>
+              </div>
+            </div>
+          )}
+        </Dialog>
       </div>
     );
   }
 
   // =========================================================================
-  // VIEW 2: SVI PREDMETI (Active Semester Courses + Quick Link to Archive)
+  // ROUTE: CONSOLIDATED COURSES HUB ("Moji predmeti")
+  // Sub-tabs:
+  //   1. Aktivni predmeti (+ full Course Details view when a course is selected)
+  //   2. Prijava ispita
+  //   3. Stari semestri (+ full archived Course Details inspection)
   // =========================================================================
-  if (activeNav === 'predmeti') {
-    const filteredEnrollments = activeEnrollments
-      .filter((enr) => {
-        const crs = bundlesByCourseId[enr.courseId]?.course;
-        if (programFilter !== 'all') {
-          const cycle = getCourseProgramCycle(
-            crs || { code: enr.courseCode, semester: '', studyProgram: undefined }
-          );
-          if (cycle !== programFilter) return false;
-        }
-        const q = courseSearch.trim().toLowerCase();
-        if (!q) return true;
-        return (
-          enr.courseName.toLowerCase().includes(q) ||
-          enr.courseCode.toLowerCase().includes(q) ||
-          (crs?.studyProgram || '').toLowerCase().includes(q) ||
-          (crs?.semester || '').toLowerCase().includes(q) ||
-          formatCourseProfessors(crs, enr.leadProfessorName).toLowerCase().includes(q) ||
-          formatCourseAssistants(crs).toLowerCase().includes(q)
+  const activeDetailBundle = detailCourseId ? bundlesByCourseId[detailCourseId] : undefined;
+  const activeDetailSummary = detailCourseId ? summariesByCourseId[detailCourseId] : undefined;
+
+  const avgFinalGrade =
+    passedEnrollmentsAll.length > 0
+      ? passedEnrollmentsAll.reduce(
+          (acc, enr) =>
+            acc + (summariesByCourseId[enr.courseId]?.studentVisibleFinalGrade ?? 0),
+          0
+        ) / passedEnrollmentsAll.length
+      : 0;
+
+  const distinctHistoryYears = Array.from(
+    new Set(
+      historicalEnrollments
+        .map((e) => bundlesByCourseId[e.courseId]?.course.academicYear || e.academicYear)
+        .filter(Boolean)
+    )
+  ).sort((a, b) => b.localeCompare(a));
+
+  const visibleHistory = historicalEnrollments.filter((enr) => {
+    const crs = bundlesByCourseId[enr.courseId]?.course;
+    const isArch = Boolean(enr.isArchived || crs?.isArchived);
+    const g = summariesByCourseId[enr.courseId]?.studentVisibleFinalGrade;
+    const isPassed = g !== null && g !== undefined && g >= 6;
+    const yearStr = crs?.academicYear || enr.academicYear;
+
+    if (historyFilter === 'archived' && !isArch) return false;
+    if (historyFilter === 'passed' && !isPassed) return false;
+    if (historyYearFilter !== 'all' && yearStr !== historyYearFilter) return false;
+    return true;
+  });
+
+  const filteredActiveEnrollments = activeEnrollments
+    .filter((enr) => {
+      const crs = bundlesByCourseId[enr.courseId]?.course;
+      if (programFilter !== 'all') {
+        const cycle = getCourseProgramCycle(
+          crs || { code: enr.courseCode, semester: '', studyProgram: undefined }
         );
-      })
-      .sort((a, b) => {
-        const sumA = summariesByCourseId[a.courseId];
-        const sumB = summariesByCourseId[b.courseId];
-        if (courseSortBy === 'points') {
-          return (sumB?.totalEarnedPoints ?? 0) - (sumA?.totalEarnedPoints ?? 0);
-        }
-        if (courseSortBy === 'pct') {
-          return (sumB?.percentageAchieved ?? 0) - (sumA?.percentageAchieved ?? 0);
-        }
-        return a.courseName.localeCompare(b.courseName, 'bs');
-      });
+        if (cycle !== programFilter) return false;
+      }
+      const q = courseSearch.trim().toLowerCase();
+      if (!q) return true;
+      return (
+        enr.courseName.toLowerCase().includes(q) ||
+        enr.courseCode.toLowerCase().includes(q) ||
+        (crs?.studyProgram || '').toLowerCase().includes(q) ||
+        (crs?.semester || '').toLowerCase().includes(q) ||
+        formatCourseProfessors(crs, enr.leadProfessorName).toLowerCase().includes(q) ||
+        formatCourseAssistants(crs).toLowerCase().includes(q)
+      );
+    })
+    .sort((a, b) => {
+      const sumA = summariesByCourseId[a.courseId];
+      const sumB = summariesByCourseId[b.courseId];
+      if (courseSortBy === 'points') {
+        return (sumB?.totalEarnedPoints ?? 0) - (sumA?.totalEarnedPoints ?? 0);
+      }
+      if (courseSortBy === 'pct') {
+        return (sumB?.percentageAchieved ?? 0) - (sumA?.percentageAchieved ?? 0);
+      }
+      return a.courseName.localeCompare(b.courseName, 'bs');
+    });
 
-    return (
-      <div className="space-y-4">
-        <div className="bg-white border border-slate-200 rounded-xl p-4 flex flex-col lg:flex-row lg:items-center justify-between gap-3">
-          <div className="flex flex-col sm:flex-row sm:items-center gap-3 flex-1">
-            <div className="relative flex-1 max-w-sm">
-              <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
-              <Input
-                value={courseSearch}
-                onChange={(e) => setCourseSearch(e.target.value)}
-                placeholder="Pretraži predmete, smjerove ili osoblje..."
-                className="pl-9"
-              />
-            </div>
+  const selectedHistBundle = selectedHistoryCourseId
+    ? bundlesByCourseId[selectedHistoryCourseId]
+    : undefined;
+  const selectedHistSummary = selectedHistoryCourseId
+    ? summariesByCourseId[selectedHistoryCourseId]
+    : undefined;
 
-            <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-lg overflow-x-auto max-w-full">
-              {(
-                [
-                  { key: 'all', label: 'Svi programi' },
-                  { key: 'strucni_rs', label: 'Stručni RS (2 god.)' },
-                  { key: 'bachelor', label: 'Bachelor' },
-                  { key: 'master', label: 'Master smjerovi' },
-                ] as const
-              ).map((tab) => (
-                <button
-                  key={tab.key}
-                  type="button"
-                  onClick={() => setProgramFilter(tab.key)}
-                  className={cn(
-                    'px-2.5 py-1 text-xs font-medium rounded-md transition-colors cursor-pointer whitespace-nowrap shrink-0',
-                    programFilter === tab.key
-                      ? 'bg-white text-slate-900 shadow-xs'
-                      : 'text-slate-600 hover:text-slate-900'
-                  )}
-                >
-                  {tab.label}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          <div className="flex flex-wrap items-center gap-2 text-xs shrink-0">
-            <ArrowUpDown className="w-3.5 h-3.5 text-slate-400" />
-            <span className="text-slate-600">Sortiraj po:</span>
-            <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-lg">
-              {[
-                { key: 'name', label: 'Nazivu' },
-                { key: 'points', label: 'Bodovima' },
-                { key: 'pct', label: 'Procentu' },
-              ].map((opt) => (
-                <button
-                  key={opt.key}
-                  type="button"
-                  onClick={() => setCourseSortBy(opt.key as 'name' | 'points' | 'pct')}
-                  className={cn(
-                    'px-2.5 py-1 rounded-md font-medium transition-colors cursor-pointer whitespace-nowrap shrink-0',
-                    courseSortBy === opt.key
-                      ? 'bg-white text-slate-900 shadow-xs'
-                      : 'text-slate-600 hover:text-slate-900'
-                  )}
-                >
-                  {opt.label}
-                </button>
-              ))}
-            </div>
-
-            {archivedEnrollments.length > 0 && (
-              <Button variant="outline" size="sm" onClick={() => onNavigate('semestri')}>
-                <Archive className="w-3.5 h-3.5" />
-                Stari semestri ({archivedEnrollments.length})
-              </Button>
+  return (
+    <div className="space-y-5">
+      {/* Top Sub-Navigation Bar for Courses, Exam Registration, and Past Semesters */}
+      <div className="bg-white border border-slate-200 rounded-xl p-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+        <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-lg overflow-x-auto max-w-full">
+          <button
+            type="button"
+            onClick={() => {
+              setCoursesSubTab('courses');
+              setDetailCourseId(null);
+            }}
+            className={cn(
+              'inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-md transition-colors cursor-pointer whitespace-nowrap shrink-0 tabular-nums',
+              coursesSubTab === 'courses'
+                ? 'bg-slate-900 text-white'
+                : 'text-slate-700 hover:text-slate-900'
             )}
-          </div>
+          >
+            <BookOpen className="w-3.5 h-3.5 shrink-0" />
+            Aktivni predmeti ({activeEnrollments.length})
+          </button>
+
+          <button
+            type="button"
+            onClick={() => {
+              setCoursesSubTab('exams');
+              setDetailCourseId(null);
+            }}
+            className={cn(
+              'inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-md transition-colors cursor-pointer whitespace-nowrap shrink-0 tabular-nums',
+              coursesSubTab === 'exams'
+                ? 'bg-slate-900 text-white'
+                : 'text-slate-700 hover:text-slate-900'
+            )}
+          >
+            <FileCheck2 className="w-3.5 h-3.5 shrink-0" />
+            Prijava ispita
+            {openExamStats.openCount > 0 ? ` (${openExamStats.openCount} otvoreno)` : ''}
+          </button>
+
+          <button
+            type="button"
+            onClick={() => {
+              setCoursesSubTab('history');
+              setDetailCourseId(null);
+            }}
+            className={cn(
+              'inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-md transition-colors cursor-pointer whitespace-nowrap shrink-0 tabular-nums',
+              coursesSubTab === 'history'
+                ? 'bg-slate-900 text-white'
+                : 'text-slate-700 hover:text-slate-900'
+            )}
+          >
+            <Archive className="w-3.5 h-3.5 shrink-0" />
+            Stari semestri ({historicalEnrollments.length})
+          </button>
         </div>
 
-        <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
-          {filteredEnrollments.length === 0 ? (
-            <div className="p-8 text-center text-sm text-slate-500">
-              Nema upisanih predmeta u tekućem semestru za izabrani kriterij pretrage.
-            </div>
-          ) : (
-            <div className="overflow-x-auto">
-              <table className="w-full text-sm border-collapse">
-                <thead>
-                  <tr className="bg-slate-50 border-b border-slate-200 text-xs font-semibold text-slate-600">
-                    <th className="text-left py-3 px-4">Predmet</th>
-                    <th className="text-left py-3 px-4">Profesori i asistenti</th>
-                    <th className="text-right py-3 px-4 whitespace-nowrap">Osvojeno</th>
-                    <th className="text-right py-3 px-4 whitespace-nowrap">Maksimalno</th>
-                    <th className="text-right py-3 px-4 whitespace-nowrap">Ostvareno</th>
-                    <th className="text-left py-3 px-4 whitespace-nowrap">Status / Ocjena</th>
-                    <th className="text-right py-3 px-4">Akcija</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-100">
-                  {filteredEnrollments.map((enr) => {
-                    const sum = summariesByCourseId[enr.courseId];
-                    const bundle = bundlesByCourseId[enr.courseId];
-                    const crs = bundle?.course;
-                    const assistantsStr = formatCourseAssistants(crs);
-                    return (
-                      <tr key={enr.id} className="hover:bg-slate-50/80 transition-colors">
-                        <td className="py-3 px-4">
-                          <div className="font-semibold text-slate-900">{enr.courseName}</div>
-                          <div className="text-xs text-slate-500 mt-0.5 flex flex-wrap items-center gap-x-1.5 gap-y-0.5">
-                            <span className="font-mono text-blue-700">{enr.courseCode}</span>
-                            {bundle && (
-                              <>
-                                <span aria-hidden="true">·</span>
-                                <span className="font-mono tabular-nums">
-                                  {bundle.course.ects} ECTS
-                                </span>
-                              </>
-                            )}
-                            {crs?.studyProgram && (
-                              <>
-                                <span aria-hidden="true">·</span>
-                                <span>{crs.studyProgram}</span>
-                              </>
-                            )}
-                          </div>
-                        </td>
-                        <td className="py-3 px-4">
-                          <div className="text-xs text-slate-800">
-                            <span className="text-slate-500">
-                              {getCourseProfessors(crs, enr.leadProfessorName).length > 1
-                                ? 'Profesori: '
-                                : 'Profesor: '}
-                            </span>
-                            <span className="font-medium">
-                              {formatCourseProfessors(crs, enr.leadProfessorName)}
-                            </span>
-                          </div>
-                          {assistantsStr && (
-                            <div className="text-xs text-slate-500 mt-0.5">
-                              <span>Asistenti: </span>
-                              <span className="text-slate-700">{assistantsStr}</span>
-                            </div>
-                          )}
-                        </td>
-                        <td className="py-3 px-4 text-right font-mono font-semibold text-slate-900 tabular-nums">
-                          {sum ? formatPoints(sum.totalEarnedPoints) : '—'}
-                        </td>
-                        <td className="py-3 px-4 text-right font-mono text-slate-500 tabular-nums">
-                          {sum ? formatPoints(sum.maxPossiblePoints) : '—'}
-                        </td>
-                        <td className="py-3 px-4 text-right font-mono text-slate-700 tabular-nums">
-                          {sum ? `${sum.percentageAchieved}%` : '—'}
-                        </td>
-                        <td className="py-3 px-4 text-xs">
-                          {sum?.studentVisibleFinalGrade !== null && sum !== undefined ? (
-                            <span className="inline-flex items-center gap-1.5 text-emerald-700 font-semibold font-mono tabular-nums">
-                              <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
-                              Zaključena ocjena: {sum.studentVisibleFinalGrade}
-                            </span>
-                          ) : sum?.passedThreshold ? (
-                            <span className="text-blue-700 font-medium">Ostvaren prag · U toku</span>
-                          ) : (
-                            <span className="text-slate-500">Nastava u toku</span>
-                          )}
-                        </td>
-                        <td className="py-3 px-4 text-right whitespace-nowrap">
-                          <Button
-                            variant="outline"
-                            size="sm"
-                            onClick={() => {
-                              setSelectedCourseId(enr.courseId);
-                              onNavigate('pocetna');
-                            }}
-                          >
-                            Detalji bodova
-                          </Button>
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
+        <div className="hidden md:flex items-center gap-2 text-xs text-slate-500 font-mono tabular-nums px-2">
+          <span>Ostvareno: {earnedEctsTotal} ECTS</span>
+          {passedEnrollmentsAll.length > 0 && (
+            <>
+              <span aria-hidden="true">·</span>
+              <span>Prosjek: {avgFinalGrade.toFixed(2)}</span>
+            </>
           )}
         </div>
       </div>
-    );
-  }
 
-  // =========================================================================
-  // VIEW 3: PRISUSTVO
-  // =========================================================================
-  if (activeNav === 'prisustvo') {
-    const att = activeSummary?.attendance;
-    return (
-      <div className="space-y-5">
-        <CourseTabsBar />
-
-        {!activeBundle?.course.attendanceEnabled ? (
-          <div className="bg-white border border-slate-200 rounded-xl p-6 text-center">
-            <Info className="w-7 h-7 text-slate-400 mx-auto mb-2" />
-            <h3 className="text-sm font-semibold text-slate-900">
-              Praćenje prisustva nije aktivno na ovom predmetu
-            </h3>
-            <p className="text-xs text-slate-500 mt-1">
-              Nastavnik je isključio bodovanje prisustva za predmet {activeBundle?.course.name}.
-            </p>
-          </div>
-        ) : (
-          att && (
-            <>
-              <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
-                <div className="grid grid-cols-2 sm:grid-cols-4 divide-y sm:divide-y-0 sm:divide-x divide-slate-200">
-                  <div className="p-4 sm:p-5">
-                    <div className="text-xs text-slate-500">Bodovi za prisustvo</div>
-                    <div className="mt-1 font-mono text-2xl font-bold text-slate-900 tabular-nums">
-                      {formatPoints(att.earnedPoints)} / {formatPoints(att.maxPoints)}
-                    </div>
-                    <div className="text-[11px] text-slate-500 mt-1 font-mono tabular-nums">
-                      {att.maxPoints} × {att.attendedCount} / {att.heldCount || 0}
-                    </div>
+      {/* =====================================================================
+          SUB-TAB 1: ACTIVE COURSES & COURSE DETAILS PAGE
+          ===================================================================== */}
+      {coursesSubTab === 'courses' && (
+        <>
+          {detailCourseId && activeDetailBundle && activeDetailSummary && profile ? (
+            <StudentCourseDetailsView
+              course={activeDetailBundle.course}
+              summary={activeDetailSummary}
+              studentProfile={profile}
+              courseExamTerms={activeDetailBundle.examTerms}
+              examRegistrations={examRegistrations}
+              siblingEnrollments={activeEnrollments}
+              onSelectCourse={(nextId) => setDetailCourseId(nextId)}
+              onBackToList={() => setDetailCourseId(null)}
+              onOpenAllExams={() => {
+                setDetailCourseId(null);
+                setCoursesSubTab('exams');
+              }}
+            />
+          ) : activeEnrollments.length === 0 ? (
+            <div className="bg-white border border-slate-200 rounded-xl p-8 text-center max-w-xl mx-auto">
+              <BookOpen className="w-8 h-8 text-slate-400 mx-auto mb-3" />
+              <h3 className="text-base font-semibold text-slate-900">
+                Trenutno nemate aktivnih predmeta u tekućem semestru
+              </h3>
+              <p className="text-sm text-slate-600 mt-1.5 leading-relaxed">
+                Studentska služba (administrator) ili predmetni nastavnik vrši upis na predmete
+                prema vašem broju indeksa.
+              </p>
+              {historicalEnrollments.length > 0 && (
+                <Button
+                  className="mt-4"
+                  variant="outline"
+                  onClick={() => setCoursesSubTab('history')}
+                >
+                  <Archive className="w-4 h-4" />
+                  Pregledaj stare semestre ({historicalEnrollments.length})
+                </Button>
+              )}
+            </div>
+          ) : (
+            <div className="space-y-4">
+              {/* Filter & Sort Toolbar */}
+              <div className="bg-white border border-slate-200 rounded-xl p-4 flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+                <div className="flex flex-col sm:flex-row sm:items-center gap-3 flex-1">
+                  <div className="relative flex-1 max-w-sm">
+                    <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                    <Input
+                      value={courseSearch}
+                      onChange={(e) => setCourseSearch(e.target.value)}
+                      placeholder="Pretraži predmete, smjerove ili osoblje..."
+                      className="pl-9"
+                    />
                   </div>
 
-                  <div className="p-4 sm:p-5">
-                    <div className="text-xs text-slate-500">Procenat prisustva</div>
-                    <div
-                      className={cn(
-                        'mt-1 font-mono text-2xl font-bold tabular-nums',
-                        (att.percentage ?? 0) >= 70 ? 'text-emerald-700' : 'text-red-700'
-                      )}
-                    >
-                      {att.percentage ?? 0}%
-                    </div>
-                    <div className="text-[11px] text-slate-500 mt-1 tabular-nums">
-                      Od ukupno {att.heldCount} održanih termina
-                    </div>
+                  <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-lg overflow-x-auto max-w-full">
+                    {(
+                      [
+                        { key: 'all', label: 'Svi programi' },
+                        { key: 'strucni_rs', label: 'Stručni RS (2 god.)' },
+                        { key: 'bachelor', label: 'Bachelor' },
+                        { key: 'master', label: 'Master smjerovi' },
+                      ] as const
+                    ).map((tab) => (
+                      <button
+                        key={tab.key}
+                        type="button"
+                        onClick={() => setProgramFilter(tab.key)}
+                        className={cn(
+                          'px-2.5 py-1 text-xs font-medium rounded-md transition-colors cursor-pointer whitespace-nowrap shrink-0',
+                          programFilter === tab.key
+                            ? 'bg-white text-slate-900 shadow-xs'
+                            : 'text-slate-600 hover:text-slate-900'
+                        )}
+                      >
+                        {tab.label}
+                      </button>
+                    ))}
                   </div>
+                </div>
 
-                  <div className="p-4 sm:p-5">
-                    <div className="text-xs text-slate-500">Prisustvovao termina</div>
-                    <div className="mt-1 font-mono text-2xl font-bold text-emerald-700 tabular-nums">
-                      {att.attendedCount}
-                    </div>
-                    <div className="text-[11px] text-slate-500 mt-1">Evidentirano prisustvo</div>
-                  </div>
-
-                  <div className="p-4 sm:p-5">
-                    <div className="text-xs text-slate-500">Broj izostanaka</div>
-                    <div
-                      className={cn(
-                        'mt-1 font-mono text-2xl font-bold tabular-nums',
-                        att.absentCount > 0 ? 'text-red-700' : 'text-slate-900'
-                      )}
-                    >
-                      {att.absentCount}
-                    </div>
-                    <div className="text-[11px] text-slate-500 mt-1">
-                      Budući i otkazani se ne odbijaju
-                    </div>
+                <div className="flex flex-wrap items-center gap-2 text-xs shrink-0">
+                  <ArrowUpDown className="w-3.5 h-3.5 text-slate-400" />
+                  <span className="text-slate-600">Sortiraj po:</span>
+                  <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-lg">
+                    {[
+                      { key: 'name', label: 'Nazivu' },
+                      { key: 'points', label: 'Bodovima' },
+                      { key: 'pct', label: 'Procentu' },
+                    ].map((opt) => (
+                      <button
+                        key={opt.key}
+                        type="button"
+                        onClick={() => setCourseSortBy(opt.key as 'name' | 'points' | 'pct')}
+                        className={cn(
+                          'px-2.5 py-1 rounded-md font-medium transition-colors cursor-pointer whitespace-nowrap shrink-0',
+                          courseSortBy === opt.key
+                            ? 'bg-white text-slate-900 shadow-xs'
+                            : 'text-slate-600 hover:text-slate-900'
+                        )}
+                      >
+                        {opt.label}
+                      </button>
+                    ))}
                   </div>
                 </div>
               </div>
 
+              {/* Active Enrolled Courses Table */}
               <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
-                <div className="px-5 py-4 border-b border-slate-200">
-                  <h3 className="text-sm font-semibold text-slate-900">
-                    Evidencija termina po datumima
-                  </h3>
-                </div>
-
-                {att.sessions.length === 0 ? (
+                {filteredActiveEnrollments.length === 0 ? (
                   <div className="p-8 text-center text-sm text-slate-500">
-                    Nastavnik još nije kreirao nijedan termin prisustva za ovaj predmet.
+                    Nema upisanih predmeta za izabrani kriterij pretrage.
                   </div>
                 ) : (
                   <div className="overflow-x-auto">
                     <table className="w-full text-sm border-collapse">
                       <thead>
                         <tr className="bg-slate-50 border-b border-slate-200 text-xs font-semibold text-slate-600">
-                          <th className="text-left py-2.5 px-4">Datum i vrijeme</th>
-                          <th className="text-left py-2.5 px-4">Tema / Opis termina</th>
-                          <th className="text-left py-2.5 px-4">Status</th>
-                          <th className="text-left py-2.5 px-4">Napomena</th>
+                          <th className="text-left py-3 px-4">Predmet</th>
+                          <th className="text-left py-3 px-4">Nastavno osoblje</th>
+                          <th className="text-right py-3 px-4 whitespace-nowrap">Osvojeno</th>
+                          <th className="text-right py-3 px-4 whitespace-nowrap">Preostalo</th>
+                          <th className="text-left py-3 px-4 whitespace-nowrap">Status / Ocjena</th>
+                          <th className="text-right py-3 px-4">Detalji</th>
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-slate-100">
-                        {att.sessions.map((row) => (
-                          <tr key={row.session.id} className="hover:bg-slate-50/70">
-                            <td className="py-2.5 px-4 whitespace-nowrap">
-                              <div className="font-mono font-medium text-slate-900 tabular-nums">
-                                {formatBosnianDate(row.session.date)}
-                              </div>
-                              {row.session.time && (
-                                <div className="text-xs text-slate-500 font-mono tabular-nums">
-                                  {row.session.time}
+                        {filteredActiveEnrollments.map((enr) => {
+                          const sum = summariesByCourseId[enr.courseId];
+                          const bundle = bundlesByCourseId[enr.courseId];
+                          const crs = bundle?.course;
+                          const assistantsStr = formatCourseAssistants(crs);
+                          return (
+                            <tr
+                              key={enr.id}
+                              onClick={() => setDetailCourseId(enr.courseId)}
+                              className="hover:bg-slate-50/80 transition-colors cursor-pointer"
+                            >
+                              <td className="py-3.5 px-4">
+                                <div className="font-semibold text-slate-900">{enr.courseName}</div>
+                                <div className="text-xs text-slate-500 mt-0.5 flex flex-wrap items-center gap-x-1.5 gap-y-0.5">
+                                  <span className="font-mono font-semibold text-blue-700">
+                                    {enr.courseCode}
+                                  </span>
+                                  {crs && (
+                                    <>
+                                      <span aria-hidden="true">·</span>
+                                      <span className="font-mono tabular-nums">
+                                        {crs.ects} ECTS
+                                      </span>
+                                    </>
+                                  )}
+                                  {crs?.studyProgram && (
+                                    <>
+                                      <span aria-hidden="true">·</span>
+                                      <span>{crs.studyProgram}</span>
+                                    </>
+                                  )}
                                 </div>
-                              )}
-                            </td>
-                            <td className="py-2.5 px-4 text-slate-800">
-                              {row.session.topic || 'Redovni termin nastave'}
-                            </td>
-                            <td className="py-2.5 px-4 whitespace-nowrap text-xs font-medium">
-                              {row.state === 'present' && (
-                                <span className="inline-flex items-center gap-1.5 text-emerald-700">
-                                  <CheckCircle2 className="w-4 h-4 shrink-0" />
-                                  Prisutan
-                                </span>
-                              )}
-                              {row.state === 'absent' && (
-                                <span className="inline-flex items-center gap-1.5 text-red-700">
-                                  <XCircle className="w-4 h-4 shrink-0" />
-                                  Odsutan
-                                </span>
-                              )}
-                              {row.state === 'cancelled' && (
-                                <span className="inline-flex items-center gap-1.5 text-slate-500">
-                                  <MinusCircle className="w-4 h-4 shrink-0" />
-                                  Otkazan termin (ne ulazi u obračun)
-                                </span>
-                              )}
-                              {row.state === 'future' && (
-                                <span className="inline-flex items-center gap-1.5 text-blue-700">
-                                  <Clock className="w-4 h-4 shrink-0" />
-                                  Budući termin (ne oduzima bodove)
-                                </span>
-                              )}
-                              {row.state === 'unrecorded' && (
-                                <span className="text-slate-400">Čeka evidenciju</span>
-                              )}
-                            </td>
-                            <td className="py-2.5 px-4 text-xs text-slate-500">
-                              {row.note || '—'}
-                            </td>
-                          </tr>
-                        ))}
+                              </td>
+
+                              <td className="py-3.5 px-4">
+                                <div className="text-xs text-slate-800">
+                                  <span className="text-slate-500">
+                                    {getCourseProfessors(crs, enr.leadProfessorName).length > 1
+                                      ? 'Profesori: '
+                                      : 'Profesor: '}
+                                  </span>
+                                  <span className="font-medium">
+                                    {formatCourseProfessors(crs, enr.leadProfessorName)}
+                                  </span>
+                                </div>
+                                {assistantsStr && (
+                                  <div className="text-xs text-slate-500 mt-0.5">
+                                    Asistenti: <span className="text-slate-700">{assistantsStr}</span>
+                                  </div>
+                                )}
+                              </td>
+
+                              <td className="py-3.5 px-4 text-right font-mono tabular-nums whitespace-nowrap">
+                                {sum ? (
+                                  <div>
+                                    <span className="font-bold text-slate-900">
+                                      {formatPoints(sum.totalEarnedPoints)}
+                                    </span>{' '}
+                                    <span className="text-xs text-slate-500">
+                                      / {formatPoints(sum.maxPossiblePoints)} b
+                                    </span>
+                                  </div>
+                                ) : (
+                                  '—'
+                                )}
+                              </td>
+
+                              <td className="py-3.5 px-4 text-right font-mono text-xs text-slate-600 tabular-nums whitespace-nowrap">
+                                {sum ? `${formatPoints(sum.remainingAvailablePoints)} b` : '—'}
+                              </td>
+
+                              <td className="py-3.5 px-4 text-xs whitespace-nowrap">
+                                {sum?.studentVisibleFinalGrade !== null && sum !== undefined ? (
+                                  <span className="inline-flex items-center gap-1.5 text-emerald-700 font-semibold font-mono tabular-nums">
+                                    <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+                                    Ocjena {sum.studentVisibleFinalGrade}
+                                  </span>
+                                ) : sum?.passedThreshold ? (
+                                  <span className="text-emerald-700 font-medium">
+                                    Ostvaren prag · U toku
+                                  </span>
+                                ) : (
+                                  <span className="text-slate-500">Nastava u toku</span>
+                                )}
+                              </td>
+
+                              <td className="py-3.5 px-4 text-right whitespace-nowrap">
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    setDetailCourseId(enr.courseId);
+                                  }}
+                                >
+                                  Otvori predmet
+                                </Button>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+        </>
+      )}
+
+      {/* =====================================================================
+          SUB-TAB 2: EXAM REGISTRATION ("Prijava ispita")
+          ===================================================================== */}
+      {coursesSubTab === 'exams' && profile && (
+        <StudentExamsView
+          studentProfile={profile}
+          examTerms={activeExamTerms}
+          examRegistrations={examRegistrations}
+          coursesById={activeCoursesById}
+        />
+      )}
+
+      {/* =====================================================================
+          SUB-TAB 3: ARCHIVED SEMESTERS & PASSED COURSES ("Stari semestri")
+          ===================================================================== */}
+      {coursesSubTab === 'history' && (
+        <div className="space-y-6">
+          {selectedHistoryCourseId && selectedHistBundle && selectedHistSummary && profile ? (
+            <StudentCourseDetailsView
+              course={selectedHistBundle.course}
+              summary={selectedHistSummary}
+              studentProfile={profile}
+              siblingEnrollments={visibleHistory}
+              onSelectCourse={(nextId) => setSelectedHistoryCourseId(nextId)}
+              onBackToList={() => setSelectedHistoryCourseId(null)}
+              isArchivedView={true}
+            />
+          ) : (
+            <>
+              {/* Historical KPI Strip */}
+              <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
+                <div className="grid grid-cols-2 lg:grid-cols-4 divide-y lg:divide-y-0 sm:divide-x divide-slate-200">
+                  <div className="p-4 sm:p-5">
+                    <div className="text-xs text-slate-500">Arhivirani predmeti</div>
+                    <div className="mt-1 font-mono text-2xl font-bold text-slate-900 tabular-nums">
+                      {archivedEnrollments.length}
+                    </div>
+                    <div className="text-[11px] text-slate-500 mt-0.5">Stari semestri u dosjeu</div>
+                  </div>
+
+                  <div className="p-4 sm:p-5">
+                    <div className="text-xs text-slate-500">Ukupno položeno predmeta</div>
+                    <div className="mt-1 font-mono text-2xl font-bold text-emerald-700 tabular-nums">
+                      {passedEnrollmentsAll.length}
+                    </div>
+                    <div className="text-[11px] text-slate-500 mt-0.5">
+                      Sa zaključenom ocjenom ≥ 6
+                    </div>
+                  </div>
+
+                  <div className="p-4 sm:p-5">
+                    <div className="text-xs text-slate-500">Ostvareno ECTS kredita</div>
+                    <div className="mt-1 font-mono text-2xl font-bold text-blue-700 tabular-nums">
+                      {earnedEctsTotal} ECTS
+                    </div>
+                    <div className="text-[11px] text-slate-500 mt-0.5">Zbir položenih predmeta</div>
+                  </div>
+
+                  <div className="p-4 sm:p-5">
+                    <div className="text-xs text-slate-500">Prosjek zaključenih ocjena</div>
+                    <div className="mt-1 font-mono text-2xl font-bold text-slate-900 tabular-nums">
+                      {passedEnrollmentsAll.length > 0 ? avgFinalGrade.toFixed(2) : '—'}
+                    </div>
+                    <div className="text-[11px] text-slate-500 mt-0.5">
+                      Na osnovu položenih ispita
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Filter Bar */}
+              <div className="bg-white border border-slate-200 rounded-xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <div className="flex flex-wrap items-center gap-1 p-1 bg-slate-100 rounded-lg">
+                  {[
+                    {
+                      key: 'all_history',
+                      label: `Sva historija (${historicalEnrollments.length})`,
+                    },
+                    {
+                      key: 'archived',
+                      label: `Arhivirani semestri (${archivedEnrollments.length})`,
+                    },
+                    { key: 'passed', label: `Položeni predmeti (${passedEnrollmentsAll.length})` },
+                  ].map((tab) => (
+                    <button
+                      key={tab.key}
+                      type="button"
+                      onClick={() =>
+                        setHistoryFilter(tab.key as 'archived' | 'passed' | 'all_history')
+                      }
+                      className={cn(
+                        'px-3 py-1.5 text-xs font-medium rounded-md transition-colors cursor-pointer whitespace-nowrap shrink-0 tabular-nums',
+                        historyFilter === tab.key
+                          ? 'bg-white text-slate-900 shadow-xs'
+                          : 'text-slate-600 hover:text-slate-900'
+                      )}
+                    >
+                      {tab.label}
+                    </button>
+                  ))}
+                </div>
+
+                {distinctHistoryYears.length > 0 && (
+                  <div className="flex items-center gap-2 text-xs">
+                    <span className="text-slate-500 whitespace-nowrap">Akademska godina:</span>
+                    <select
+                      value={historyYearFilter}
+                      onChange={(e) => setHistoryYearFilter(e.target.value)}
+                      className="h-8 rounded-lg border border-slate-300 bg-white px-2.5 font-mono text-xs text-slate-800 tabular-nums"
+                    >
+                      <option value="all">Sve godine</option>
+                      {distinctHistoryYears.map((yr) => (
+                        <option key={yr} value={yr}>
+                          {yr}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+              </div>
+
+              {/* Historical Courses Table */}
+              <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
+                {visibleHistory.length === 0 ? (
+                  <div className="p-8 text-center">
+                    <Archive className="w-7 h-7 text-slate-400 mx-auto mb-2" />
+                    <h3 className="text-sm font-semibold text-slate-900">
+                      Nema arhiviranih semestara ili položenih predmeta za izabrani filter
+                    </h3>
+                    <p className="text-xs text-slate-500 mt-1 max-w-md mx-auto leading-relaxed">
+                      Kada uprava fakulteta arhivira završeni semestar ili nastavnik zaključi
+                      prolaznu ocjenu, cjelokupna evidencija predmeta trajno ostaje dostupna ovdje.
+                    </p>
+                  </div>
+                ) : (
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-sm border-collapse">
+                      <thead>
+                        <tr className="bg-slate-50 border-b border-slate-200 text-xs font-semibold text-slate-600">
+                          <th className="text-left py-3 px-4">Predmet</th>
+                          <th className="text-left py-3 px-4 whitespace-nowrap">
+                            Godina i semestar
+                          </th>
+                          <th className="text-left py-3 px-4">Nastavnik</th>
+                          <th className="text-right py-3 px-4 whitespace-nowrap">Bodovi</th>
+                          <th className="text-left py-3 px-4 whitespace-nowrap">Konačna ocjena</th>
+                          <th className="text-right py-3 px-4">Detalji</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-100">
+                        {visibleHistory.map((enr) => {
+                          const bundle = bundlesByCourseId[enr.courseId];
+                          const crs = bundle?.course;
+                          const sum = summariesByCourseId[enr.courseId];
+                          const isArch = Boolean(enr.isArchived || crs?.isArchived);
+                          return (
+                            <tr
+                              key={enr.id}
+                              onClick={() => setSelectedHistoryCourseId(enr.courseId)}
+                              className="hover:bg-slate-50/80 transition-colors cursor-pointer"
+                            >
+                              <td className="py-3 px-4">
+                                <div className="font-semibold text-slate-900">{enr.courseName}</div>
+                                <div className="text-xs text-slate-500 mt-0.5 flex flex-wrap items-center gap-1.5">
+                                  <span className="font-mono text-blue-700">{enr.courseCode}</span>
+                                  {crs && (
+                                    <>
+                                      <span aria-hidden="true">·</span>
+                                      <span className="font-mono tabular-nums">
+                                        {crs.ects} ECTS
+                                      </span>
+                                    </>
+                                  )}
+                                  {isArch && (
+                                    <>
+                                      <span aria-hidden="true">·</span>
+                                      <span>Arhiviran semestar</span>
+                                    </>
+                                  )}
+                                </div>
+                              </td>
+                              <td className="py-3 px-4 text-xs text-slate-700">
+                                <div className="font-mono font-semibold text-slate-900 tabular-nums">
+                                  {crs?.academicYear || enr.academicYear}
+                                </div>
+                                <div className="text-slate-500 mt-0.5">
+                                  {crs?.semester || enr.semester || 'Završen semestar'}
+                                </div>
+                              </td>
+                              <td className="py-3 px-4 text-xs text-slate-700">
+                                {formatCourseProfessors(crs, enr.leadProfessorName)}
+                              </td>
+                              <td className="py-3 px-4 text-right font-mono font-semibold text-slate-900 tabular-nums">
+                                {sum
+                                  ? `${formatPoints(sum.totalEarnedPoints)} / ${formatPoints(sum.maxPossiblePoints)}`
+                                  : '—'}
+                              </td>
+                              <td className="py-3 px-4 text-xs whitespace-nowrap">
+                                {sum?.studentVisibleFinalGrade !== null && sum !== undefined ? (
+                                  <span className="inline-flex items-center gap-1.5 text-emerald-700 font-semibold font-mono tabular-nums">
+                                    <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+                                    Ocjena {sum.studentVisibleFinalGrade}
+                                  </span>
+                                ) : (
+                                  <span className="text-slate-500">Arhivirano bez ocjene</span>
+                                )}
+                              </td>
+                              <td className="py-3 px-4 text-right whitespace-nowrap">
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    setSelectedHistoryCourseId(enr.courseId);
+                                  }}
+                                >
+                                  Pregled bodova
+                                </Button>
+                              </td>
+                            </tr>
+                          );
+                        })}
                       </tbody>
                     </table>
                   </div>
                 )}
               </div>
             </>
-          )
-        )}
-      </div>
-    );
-  }
-
-  // =========================================================================
-  // VIEW 4: ZADACI I PROVJERE
-  // =========================================================================
-  const allItemsWithMeta =
-    activeSummary?.categories.flatMap((cat) =>
-      cat.items.map((itemRow) => ({
-        categoryName: cat.category.name,
-        categoryId: cat.category.id,
-        ...itemRow,
-      }))
-    ) || [];
-
-  const filteredItems =
-    itemFilterCat === 'all'
-      ? allItemsWithMeta
-      : allItemsWithMeta.filter((i) => i.categoryId === itemFilterCat);
-
-  return (
-    <div className="space-y-5">
-      <CourseTabsBar />
-
-      {activeSummary && activeSummary.categories.length > 0 && (
-        <div className="flex flex-wrap items-center gap-1 p-1 bg-slate-100 rounded-lg w-fit max-w-full">
-          <button
-            type="button"
-            onClick={() => setItemFilterCat('all')}
-            className={cn(
-              'px-3 py-1.5 text-xs font-medium rounded-md transition-colors cursor-pointer whitespace-nowrap shrink-0 tabular-nums',
-              itemFilterCat === 'all'
-                ? 'bg-white text-slate-900 shadow-xs'
-                : 'text-slate-600 hover:text-slate-900'
-            )}
-          >
-            Sve stavke ({allItemsWithMeta.length})
-          </button>
-          {activeSummary.categories.map((cat) => (
-            <button
-              key={cat.category.id}
-              type="button"
-              onClick={() => setItemFilterCat(cat.category.id)}
-              className={cn(
-                'px-3 py-1.5 text-xs font-medium rounded-md transition-colors cursor-pointer whitespace-nowrap shrink-0 tabular-nums',
-                itemFilterCat === cat.category.id
-                  ? 'bg-white text-slate-900 shadow-xs'
-                  : 'text-slate-600 hover:text-slate-900'
-              )}
-            >
-              {cat.category.name} ({cat.items.length})
-            </button>
-          ))}
+          )}
         </div>
       )}
-
-      <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
-        {filteredItems.length === 0 ? (
-          <div className="p-8 text-center text-sm text-slate-500">
-            Nema evidentiranih zadataka, vježbi ili ispita za izabrani filter.
-          </div>
-        ) : (
-          <div className="divide-y divide-slate-100">
-            {filteredItems.map((entry) => (
-              <div
-                key={entry.item.id}
-                className="p-4 sm:p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4 hover:bg-slate-50/70"
-              >
-                <div className="space-y-1 min-w-0">
-                  <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500">
-                    <span className="font-medium text-blue-700">{entry.categoryName}</span>
-                    <span aria-hidden="true">·</span>
-                    <span className="inline-flex items-center gap-1 font-mono tabular-nums">
-                      <Calendar className="w-3 h-3 text-slate-400" />
-                      {formatBosnianDate(entry.item.date)}
-                    </span>
-                  </div>
-                  <h3 className="text-sm font-semibold text-slate-900">{entry.item.name}</h3>
-                  {entry.item.description && (
-                    <p className="text-xs text-slate-600">{entry.item.description}</p>
-                  )}
-                  {entry.feedback && (
-                    <div className="pt-1 flex items-start gap-1.5 text-xs text-slate-700">
-                      <MessageSquare className="w-3.5 h-3.5 text-blue-700 shrink-0 mt-0.5" />
-                      <span>
-                        <strong>Komentar nastavnika:</strong> {entry.feedback}
-                      </span>
-                    </div>
-                  )}
-                </div>
-
-                <div className="flex sm:flex-col items-center sm:items-end justify-between gap-1 shrink-0 border-t sm:border-t-0 pt-2 sm:pt-0 border-slate-100">
-                  <div className="font-mono text-base font-bold text-slate-900 tabular-nums">
-                    {entry.graded ? formatPoints(entry.earnedPoints) : '—'}{' '}
-                    <span className="text-xs font-normal text-slate-500">
-                      / {formatPoints(entry.maxPoints)} b
-                    </span>
-                  </div>
-                  <div className="text-xs">
-                    {entry.graded ? (
-                      <span className="text-emerald-700 font-medium">Ocijenjeno</span>
-                    ) : (
-                      <span className="text-slate-400">Čeka ocjenu</span>
-                    )}
-                  </div>
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
     </div>
   );
 }

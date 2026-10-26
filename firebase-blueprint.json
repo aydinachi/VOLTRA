@@ -1441,6 +1441,78 @@
         "createdAt",
         "updatedAt"
       ]
+    },
+    "ActivityAward": {
+      "title": "ActivityAward",
+      "description": "Individual student activity point awards on a course recorded by authorized professors or administrators.",
+      "type": "object",
+      "properties": {
+        "courseId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 60,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "studentId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "points": {
+          "type": "number",
+          "description": "Awarded activity points (> 0 and <= 100)."
+        },
+        "maxPoints": {
+          "type": "number",
+          "description": "Optional reference maximum points (0 when awarded as uncapped activity points, <= 100)."
+        },
+        "date": {
+          "type": "string",
+          "minLength": 10,
+          "maxLength": 10,
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300
+        },
+        "awardedBy": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "professorIds": {
+          "type": "array",
+          "description": "Bounded list (max 10) of assigned professor UIDs."
+        },
+        "isSeed": {
+          "type": "boolean"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "courseId",
+        "studentId",
+        "points",
+        "maxPoints",
+        "date",
+        "description",
+        "awardedBy",
+        "professorIds",
+        "isSeed",
+        "createdAt",
+        "updatedAt"
+      ]
     }
   },
   "firestore": {
@@ -1519,6 +1591,11 @@
     "/academicState/{stateId}": {
       "schema": "AcademicState",
       "description": "Active semester and academic year state."
+    },
+    "/activityAwards/{awardId}": {
+      "schema": "ActivityAward",
+      "description": "Individual student activity point awards on courses."
     }
   }
 }
+
