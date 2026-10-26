@@ -23,6 +23,18 @@ import { AuthProvider, useAuth } from './context/AuthContext';
 import { subscribeAcademicState } from './services/zamioService';
 import { AcademicState, SmartNotificationItem } from './types/zamio';
 
+const PROFESSOR_PAGE_TITLES: Record<ProfessorNavKey, string> = {
+  pocetna: 'Pregled predmeta',
+  bodovi: 'Unos bodova',
+  prisustvo: 'Prisustvo',
+  ispiti: 'Ispitni rokovi',
+  studenti: 'Studenti i ocjene',
+  postavke: 'Osoblje i postavke',
+  raspored: 'Raspored nastave',
+  obavjestenja: 'Obavještenja',
+  profil: 'Moj profil',
+};
+
 function VoltraContent() {
   const { firebaseUser, profile, authReady, portalMode } = useAuth();
   const [studentNav, setStudentNav] = useState<StudentNavKey>('pocetna');
@@ -61,7 +73,7 @@ function VoltraContent() {
     }
 
     if (portalMode === 'professor') {
-      const validProfKeys = PROFESSOR_NAV_ITEMS.map((i) => i.key) as string[];
+      const validProfKeys = Object.keys(PROFESSOR_PAGE_TITLES);
       setProfessorNav(validProfKeys.includes(key) ? (key as ProfessorNavKey) : 'pocetna');
       return;
     }
@@ -128,7 +140,9 @@ function VoltraContent() {
     portalMode === 'admin'
       ? ADMIN_NAV_ITEMS.find((i) => i.key === adminNav)?.label || 'Administratorski portal'
       : portalMode === 'professor'
-        ? PROFESSOR_NAV_ITEMS.find((i) => i.key === professorNav)?.label || 'Pregled predmeta'
+        ? PROFESSOR_PAGE_TITLES[professorNav] ||
+          PROFESSOR_NAV_ITEMS.find((i) => i.key === professorNav)?.label ||
+          'Pregled predmeta'
         : STUDENT_NAV_ITEMS.find((i) => i.key === studentNav)?.label || 'Početna';
 
   const handleSelectNotification = (item: SmartNotificationItem) => {

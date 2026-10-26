@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
+  ArrowLeft,
   Calendar,
   CalendarCheck,
   CalendarCheck2,
@@ -203,6 +204,17 @@ export function ProfessorCourseSelector({
         {/* Left: Full Active Course Info */}
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-slate-500">
+            <button
+              type="button"
+              onClick={() => onNavigate('pocetna')}
+              className="inline-flex items-center gap-1 font-medium text-slate-600 hover:text-blue-700 transition-colors cursor-pointer"
+            >
+              <ArrowLeft className="w-3.5 h-3.5" />
+              <span>Svi predmeti</span>
+            </button>
+            <span aria-hidden="true" className="text-slate-300">
+              ·
+            </span>
             {activeCourse.isArchived && (
               <>
                 <span className="font-semibold text-amber-700">
@@ -504,9 +516,14 @@ export function ProfessorCourseSelector({
         <button
           type="button"
           onClick={() => onNavigate('raspored')}
-          className="px-2.5 py-1.5 text-xs font-medium text-slate-600 hover:text-slate-900 inline-flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap shrink-0"
+          className={cn(
+            'px-3 py-1.5 rounded-lg text-xs font-medium inline-flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap shrink-0',
+            activeNav === 'raspored'
+              ? 'bg-white text-slate-900 font-semibold border border-slate-200/90 shadow-2xs'
+              : 'text-slate-600 hover:text-slate-900 hover:bg-slate-200/50 border border-transparent'
+          )}
         >
-          <Calendar className="w-3.5 h-3.5" />
+          <Calendar className="w-3.5 h-3.5 shrink-0" />
           <span>Raspored nastave</span>
         </button>
       </div>

@@ -1,20 +1,15 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
-  Archive,
   Bell,
   BookOpen,
   Calendar,
-  CalendarCheck,
   CheckCheck,
-  ClipboardList,
-  FileCheck2,
   FolderSync,
   GraduationCap,
   LayoutDashboard,
   LogOut,
   Megaphone,
   Menu,
-  Settings,
   ShieldCheck,
   User,
   Users,
@@ -61,14 +56,8 @@ export const STUDENT_NAV_ITEMS: NavItem<StudentNavKey>[] = [
 ];
 
 export const PROFESSOR_NAV_ITEMS: NavItem<ProfessorNavKey>[] = [
-  { key: 'pocetna', label: 'Pregled predmeta', icon: LayoutDashboard },
-  { key: 'raspored', label: 'Raspored nastave', icon: Calendar },
-  { key: 'ispiti', label: 'Ispitni rokovi', icon: FileCheck2 },
-  { key: 'bodovi', label: 'Unos bodova', icon: ClipboardList },
-  { key: 'prisustvo', label: 'Prisustvo', icon: CalendarCheck },
-  { key: 'studenti', label: 'Studenti i ocjene', icon: Users },
+  { key: 'pocetna', label: 'Pregled predmeta', icon: BookOpen },
   { key: 'obavjestenja', label: 'Obavještenja', icon: Megaphone },
-  { key: 'postavke', label: 'Postavke predmeta', icon: Settings },
   { key: 'profil', label: 'Moj profil', icon: User },
 ];
 
@@ -172,6 +161,19 @@ export function AppShell({
         ? 'Nastavno osoblje'
         : 'Student';
 
+  const isNavItemActive = (itemKey: string) => {
+    if (activeNav === itemKey) return true;
+    if (
+      portalMode === 'professor' &&
+      itemKey === 'pocetna' &&
+      activeNav !== 'obavjestenja' &&
+      activeNav !== 'profil'
+    ) {
+      return true;
+    }
+    return false;
+  };
+
   const handleNavClick = (key: string) => {
     onSelectNav(key);
     setMobileOpen(false);
@@ -208,7 +210,7 @@ export function AppShell({
         <nav className="flex-1 px-3 py-4 space-y-1 overflow-y-auto">
           {navItems.map((item) => {
             const Icon = item.icon;
-            const isActive = activeNav === item.key;
+            const isActive = isNavItemActive(item.key);
             return (
               <button
                 key={item.key}
@@ -330,7 +332,7 @@ export function AppShell({
             <nav className="flex-1 p-3 space-y-1 overflow-y-auto">
               {navItems.map((item) => {
                 const Icon = item.icon;
-                const isActive = activeNav === item.key;
+                const isActive = isNavItemActive(item.key);
                 return (
                   <button
                     key={item.key}
