@@ -16,6 +16,7 @@ import {
   calculateCourseStudentSummary,
   CourseStudentSummary,
   getTodayIsoLocal,
+  isCourseActivityEnabled,
 } from '../../lib/calculations';
 import {
   getCourseProgramCycle,
@@ -112,9 +113,9 @@ export function ProfessorPortal({ activeNav, onNavigate }: ProfessorPortalProps)
   const [studentFilter, setStudentFilter] = useState<'all' | 'passed' | 'below' | 'finalized'>(
     'all'
   );
-  const [studentSort, setStudentSort] = useState<'name' | 'index' | 'total' | 'attendance'>(
-    'total'
-  );
+  const [studentSort, setStudentSort] = useState<
+    'name' | 'index' | 'total' | 'attendance' | 'activity'
+  >('total');
   const [scheduleScope, setScheduleScope] = useState<'course' | 'all'>('course');
 
   // Create Course Modal
@@ -128,6 +129,7 @@ export function ProfessorPortal({ activeNav, onNavigate }: ProfessorPortalProps)
   const [newAssistants, setNewAssistants] = useState('');
   const [newAttEnabled, setNewAttEnabled] = useState(true);
   const [newAttMax, setNewAttMax] = useState('10');
+  const [newActivityMarksEnabled, setNewActivityMarksEnabled] = useState(false);
   const [creatingCourse, setCreatingCourse] = useState(false);
 
   // Enroll Student Modal
@@ -304,6 +306,7 @@ export function ProfessorPortal({ activeNav, onNavigate }: ProfessorPortalProps)
         ects: Number(newEcts),
         attendanceEnabled: newAttEnabled,
         attendanceMaxPoints: newAttEnabled ? Number(newAttMax) : 0,
+        activityMarksEnabled: newActivityMarksEnabled,
       });
       setShowArchivedOnHome(false);
       setSelectedCourseId(id);
@@ -312,6 +315,7 @@ export function ProfessorPortal({ activeNav, onNavigate }: ProfessorPortalProps)
       setNewName('');
       setNewCoProfessors('');
       setNewAssistants('');
+      setNewActivityMarksEnabled(false);
       onNavigate('bodovi');
       toast.success('Novi predmet je uspješno kreiran.');
     } catch (err) {
@@ -394,8 +398,9 @@ export function ProfessorPortal({ activeNav, onNavigate }: ProfessorPortalProps)
   const handleExportCsv = () => {
     if (!activeCourse) return;
     const sortedCats = [...categories].sort((a, b) => a.order - b.order);
-    const hasStandaloneActivity = Object.values(studentSummaries).some(
-      (s) => s.activity.awards.length > 0 && !s.activity.linkedCategoryId
+    const usesActivity = isCourseActivityEnabled(activeCourse, activityAwards.length);
+    const hasStandaloneActivityPts = Object.values(studentSummaries).some(
+      (s) => s.activity.earnedPoints > 0 && !s.activity.linkedCategoryId
     );
     const headers = [
       'Broj indeksa',
@@ -405,7 +410,8 @@ export function ProfessorPortal({ activeNav, onNavigate }: ProfessorPortalProps)
         ? [`Prisustvo (/${activeCourse.attendanceMaxPoints})`]
         : []),
       ...sortedCats.map((c) => `${c.name} (/${c.maxPoints})`),
-      ...(hasStandaloneActivity ? ['Aktivnost'] : []),
+      ...(usesActivity ? ['Plusevi za aktivnost (+)'] : []),
+      ...(hasStandaloneActivityPts ? ['Bodovi za aktivnost'] : []),
       'Ukupno bodova',
       'Procenat (%)',
       'Konačna ocjena',
@@ -427,7 +433,8 @@ export function ProfessorPortal({ activeNav, onNavigate }: ProfessorPortalProps)
           enr.studentDepartment,
           ...(activeCourse.attendanceEnabled ? [sum?.attendance.earnedPoints ?? 0] : []),
           ...catCells,
-          ...(hasStandaloneActivity ? [sum?.activity.earnedPoints ?? 0] : []),
+          ...(usesActivity ? [sum?.activity.plusCount ?? 0] : []),
+          ...(hasStandaloneActivityPts ? [sum?.activity.earnedPoints ?? 0] : []),
           sum?.totalEarnedPoints ?? 0,
           sum?.percentageAchieved ?? 0,
           sum?.officialFinalGrade ? sum.officialFinalGrade.finalGrade : '—',
@@ -563,25 +570,42 @@ export function ProfessorPortal({ activeNav, onNavigate }: ProfessorPortalProps)
             placeholder="npr. mr. Haris Šupić, dipl. el. ing. Maja Kovač"
           />
         </div>
-        <div className="flex items-center justify-between gap-3 pt-1">
-          <label className="flex items-center gap-2 text-xs text-slate-700 cursor-pointer">
+        <div className="space-y-2.5 pt-1">
+          <div className="flex items-center justify-between gap-3">
+            <label className="flex items-center gap-2 text-xs text-slate-700 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={newAttEnabled}
+                onChange={(e) => setNewAttEnabled(e.target.checked)}
+              />
+              <span>Uključi bodovanje prisustva (podrazumijevano 10 b)</span>
+            </label>
+            {newAttEnabled && (
+              <Input
+                type="number"
+                min="0"
+                max="100"
+                value={newAttMax}
+                onChange={(e) => setNewAttMax(e.target.value)}
+                className="w-20 h-8 font-mono text-right tabular-nums"
+              />
+            )}
+          </div>
+
+          <label className="flex items-start gap-2 text-xs text-slate-700 cursor-pointer">
             <input
               type="checkbox"
-              checked={newAttEnabled}
-              onChange={(e) => setNewAttEnabled(e.target.checked)}
+              checked={newActivityMarksEnabled}
+              onChange={(e) => setNewActivityMarksEnabled(e.target.checked)}
+              className="mt-0.5"
             />
-            <span>Uključi bodovanje prisustva (podrazumijevano 10 b)</span>
+            <span>
+              <strong className="font-medium text-slate-900">
+                Koristi tačke / pluseve za aktivnost na predmetu (+)
+              </strong>{' '}
+              — omogućava brzu evidenciju pluseva za urađene vježbe (bez obaveznog unosa bodova)
+            </span>
           </label>
-          {newAttEnabled && (
-            <Input
-              type="number"
-              min="0"
-              max="100"
-              value={newAttMax}
-              onChange={(e) => setNewAttMax(e.target.value)}
-              className="w-20 h-8 font-mono text-right tabular-nums"
-            />
-          )}
         </div>
         <div className="flex justify-end gap-2 pt-2">
           <Button variant="outline" onClick={() => setNewCourseOpen(false)}>
@@ -921,6 +945,14 @@ export function ProfessorPortal({ activeNav, onNavigate }: ProfessorPortalProps)
                           {crs.grade6Threshold} b
                         </strong>
                       </span>
+                      {crs.activityMarksEnabled && (
+                        <>
+                          <span aria-hidden="true" className="text-slate-300">
+                            ·
+                          </span>
+                          <span className="font-medium text-emerald-700">Tačke (+)</span>
+                        </>
+                      )}
                     </div>
 
                     <span className="inline-flex items-center gap-1 font-semibold text-blue-700 whitespace-nowrap shrink-0">
@@ -1050,11 +1082,20 @@ export function ProfessorPortal({ activeNav, onNavigate }: ProfessorPortalProps)
       if (studentSort === 'attendance') {
         return (sumB?.attendance.earnedPoints ?? 0) - (sumA?.attendance.earnedPoints ?? 0);
       }
+      if (studentSort === 'activity') {
+        const diffPlus = (sumB?.activity.plusCount ?? 0) - (sumA?.activity.plusCount ?? 0);
+        if (diffPlus !== 0) return diffPlus;
+        return (sumB?.totalEarnedPoints ?? 0) - (sumA?.totalEarnedPoints ?? 0);
+      }
       if (studentSort === 'index') {
         return a.studentIndex.localeCompare(b.studentIndex, 'bs', { numeric: true });
       }
       return a.studentName.localeCompare(b.studentName, 'bs');
     });
+
+  const courseUsesActivity = activeCourse
+    ? isCourseActivityEnabled(activeCourse, activityAwards.length)
+    : false;
 
   const isExamCategory = (catName: string) => {
     const low = catName.toLowerCase();
@@ -1180,6 +1221,9 @@ export function ProfessorPortal({ activeNav, onNavigate }: ProfessorPortalProps)
             <option value="name">Sortiraj: Prezime i ime</option>
             <option value="index">Sortiraj: Broj indeksa</option>
             <option value="attendance">Sortiraj: Prisustvo</option>
+            {courseUsesActivity && (
+              <option value="activity">Sortiraj: Plusevi za aktivnost (+)</option>
+            )}
           </select>
         </div>
 
@@ -1210,6 +1254,9 @@ export function ProfessorPortal({ activeNav, onNavigate }: ProfessorPortalProps)
                   <th className="text-left py-3 px-4 whitespace-nowrap">Indeks</th>
                   <th className="text-right py-3 px-4 whitespace-nowrap">Prisustvo</th>
                   <th className="text-right py-3 px-4 whitespace-nowrap">Zadaci / Vježbe</th>
+                  {courseUsesActivity && (
+                    <th className="text-right py-3 px-4 whitespace-nowrap">Aktivnost (+)</th>
+                  )}
                   <th className="text-right py-3 px-4 whitespace-nowrap">Ispiti</th>
                   <th className="text-right py-3 px-4 whitespace-nowrap">Ukupno</th>
                   <th className="text-left py-3 px-4 whitespace-nowrap">Konačna ocjena</th>
@@ -1256,6 +1303,24 @@ export function ProfessorPortal({ activeNav, onNavigate }: ProfessorPortalProps)
                           </div>
                         )}
                       </td>
+                      {courseUsesActivity && (
+                        <td className="py-3 px-4 text-right font-mono text-xs tabular-nums">
+                          {sum && sum.activity.plusCount > 0 ? (
+                            <div>
+                              <span className="font-semibold text-emerald-700">
+                                {sum.activity.plusCount} × +
+                              </span>
+                              {sum.activity.earnedPoints > 0 && (
+                                <div className="text-[11px] text-slate-500">
+                                  +{formatPoints(sum.activity.earnedPoints)} b
+                                </div>
+                              )}
+                            </div>
+                          ) : (
+                            <span className="text-slate-400">—</span>
+                          )}
+                        </td>
+                      )}
                       <td className="py-3 px-4 text-right font-mono text-xs tabular-nums text-slate-800">
                         {formatPoints(examPts)}
                       </td>
@@ -1363,7 +1428,11 @@ export function ProfessorPortal({ activeNav, onNavigate }: ProfessorPortalProps)
         title="Upis ili zaključivanje konačne ocjene"
         description={
           gradeModalStudent
-            ? `${gradeModalStudent.enrollment.studentName} (${gradeModalStudent.enrollment.studentIndex}) — Ostvareno: ${formatPoints(gradeModalStudent.summary.totalEarnedPoints)} bodova`
+            ? `${gradeModalStudent.enrollment.studentName} (${gradeModalStudent.enrollment.studentIndex}) — Ostvareno: ${formatPoints(gradeModalStudent.summary.totalEarnedPoints)} bodova${
+                courseUsesActivity
+                  ? ` · Plusevi za aktivnost: ${gradeModalStudent.summary.activity.plusCount} × +`
+                  : ''
+              }`
             : ''
         }
       >

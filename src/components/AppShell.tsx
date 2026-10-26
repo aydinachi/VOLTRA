@@ -109,6 +109,7 @@ export function AppShell({
   const { profile, isAdminUser, setPortalMode, signOut } = useAuth();
   const [mobileOpen, setMobileOpen] = useState(false);
   const [notifOpen, setNotifOpen] = useState(false);
+  const [brandMarkFailed, setBrandMarkFailed] = useState(false);
   const notifContainerRef = useRef<HTMLDivElement | null>(null);
 
   const navItems =
@@ -190,19 +191,29 @@ export function AppShell({
       {/* Desktop Sidebar */}
       <aside className="hidden lg:flex lg:w-64 lg:flex-col lg:fixed lg:inset-y-0 bg-white border-r border-slate-200 z-30">
         <div className="h-16 px-5 flex items-center gap-3 border-b border-slate-200">
-          <div className="w-8 h-8 rounded-lg bg-slate-900 flex items-center justify-center text-white shrink-0">
-            {portalMode === 'admin' ? (
-              <ShieldCheck className="w-4 h-4" />
-            ) : (
-              <GraduationCap className="w-4 h-4" />
-            )}
-          </div>
+          {!brandMarkFailed ? (
+            <img
+              src="/assets/aistudio/images__3__ce548d61.jfif"
+              alt="ETF Sarajevo"
+              referrerPolicy="no-referrer"
+              onError={() => setBrandMarkFailed(true)}
+              className="w-8 h-8 rounded-lg object-cover shrink-0"
+            />
+          ) : (
+            <div className="w-8 h-8 rounded-lg bg-slate-900 flex items-center justify-center text-white shrink-0">
+              {portalMode === 'admin' ? (
+                <ShieldCheck className="w-4 h-4" />
+              ) : (
+                <GraduationCap className="w-4 h-4" />
+              )}
+            </div>
+          )}
           <div className="min-w-0">
             <div className="text-base font-bold tracking-tight text-slate-900 leading-none">
               VOLTRA
             </div>
             <div className="text-[11px] text-slate-500 mt-1 truncate">
-              {portalMode === 'admin' ? 'ETF Uprava sistema' : 'ETF Student Portal'}
+              {portalMode === 'admin' ? 'ETF Uprava sistema' : 'ETF Sarajevo'}
             </div>
           </div>
         </div>
@@ -314,9 +325,19 @@ export function AppShell({
           >
             <div className="h-14 px-4 flex items-center justify-between border-b border-slate-200">
               <div className="flex items-center gap-2.5">
-                <div className="w-7 h-7 rounded-lg bg-slate-900 flex items-center justify-center text-white">
-                  <GraduationCap className="w-4 h-4" />
-                </div>
+                {!brandMarkFailed ? (
+                  <img
+                    src="/assets/aistudio/images__3__ce548d61.jfif"
+                    alt="ETF Sarajevo"
+                    referrerPolicy="no-referrer"
+                    onError={() => setBrandMarkFailed(true)}
+                    className="w-7 h-7 rounded-lg object-cover shrink-0"
+                  />
+                ) : (
+                  <div className="w-7 h-7 rounded-lg bg-slate-900 flex items-center justify-center text-white">
+                    <GraduationCap className="w-4 h-4" />
+                  </div>
+                )}
                 <span className="font-bold tracking-tight text-slate-900">VOLTRA</span>
               </div>
               <button

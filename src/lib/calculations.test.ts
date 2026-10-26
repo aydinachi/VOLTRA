@@ -3,6 +3,7 @@ import {
   calculateAttendance,
   calculateCourseStudentSummary,
   calculateSuggestedGrade,
+  isCourseActivityEnabled,
 } from './calculations';
 import {
   AttendanceRecord,
@@ -604,6 +605,89 @@ describe('Zamio Centralized Calculations', () => {
     expect(summaryLinked.maxPossiblePoints).toBe(100);
     // Remaining = 15 (Z2) + 60 (Ispit) + 6 (remaining room in 10pt Aktivnost category) = 81
     expect(summaryLinked.remainingAvailablePoints).toBe(81);
+  });
+
+  it('supports 0-point plus (+) activity marks (Samir Ribić workflow) and course-level activityMarksEnabled opt-in', () => {
+    expect(isCourseActivityEnabled({ activityMarksEnabled: false }, 3)).toBe(false);
+    expect(isCourseActivityEnabled({ activityMarksEnabled: undefined }, 0)).toBe(false);
+    expect(isCourseActivityEnabled({ activityMarksEnabled: undefined }, 2)).toBe(true);
+    expect(isCourseActivityEnabled({ activityMarksEnabled: true }, 0)).toBe(true);
+
+    const osCourse = makeBaseCourse({
+      id: 'seed_crs_os',
+      code: 'RI-OS',
+      name: 'Operativni sistemi',
+      attendanceEnabled: false,
+      activityMarksEnabled: true,
+    });
+
+    const summaryWithPluses = calculateCourseStudentSummary({
+      course: osCourse,
+      categories: [
+        {
+          id: 'cat_lab',
+          courseId: 'seed_crs_os',
+          name: 'Laboratorijske vježbe',
+          maxPoints: 25,
+          order: 1,
+          professorIds: ['prof_1'],
+          isSeed: true,
+        },
+      ],
+      items: [],
+      scores: [],
+      sessions: [],
+      attendanceRecords: [],
+      activityAwards: [
+        {
+          id: 'plus_1',
+          courseId: 'seed_crs_os',
+          studentId: 'stu_1',
+          points: 0,
+          maxPoints: 0,
+          date: '2026-10-12',
+          description: 'Urađena vježba 2 (+)',
+          awardedBy: 'prof_1',
+          professorIds: ['prof_1'],
+          isSeed: false,
+        },
+        {
+          id: 'plus_2',
+          courseId: 'seed_crs_os',
+          studentId: 'stu_1',
+          points: 0,
+          maxPoints: 0,
+          date: '2026-10-19',
+          description: 'Urađena vježba 3 (+)',
+          awardedBy: 'prof_1',
+          professorIds: ['prof_1'],
+          isSeed: false,
+        },
+      ],
+      studentId: 'stu_1',
+      referenceDateIso: '2026-10-23',
+    });
+
+    expect(summaryWithPluses.activity.enabled).toBe(true);
+    expect(summaryWithPluses.activity.plusCount).toBe(2);
+    expect(summaryWithPluses.activity.earnedPoints).toBe(0);
+    expect(summaryWithPluses.totalEarnedPoints).toBe(0);
+
+    const disabledCourse = { ...osCourse, activityMarksEnabled: false };
+    const summaryDisabled = calculateCourseStudentSummary({
+      course: disabledCourse,
+      categories: [],
+      items: [],
+      scores: [],
+      sessions: [],
+      attendanceRecords: [],
+      activityAwards: summaryWithPluses.activity.awards.map((r) => r.award),
+      studentId: 'stu_1',
+      referenceDateIso: '2026-10-23',
+    });
+
+    expect(summaryDisabled.activity.enabled).toBe(false);
+    expect(summaryDisabled.activity.plusCount).toBe(0);
   });
 });
 

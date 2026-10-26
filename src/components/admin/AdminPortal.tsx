@@ -169,6 +169,7 @@ export function AdminPortal({ activeNav }: AdminPortalProps) {
   const [crsEcts, setCrsEcts] = useState('6');
   const [crsCoProfs, setCrsCoProfs] = useState('');
   const [crsAssistants, setCrsAssistants] = useState('');
+  const [crsActivityMarksEnabled, setCrsActivityMarksEnabled] = useState(false);
   const [creatingCourse, setCreatingCourse] = useState(false);
 
   // Edit Course Staff Modal
@@ -477,6 +478,7 @@ export function AdminPortal({ activeNav }: AdminPortalProps) {
         ects: Number(crsEcts),
         attendanceEnabled: true,
         attendanceMaxPoints: 10,
+        activityMarksEnabled: crsActivityMarksEnabled,
       });
 
       setNewCourseOpen(false);
@@ -484,6 +486,7 @@ export function AdminPortal({ activeNav }: AdminPortalProps) {
       setCrsName('');
       setCrsCoProfs('');
       setCrsAssistants('');
+      setCrsActivityMarksEnabled(false);
       toast.success('Novi predmet je uspješno kreiran i dodijeljen nastavniku.');
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Greška pri kreiranju predmeta.');
@@ -1207,6 +1210,25 @@ export function AdminPortal({ activeNav }: AdminPortalProps) {
                 onChange={(e) => setCrsAssistants(e.target.value)}
                 placeholder="npr. mr. Emir Buza, as. Maja Kovač"
               />
+            </div>
+
+            <div className="pt-1 border-t border-slate-100">
+              <label className="flex items-start gap-2.5 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={crsActivityMarksEnabled}
+                  onChange={(e) => setCrsActivityMarksEnabled(e.target.checked)}
+                  className="w-4 h-4 mt-0.5 rounded border-slate-300 text-blue-600 focus:ring-blue-500"
+                />
+                <div>
+                  <span className="text-sm font-medium text-slate-900 block">
+                    Koristi tačke / pluseve za aktivnost na predmetu (+)
+                  </span>
+                  <span className="text-xs text-slate-500 block mt-0.5">
+                    Ako je isključeno, predmet nema sekciju za evidenciju pluseva / tačaka za aktivnost.
+                  </span>
+                </div>
+              </label>
             </div>
 
             <div className="flex justify-end gap-2 pt-2">

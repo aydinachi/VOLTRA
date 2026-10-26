@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   AlertCircle,
   ArrowLeft,
@@ -137,6 +137,12 @@ export function StudentCourseDetailsView({
   const pendingOrFutureCount = attendance.futureCount + attendance.unrecordedCount;
   const pendingShare = Math.max(0, 100 - presentShare - absentShare);
 
+  useEffect(() => {
+    if (assessmentFilter === '__activity__' && !activity.enabled) {
+      setAssessmentFilter('all');
+    }
+  }, [assessmentFilter, activity.enabled]);
+
   const visibleCategories = useMemo(() => {
     if (assessmentFilter === 'all') return categories;
     if (assessmentFilter === '__activity__') return [];
@@ -144,9 +150,10 @@ export function StudentCourseDetailsView({
   }, [categories, assessmentFilter]);
 
   const showActivitySection =
-    assessmentFilter === 'all' ||
-    assessmentFilter === '__activity__' ||
-    (activity.linkedCategoryId !== null && assessmentFilter === activity.linkedCategoryId);
+    activity.enabled &&
+    (assessmentFilter === 'all' ||
+      assessmentFilter === '__activity__' ||
+      (activity.linkedCategoryId !== null && assessmentFilter === activity.linkedCategoryId));
 
   const assistantsText = formatCourseAssistants(course);
 
@@ -712,7 +719,9 @@ export function StudentCourseDetailsView({
         <div className="px-5 sm:px-6 py-4 border-b border-slate-200 flex flex-col lg:flex-row lg:items-center justify-between gap-3">
           <div>
             <h3 className="text-base font-semibold text-slate-900">
-              Kategorije provjera znanja, zadaće, ispiti i bodovi za aktivnost
+              {activity.enabled
+                ? 'Kategorije provjera znanja, zadaće, ispiti i tačke za aktivnost (+)'
+                : 'Kategorije provjera znanja, zadaće i ispiti'}
             </h3>
             <p className="text-xs text-slate-500 mt-0.5">
               Neocijenjene obaveze su prikazane sa „—“ i ne prikazuju se kao 0 bodova dok nastavnik
@@ -749,7 +758,7 @@ export function StudentCourseDetailsView({
                   {cat.category.name}
                 </button>
               ))}
-              {activity.linkedCategoryId === null && (
+              {activity.enabled && activity.linkedCategoryId === null && (
                 <button
                   type="button"
                   onClick={() => setAssessmentFilter('__activity__')}
@@ -760,7 +769,7 @@ export function StudentCourseDetailsView({
                       : 'text-slate-600 hover:text-slate-900'
                   )}
                 >
-                  Aktivnost ({activity.awards.length})
+                  Aktivnost ({activity.plusCount} × +)
                 </button>
               )}
             </div>
@@ -882,34 +891,33 @@ export function StudentCourseDetailsView({
                 );
               })}
 
-              {/* Standalone Activity Points Section (when not linked to an "Aktivnost" category) */}
+              {/* Standalone Activity Marks (+) Section (only when enabled on course) */}
               {showActivitySection && activity.linkedCategoryId === null && (
                 <>
                   <tr className="bg-slate-50/75">
                     <td className="py-3 px-5 font-semibold text-slate-900" colSpan={2}>
                       <span className="inline-flex items-center gap-1.5">
                         <Star className="w-4 h-4 text-amber-600 shrink-0" />
-                        Bodovi za aktivnost na nastavi i vježbama
+                        Tačke za aktivnost i urađene vježbe (+)
                       </span>
                     </td>
                     <td className="py-3 px-4 text-right font-mono font-bold text-emerald-700 tabular-nums">
-                      {activity.awards.length > 0
-                        ? `+${formatPoints(activity.earnedPoints)}`
-                        : '0'}
+                      {activity.earnedPoints > 0
+                        ? `+${formatPoints(activity.earnedPoints)} (${activity.plusCount} × +)`
+                        : `${activity.plusCount} × +`}
                     </td>
                     <td className="py-3 px-4 text-right font-mono text-slate-500 tabular-nums">
-                      {activity.maxPoints > 0 ? formatPoints(activity.maxPoints) : 'Bonus'}
+                      {activity.maxPoints > 0 ? formatPoints(activity.maxPoints) : 'Evidencija (+)'}
                     </td>
                     <td className="py-3 px-5 text-xs text-slate-600 font-mono tabular-nums">
-                      {activity.awards.length}{' '}
-                      {activity.awards.length === 1 ? 'dodjela' : 'dodjele'}
+                      {activity.plusCount} evidentirano
                     </td>
                   </tr>
 
                   {activity.awards.length === 0 ? (
                     <tr>
                       <td className="py-3 px-5 pl-8 text-xs text-slate-500" colSpan={5}>
-                        Još nema dodijeljenih bodova za aktivnost na ovom predmetu.
+                        Još nema evidentiranih pluseva (+) za aktivnost na ovom predmetu.
                       </td>
                     </tr>
                   ) : (
@@ -922,7 +930,7 @@ export function StudentCourseDetailsView({
                           {formatBosnianDate(award.date)}
                         </td>
                         <td className="py-3 px-4 text-right font-mono font-semibold text-emerald-700 tabular-nums">
-                          +{formatPoints(effectivePoints)}
+                          {effectivePoints > 0 ? `+${formatPoints(effectivePoints)}` : '+'}
                         </td>
                         <td className="py-3 px-4 text-right font-mono text-slate-500 tabular-nums">
                           {award.maxPoints > 0 ? formatPoints(award.maxPoints) : '—'}
@@ -930,7 +938,7 @@ export function StudentCourseDetailsView({
                         <td className="py-3 px-5 text-xs whitespace-nowrap">
                           <span className="inline-flex items-center gap-1 text-emerald-700 font-medium">
                             <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
-                            Upisano u zbir
+                            {effectivePoints > 0 ? 'Upisano u zbir' : 'Evidentiran plus (+)'}
                           </span>
                         </td>
                       </tr>
@@ -943,7 +951,9 @@ export function StudentCourseDetailsView({
               {assessmentFilter === 'all' && (
                 <tr className="bg-slate-900 text-white font-semibold">
                   <td className="py-3.5 px-5" colSpan={2}>
-                    Ukupno bodova (Prisustvo + Kategorije + Aktivnost)
+                    {activity.enabled && activity.earnedPoints > 0
+                      ? 'Ukupno bodova (Prisustvo + Kategorije + Aktivnost)'
+                      : 'Ukupno bodova (Prisustvo + Kategorije)'}
                   </td>
                   <td className="py-3.5 px-4 text-right font-mono text-base tabular-nums">
                     {formatPoints(totalEarnedPoints)}

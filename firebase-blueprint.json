@@ -501,6 +501,10 @@
         "allowBonusPoints": {
           "type": "boolean"
         },
+        "activityMarksEnabled": {
+          "type": "boolean",
+          "description": "Optional flag indicating whether this course uses plus (+) / activity marks for exercises and optional activity points."
+        },
         "grade6Threshold": {
           "type": "number"
         },
@@ -1461,7 +1465,7 @@
         },
         "points": {
           "type": "number",
-          "description": "Awarded activity points (> 0 and <= 100)."
+          "description": "Awarded activity points (>= 0 and <= 100; 0 represents a non-point plus / activity mark for completed exercises)."
         },
         "maxPoints": {
           "type": "number",

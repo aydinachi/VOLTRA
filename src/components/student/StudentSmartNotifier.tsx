@@ -499,8 +499,14 @@ export function StudentSmartNotifier({
         if (prefs.pointsChanged) {
           pushSmartNotification({
             category: 'pointsChanged',
-            title: `Dodijeljeni bodovi za aktivnost — ${crsCode}`,
-            description: `${a.description}: +${formatPoints(a.points)} bodova (${formatBosnianDate(a.date)}).`,
+            title:
+              a.points > 0
+                ? `Dodijeljeni bodovi za aktivnost — ${crsCode}`
+                : `Evidentiran plus (+) za aktivnost — ${crsCode}`,
+            description:
+              a.points > 0
+                ? `${a.description}: +${formatPoints(a.points)} bodova (${formatBosnianDate(a.date)}).`
+                : `${a.description} (${formatBosnianDate(a.date)}).`,
             targetNav: 'predmeti',
             targetCourseId: a.courseId,
             targetSubTab: 'courses',
@@ -512,8 +518,14 @@ export function StudentSmartNotifier({
         if (prefs.pointsChanged) {
           pushSmartNotification({
             category: 'pointsChanged',
-            title: `Ažurirani bodovi za aktivnost — ${crsCode}`,
-            description: `${a.description}: +${formatPoints(a.points)} bodova.`,
+            title:
+              a.points > 0
+                ? `Ažurirani bodovi za aktivnost — ${crsCode}`
+                : `Ažurirana evidencija aktivnosti (+) — ${crsCode}`,
+            description:
+              a.points > 0
+                ? `${a.description}: +${formatPoints(a.points)} bodova.`
+                : `${a.description} (${formatBosnianDate(a.date)}).`,
             targetNav: 'predmeti',
             targetCourseId: a.courseId,
             targetSubTab: 'courses',

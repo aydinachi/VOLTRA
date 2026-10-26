@@ -22,6 +22,14 @@ service cloud.firestore {
       return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
     }
 
+    function isValidCourseId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 60 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidStudentId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 64 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
     function incoming() {
       return request.resource.data;
     }
@@ -237,7 +245,7 @@ service cloud.firestore {
           'professorNames', 'assistantNames', 'studyProgram',
           'categoryIds', 'itemIds', 'sessionIds', 'examTermIds', 'scheduleEventIds',
           'isArchived',
-          'attendanceEnabled', 'attendanceMaxPoints', 'allowBonusPoints',
+          'attendanceEnabled', 'attendanceMaxPoints', 'allowBonusPoints', 'activityMarksEnabled',
           'grade6Threshold', 'grade7Threshold', 'grade8Threshold', 'grade9Threshold', 'grade10Threshold',
           'isSeed', 'createdAt', 'updatedAt'
         ]) &&
@@ -261,6 +269,7 @@ service cloud.firestore {
         data.attendanceEnabled is bool &&
         data.attendanceMaxPoints is number && data.attendanceMaxPoints >= 0 && data.attendanceMaxPoints <= 100 &&
         data.allowBonusPoints is bool &&
+        (!('activityMarksEnabled' in data) || data.activityMarksEnabled is bool) &&
         data.grade6Threshold is number && data.grade6Threshold >= 0 &&
         data.grade7Threshold is number && data.grade7Threshold > data.grade6Threshold &&
         data.grade8Threshold is number && data.grade8Threshold > data.grade7Threshold &&
@@ -580,7 +589,7 @@ service cloud.firestore {
         ]) &&
         isValidCourseId(data.courseId) &&
         isValidStudentId(data.studentId) &&
-        data.points is number && data.points > 0 && data.points <= 100 &&
+        data.points is number && data.points >= 0 && data.points <= 100 &&
         data.maxPoints is number && data.maxPoints >= 0 && data.maxPoints <= 100 &&
         data.date is string && data.date.size() == 10 && data.date.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$') &&
         data.description is string && data.description.size() >= 1 && data.description.size() <= 300 &&
@@ -872,7 +881,7 @@ service cloud.firestore {
               'professorNames', 'assistantNames', 'studyProgram',
               'categoryIds', 'itemIds', 'sessionIds', 'examTermIds', 'scheduleEventIds',
               'isArchived',
-              'attendanceEnabled', 'attendanceMaxPoints', 'allowBonusPoints',
+              'attendanceEnabled', 'attendanceMaxPoints', 'allowBonusPoints', 'activityMarksEnabled',
               'grade6Threshold', 'grade7Threshold', 'grade8Threshold', 'grade9Threshold', 'grade10Threshold',
               'updatedAt'
             ])
@@ -892,10 +901,11 @@ service cloud.firestore {
               incoming().diff(existing()).affectedKeys().hasOnly([
                 'name', 'semester', 'academicYear', 'ects', 'leadProfessorName',
                 'professorNames', 'assistantNames', 'studyProgram',
-                'attendanceEnabled', 'attendanceMaxPoints', 'allowBonusPoints',
+                'attendanceEnabled', 'attendanceMaxPoints', 'allowBonusPoints', 'activityMarksEnabled',
                 'grade6Threshold', 'grade7Threshold', 'grade8Threshold', 'grade9Threshold', 'grade10Threshold',
                 'updatedAt'
               ]) ||
+              incoming().diff(existing()).affectedKeys().hasOnly(['activityMarksEnabled', 'updatedAt']) ||
               incoming().diff(existing()).affectedKeys().hasOnly([
                 'leadProfessorName', 'professorNames', 'assistantNames', 'updatedAt'
               ]) ||

@@ -65,11 +65,27 @@ export interface ActivityAwardBreakdownRow {
 }
 
 export interface ActivitySummary {
+  enabled: boolean;
   awards: ActivityAwardBreakdownRow[];
+  plusCount: number;
   earnedPoints: number;
   maxPoints: number;
   /** Non-null when awards are absorbed into an empty "Aktivnost" category so maxPoints aren't double-counted */
   linkedCategoryId: string | null;
+}
+
+/**
+ * Determines whether a course uses plus (+) / activity marks.
+ * Explicitly enabled courses return true; explicitly disabled courses return false;
+ * legacy courses without the flag default to false unless activity records already exist.
+ */
+export function isCourseActivityEnabled(
+  course: Pick<Course, 'activityMarksEnabled'>,
+  recordedAwardsCount: number = 0
+): boolean {
+  if (course.activityMarksEnabled === true) return true;
+  if (course.activityMarksEnabled === false) return false;
+  return recordedAwardsCount > 0;
 }
 
 export interface CourseStudentSummary {
@@ -396,14 +412,19 @@ export function calculateCourseStudentSummary(params: {
     }
   }
 
-  // Deduplicate activity awards by id for this course & student
+  // Deduplicate activity awards by id for this course & student (respecting course.activityMarksEnabled)
   const awardMap = new Map<string, ActivityAward>();
-  for (const aw of activityAwards) {
-    if (aw.courseId === course.id && aw.studentId === studentId) {
-      awardMap.set(aw.id, aw);
+  if (course.activityMarksEnabled !== false) {
+    for (const aw of activityAwards) {
+      if (aw.courseId === course.id && aw.studentId === studentId) {
+        awardMap.set(aw.id, aw);
+      }
     }
   }
-  const studentAwards = [...awardMap.values()].sort((a, b) => b.date.localeCompare(a.date));
+  const studentAwards = [...awardMap.values()].sort(
+    (a, b) => b.date.localeCompare(a.date) || b.id.localeCompare(a.id)
+  );
+  const activityEnabled = isCourseActivityEnabled(course, studentAwards.length);
 
   let rawActivityEarned = 0;
   let rawActivityMax = 0;
@@ -423,13 +444,16 @@ export function calculateCourseStudentSummary(params: {
     };
   });
 
-  // Check if the course already defines an empty "Aktivnost" category so we don't double-count max points
+  // Check if the course already defines an empty "Aktivnost" category so numeric activity points don't double-count max points
+  // Pure 0-point plus (+) marks stay standalone so they never zero-out a numeric category
   const emptyActivityCat = courseCategories.find((cat) => {
     const hasItems = [...activeItemMap.values()].some((it) => it.categoryId === cat.id);
     return !hasItems && /aktivnost|activity/i.test(cat.name);
   });
   const linkedActivityCategoryId =
-    emptyActivityCat && awardRows.length > 0 ? emptyActivityCat.id : null;
+    emptyActivityCat && awardRows.length > 0 && rawActivityEarned > 0
+      ? emptyActivityCat.id
+      : null;
 
   const attendance = calculateAttendance({
     attendanceEnabled: course.attendanceEnabled,
@@ -527,7 +551,9 @@ export function calculateCourseStudentSummary(params: {
   const standaloneActivityMax = linkedActivityCategoryId ? 0 : roundTo2(rawActivityMax);
 
   const activitySummary: ActivitySummary = {
+    enabled: activityEnabled,
     awards: awardRows,
+    plusCount: awardRows.length,
     earnedPoints: linkedActivityCategoryId
       ? categoryBreakdowns.find((c) => c.category.id === linkedActivityCategoryId)?.earnedPoints ??
         roundTo2(rawActivityEarned)

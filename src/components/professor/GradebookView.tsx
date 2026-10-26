@@ -5,13 +5,15 @@ import {
   Edit3,
   ListChecks,
   Plus,
+  RotateCcw,
   Save,
+  Search,
   Table2,
   Trash2,
   UserCheck,
 } from 'lucide-react';
 import { toast } from 'sonner';
-import { getTodayIsoLocal } from '../../lib/calculations';
+import { getTodayIsoLocal, isCourseActivityEnabled } from '../../lib/calculations';
 import { cn, formatBosnianDate, formatPoints } from '../../lib/utils';
 import { validateActivityAwardInput, validateScoreInput } from '../../lib/validation';
 import {
@@ -70,8 +72,16 @@ export function GradebookView({
     [enrollments]
   );
 
-  // Top-level section switch: Assessments Gradebook vs Activity Points
+  const activityEnabled = isCourseActivityEnabled(course, activityAwards.length);
+
+  // Top-level section switch: Assessments Gradebook vs Activity Marks (+)
   const [activeSection, setActiveSection] = useState<'items' | 'activity'>('items');
+
+  useEffect(() => {
+    if (!activityEnabled && activeSection === 'activity') {
+      setActiveSection('items');
+    }
+  }, [activityEnabled, activeSection]);
 
   // Entry mode inside Assessments Gradebook: Single-student sequential entry vs Tabular sheet
   const [entryMode, setEntryMode] = useState<'single' | 'table'>('table');
@@ -109,15 +119,15 @@ export function GradebookView({
   const [deleting, setDeleting] = useState(false);
 
   // =========================================================================
-  // Activity Points (Bodovi za aktivnost) State
+  // Activity Marks (+) & Optional Points State
   // =========================================================================
-  const [actStudentId, setActStudentId] = useState<string>('');
+  const [actRosterSearch, setActRosterSearch] = useState<string>('');
   const [actPointsStr, setActPointsStr] = useState<string>('');
-  const [actMaxPointsStr, setActMaxPointsStr] = useState<string>('');
   const [actDate, setActDate] = useState<string>(getTodayIsoLocal());
   const [actDescription, setActDescription] = useState<string>('');
   const [actFormError, setActFormError] = useState<string | null>(null);
-  const [actSaving, setActSaving] = useState(false);
+  const [addingPlusStudentId, setAddingPlusStudentId] = useState<string | null>(null);
+  const [undoingStudentId, setUndoingStudentId] = useState<string | null>(null);
   const [actFilterStudentId, setActFilterStudentId] = useState<string>('all');
 
   // Edit / Delete Activity Award Modals
@@ -142,19 +152,13 @@ export function GradebookView({
     });
   }, [sortedItems]);
 
-  // Keep singleStudentId and actStudentId valid when course roster loads/changes
+  // Keep singleStudentId valid when course roster loads/changes
   useEffect(() => {
     if (sortedStudents.length === 0) {
       setSingleStudentId('');
-      setActStudentId('');
       return;
     }
     setSingleStudentId((prev) =>
-      prev && sortedStudents.some((s) => s.studentId === prev)
-        ? prev
-        : sortedStudents[0].studentId
-    );
-    setActStudentId((prev) =>
       prev && sortedStudents.some((s) => s.studentId === prev)
         ? prev
         : sortedStudents[0].studentId
@@ -479,7 +483,7 @@ export function GradebookView({
   };
 
   // =========================================================================
-  // Activity Points Handlers
+  // Activity Marks (+) & Optional Points Handlers
   // =========================================================================
   const sortedActivityAwards = useMemo(
     () =>
@@ -488,6 +492,26 @@ export function GradebookView({
       ),
     [activityAwards]
   );
+
+  const awardsByStudentMap = useMemo(() => {
+    const map: Record<string, ActivityAward[]> = {};
+    for (const aw of sortedActivityAwards) {
+      if (!map[aw.studentId]) map[aw.studentId] = [];
+      map[aw.studentId].push(aw);
+    }
+    return map;
+  }, [sortedActivityAwards]);
+
+  const filteredActivityRoster = useMemo(() => {
+    const q = actRosterSearch.trim().toLowerCase();
+    if (!q) return sortedStudents;
+    return sortedStudents.filter(
+      (s) =>
+        s.studentName.toLowerCase().includes(q) ||
+        s.studentIndex.toLowerCase().includes(q) ||
+        s.studentDepartment.toLowerCase().includes(q)
+    );
+  }, [sortedStudents, actRosterSearch]);
 
   const visibleActivityAwards = useMemo(() => {
     if (actFilterStudentId === 'all') return sortedActivityAwards;
@@ -502,58 +526,72 @@ export function GradebookView({
     return map;
   }, [sortedStudents]);
 
-  const handleCreateActivity = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!actStudentId || actSaving) return;
+  const handleQuickAddPlus = async (studentId: string) => {
+    if (addingPlusStudentId === studentId) return;
     setActFormError(null);
 
-    const pts = Number(actPointsStr);
-    const maxPts = actMaxPointsStr.trim() === '' ? 0 : Number(actMaxPointsStr);
+    const trimmedPts = actPointsStr.trim();
+    const pts = trimmedPts === '' ? 0 : Number(trimmedPts);
+    const effectiveDesc = actDescription.trim() || 'Urađena vježba (+)';
 
     const validation = validateActivityAwardInput({
       points: pts,
-      maxPoints: maxPts,
+      maxPoints: 0,
       date: actDate,
-      description: actDescription,
+      description: effectiveDesc,
       allowBonusPoints: course.allowBonusPoints,
     });
     if (!validation.valid) {
-      const msg = validation.error || 'Provjerite podatke za bodove aktivnosti.';
+      const msg = validation.error || 'Provjerite podatke za evidenciju aktivnosti.';
       setActFormError(msg);
       toast.error(msg);
       return;
     }
 
-    const stu = studentByIdMap[actStudentId];
-    setActSaving(true);
+    const stu = studentByIdMap[studentId];
+    setAddingPlusStudentId(studentId);
     try {
       await createActivityAward({
         course,
-        studentId: actStudentId,
+        studentId,
         points: pts,
-        maxPoints: maxPts,
+        maxPoints: 0,
         date: actDate,
-        description: actDescription,
+        description: effectiveDesc,
         professorUid,
       });
-      // Retain course, date & optional maxPoints; clear points & description for next entry
-      setActPointsStr('');
-      setActDescription('');
       toast.success(
-        `Dodijeljeno +${formatPoints(pts)} b za aktivnost (${stu?.studentName || 'student'}).`
+        pts > 0
+          ? `Evidentiran + (${formatPoints(pts)} b) — ${stu?.studentName || 'student'}.`
+          : `Evidentiran plus (+) za aktivnost — ${stu?.studentName || 'student'}.`
       );
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Greška pri dodjeli bodova za aktivnost.';
+      const msg = err instanceof Error ? err.message : 'Greška pri evidenciji plusa (+).';
       setActFormError(msg);
       toast.error(msg);
     } finally {
-      setActSaving(false);
+      setAddingPlusStudentId(null);
+    }
+  };
+
+  const handleQuickUndoLatestPlus = async (studentId: string) => {
+    const latest = awardsByStudentMap[studentId]?.[0];
+    if (!latest || undoingStudentId === studentId) return;
+    const stu = studentByIdMap[studentId];
+    setUndoingStudentId(studentId);
+    try {
+      await deleteActivityAward(latest.id);
+      toast.info(`Poništen zadnji plus (+) — ${stu?.studentName || 'student'}.`);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Greška pri poništavanju plusa.');
+    } finally {
+      setUndoingStudentId(null);
     }
   };
 
   const openEditAwardModal = (award: ActivityAward) => {
     setEditingAward(award);
-    setEditAwardPoints(String(award.points));
+    setEditAwardPoints(award.points > 0 ? String(award.points) : '');
     setEditAwardMax(award.maxPoints > 0 ? String(award.maxPoints) : '');
     setEditAwardDate(award.date);
     setEditAwardDesc(award.description);
@@ -562,8 +600,9 @@ export function GradebookView({
   const handleSaveEditAward = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!editingAward || editAwardSaving) return;
-    const pts = Number(editAwardPoints);
+    const pts = editAwardPoints.trim() === '' ? 0 : Number(editAwardPoints);
     const maxPts = editAwardMax.trim() === '' ? 0 : Number(editAwardMax);
+    const effectiveDesc = editAwardDesc.trim() || 'Urađena vježba (+)';
 
     setEditAwardSaving(true);
     try {
@@ -573,7 +612,7 @@ export function GradebookView({
         points: pts,
         maxPoints: maxPts,
         date: editAwardDate,
-        description: editAwardDesc,
+        description: effectiveDesc,
         professorUid,
       });
       setEditingAward(null);
@@ -591,7 +630,7 @@ export function GradebookView({
     try {
       await deleteActivityAward(deletingAwardTarget.id);
       setDeletingAwardTarget(null);
-      toast.success('Zapis o bodovima za aktivnost je uklonjen.');
+      toast.success('Zapis o aktivnosti je uklonjen.');
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Greška pri brisanju zapisa.');
     } finally {
@@ -607,44 +646,56 @@ export function GradebookView({
     ? scores.filter((s) => s.itemId === activeItem.id).length
     : 0;
 
+  const parsedQuickPoints =
+    actPointsStr.trim() !== '' && Number.isFinite(Number(actPointsStr)) && Number(actPointsStr) > 0
+      ? Number(actPointsStr)
+      : 0;
+
   return (
     <div className="space-y-5">
-      {/* Top Toolbar: Switch between Grading Items & Activity Points */}
+      {/* Top Toolbar: Switch between Grading Items & Activity Marks (+) when enabled on course */}
       <div className="bg-white border border-slate-200 rounded-xl p-4 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
         <div className="flex flex-col sm:flex-row sm:items-center gap-3">
-          <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-lg self-start">
-            <button
-              type="button"
-              onClick={() => setActiveSection('items')}
-              className={cn(
-                'px-3 py-1.5 text-xs font-medium rounded-md transition-colors cursor-pointer whitespace-nowrap shrink-0 flex items-center gap-1.5',
-                activeSection === 'items'
-                  ? 'bg-white text-slate-900 shadow-xs'
-                  : 'text-slate-600 hover:text-slate-900'
-              )}
-            >
-              <ListChecks className="w-3.5 h-3.5" />
-              Provjere, zadaci i ispiti ({sortedItems.length})
-            </button>
-            <button
-              type="button"
-              onClick={() => setActiveSection('activity')}
-              className={cn(
-                'px-3 py-1.5 text-xs font-medium rounded-md transition-colors cursor-pointer whitespace-nowrap shrink-0 flex items-center gap-1.5',
-                activeSection === 'activity'
-                  ? 'bg-white text-slate-900 shadow-xs'
-                  : 'text-slate-600 hover:text-slate-900'
-              )}
-            >
-              <Award className="w-3.5 h-3.5" />
-              Bodovi za aktivnost ({sortedActivityAwards.length})
-            </button>
-          </div>
+          {activityEnabled ? (
+            <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-lg self-start">
+              <button
+                type="button"
+                onClick={() => setActiveSection('items')}
+                className={cn(
+                  'px-3 py-1.5 text-xs font-medium rounded-md transition-colors cursor-pointer whitespace-nowrap shrink-0 flex items-center gap-1.5 tabular-nums',
+                  activeSection === 'items'
+                    ? 'bg-white text-slate-900 shadow-xs'
+                    : 'text-slate-600 hover:text-slate-900'
+                )}
+              >
+                <ListChecks className="w-3.5 h-3.5" />
+                Provjere, zadaci i ispiti ({sortedItems.length})
+              </button>
+              <button
+                type="button"
+                onClick={() => setActiveSection('activity')}
+                className={cn(
+                  'px-3 py-1.5 text-xs font-medium rounded-md transition-colors cursor-pointer whitespace-nowrap shrink-0 flex items-center gap-1.5 tabular-nums',
+                  activeSection === 'activity'
+                    ? 'bg-white text-slate-900 shadow-xs'
+                    : 'text-slate-600 hover:text-slate-900'
+                )}
+              >
+                <Award className="w-3.5 h-3.5" />
+                Tačke / Aktivnost (+) ({sortedActivityAwards.length})
+              </button>
+            </div>
+          ) : (
+            <div className="flex items-center gap-2 text-sm font-semibold text-slate-900">
+              <ListChecks className="w-4 h-4 text-blue-700 shrink-0" />
+              <span>Provjere, zadaci i ispiti ({sortedItems.length})</span>
+            </div>
+          )}
 
           <p className="text-xs text-slate-500">
-            {activeSection === 'items'
-              ? 'Kontekst predmeta i izabrane stavke ostaje sačuvan između unosa.'
-              : 'Dodijelite pojedinačne bodove za aktivnost na predavanjima ili vježbama.'}
+            {activeSection === 'activity' && activityEnabled
+              ? 'Svi studenti sa predmeta su izlistani ispod — jednim klikom dodajte plus (+) za urađenu vježbu (unos bodova nije obavezan).'
+              : 'Kontekst predmeta i izabrane stavke ostaje sačuvan između unosa.'}
           </p>
         </div>
 
@@ -693,106 +744,58 @@ export function GradebookView({
       </div>
 
       {/* =====================================================================
-          SECTION A: BODOVI ZA AKTIVNOST (Activity Points)
+          SECTION A: TAČKE / AKTIVNOST (+) — Full Roster 1-Click (+) Entry
          ===================================================================== */}
-      {activeSection === 'activity' ? (
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 items-start">
-          {/* Left 5 Cols: Award Activity Points Form */}
-          <form
-            onSubmit={handleCreateActivity}
-            className="lg:col-span-5 bg-white border border-slate-200 rounded-xl p-5 space-y-4"
-          >
-            <div className="pb-3 border-b border-slate-100">
-              <h3 className="text-base font-semibold text-slate-900">
-                Dodijeli bodove za aktivnost
-              </h3>
-              <p className="text-xs text-slate-500 mt-0.5">
-                Bodovi ulaze u ukupan zbir predmeta bez duplog obračuna i odmah su vidljivi studentu.
-              </p>
-            </div>
-
-            {actFormError && (
-              <div className="rounded-lg border border-red-200 bg-red-50/70 px-3 py-2 text-xs text-red-800 font-medium">
-                {actFormError}
-              </div>
-            )}
-
-            {sortedStudents.length === 0 ? (
-              <div className="text-xs text-slate-500 py-4 text-center">
-                Nema upisanih studenata na predmetu {course.name}.
-              </div>
-            ) : (
-              <>
+      {activeSection === 'activity' && activityEnabled ? (
+        <div className="space-y-5">
+          {/* Card 1: Full Enrolled Student Roster for 1-Click (+) Marking */}
+          <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
+            <div className="px-5 py-4 border-b border-slate-200 space-y-3">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
                 <div>
-                  <Label htmlFor="act-stu">Student</Label>
-                  <select
-                    id="act-stu"
-                    value={actStudentId}
-                    onChange={(e) => {
-                      setActStudentId(e.target.value);
-                      if (actFormError) setActFormError(null);
-                    }}
-                    className="flex h-9 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-900"
-                    required
-                  >
-                    {sortedStudents.map((stu) => (
-                      <option key={stu.studentId} value={stu.studentId}>
-                        {stu.studentName} ({stu.studentIndex})
-                      </option>
-                    ))}
-                  </select>
+                  <h3 className="text-base font-semibold text-slate-900">
+                    Evidencija aktivnosti i urađenih vježbi (+)
+                  </h3>
+                  <p className="text-xs text-slate-500 mt-0.5">
+                    Kliknite „+ Dodaj plus“ pored studenta koji je uradio vježbu. Polje za bodove
+                    ostavite prazno za čistu evidenciju tačke (+).
+                  </p>
                 </div>
+                <div className="font-mono text-xs text-slate-600 tabular-nums shrink-0">
+                  Studenti: <strong className="text-slate-900">{sortedStudents.length}</strong> ·
+                  Ukupno pluseva:{' '}
+                  <strong className="text-emerald-700">{sortedActivityAwards.length}</strong>
+                </div>
+              </div>
 
-                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                  <div>
-                    <Label htmlFor="act-pts">Osvojeni bodovi</Label>
-                    <Input
-                      id="act-pts"
-                      type="number"
-                      step="0.25"
-                      min="0.25"
-                      max="100"
-                      value={actPointsStr}
-                      onChange={(e) => {
-                        setActPointsStr(e.target.value);
-                        if (actFormError) setActFormError(null);
-                      }}
-                      placeholder="npr. 2"
-                      className="font-mono tabular-nums"
-                      required
-                    />
-                  </div>
+              {actFormError && (
+                <div className="rounded-lg border border-red-200 bg-red-50/70 px-3 py-2 text-xs text-red-800 font-medium">
+                  {actFormError}
+                </div>
+              )}
 
-                  <div>
-                    <Label htmlFor="act-max">Maks. (opciono)</Label>
+              {/* Context Bar for 1-Click (+) Entry (Retained across clicks) */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-12 gap-3 pt-1">
+                <div className="lg:col-span-3">
+                  <Label htmlFor="act-roster-q" className="text-[11px]">
+                    Pretraga studenta
+                  </Label>
+                  <div className="relative">
+                    <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
                     <Input
-                      id="act-max"
-                      type="number"
-                      step="0.5"
-                      min="0"
-                      max="100"
-                      value={actMaxPointsStr}
-                      onChange={(e) => setActMaxPointsStr(e.target.value)}
-                      placeholder="Bonus / 0"
-                      className="font-mono tabular-nums"
-                    />
-                  </div>
-
-                  <div>
-                    <Label htmlFor="act-date">Datum</Label>
-                    <Input
-                      id="act-date"
-                      type="date"
-                      value={actDate}
-                      onChange={(e) => setActDate(e.target.value)}
-                      className="font-mono tabular-nums"
-                      required
+                      id="act-roster-q"
+                      value={actRosterSearch}
+                      onChange={(e) => setActRosterSearch(e.target.value)}
+                      placeholder="Ime ili broj indeksa..."
+                      className="pl-8 h-9 text-xs"
                     />
                   </div>
                 </div>
 
-                <div>
-                  <Label htmlFor="act-desc">Kratak opis / razlog dodjele</Label>
+                <div className="lg:col-span-4">
+                  <Label htmlFor="act-desc" className="text-[11px]">
+                    Opis vježbe / napomena uz plus (opciono)
+                  </Label>
                   <Input
                     id="act-desc"
                     value={actDescription}
@@ -800,53 +803,54 @@ export function GradebookView({
                       setActDescription(e.target.value);
                       if (actFormError) setActFormError(null);
                     }}
-                    placeholder="npr. Rješavanje zadatka na tabli ili aktivnost na vježbama"
+                    placeholder="Urađena vježba (+)"
                     maxLength={300}
-                    required
+                    className="h-9 text-xs"
                   />
                 </div>
 
-                <div className="pt-1 flex justify-end">
-                  <Button type="submit" disabled={actSaving}>
-                    <Plus className="w-4 h-4" />
-                    {actSaving ? 'Čuvanje...' : 'Dodijeli bodove za aktivnost'}
-                  </Button>
+                <div className="lg:col-span-2">
+                  <Label htmlFor="act-date" className="text-[11px]">
+                    Datum evidencije
+                  </Label>
+                  <Input
+                    id="act-date"
+                    type="date"
+                    value={actDate}
+                    onChange={(e) => setActDate(e.target.value)}
+                    className="h-9 font-mono text-xs tabular-nums"
+                  />
                 </div>
-              </>
-            )}
-          </form>
 
-          {/* Right 7 Cols: Recorded Activity Awards Table */}
-          <div className="lg:col-span-7 bg-white border border-slate-200 rounded-xl overflow-hidden">
-            <div className="px-5 py-4 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-              <div>
-                <h3 className="text-base font-semibold text-slate-900">
-                  Evidentirani bodovi za aktivnost ({visibleActivityAwards.length})
-                </h3>
-                <p className="text-xs text-slate-500 mt-0.5">
-                  Hronološki pregled svih pojedinačnih nagrada i aktivnosti na predmetu
-                </p>
+                <div className="lg:col-span-3">
+                  <Label htmlFor="act-pts" className="text-[11px]">
+                    Bodovi uz plus (opciono)
+                  </Label>
+                  <Input
+                    id="act-pts"
+                    type="number"
+                    step="0.25"
+                    min="0"
+                    max="100"
+                    value={actPointsStr}
+                    onChange={(e) => {
+                      setActPointsStr(e.target.value);
+                      if (actFormError) setActFormError(null);
+                    }}
+                    placeholder="Bez bodova (samo +)"
+                    className="h-9 font-mono text-xs tabular-nums"
+                  />
+                </div>
               </div>
-
-              {sortedStudents.length > 0 && (
-                <select
-                  value={actFilterStudentId}
-                  onChange={(e) => setActFilterStudentId(e.target.value)}
-                  className="h-8 rounded-lg border border-slate-300 bg-white px-2.5 text-xs text-slate-800"
-                >
-                  <option value="all">Svi studenti ({sortedActivityAwards.length})</option>
-                  {sortedStudents.map((stu) => (
-                    <option key={stu.studentId} value={stu.studentId}>
-                      {stu.studentName} ({stu.studentIndex})
-                    </option>
-                  ))}
-                </select>
-              )}
             </div>
 
-            {visibleActivityAwards.length === 0 ? (
+            {sortedStudents.length === 0 ? (
               <div className="p-8 text-center text-sm text-slate-500">
-                Još nema evidentiranih bodova za aktivnost za izabrani filter.
+                Nema upisanih studenata na predmetu {course.name}.
+              </div>
+            ) : filteredActivityRoster.length === 0 ? (
+              <div className="p-8 text-center text-sm text-slate-500">
+                Nijedan student ne odgovara pretrazi „{actRosterSearch}“.
               </div>
             ) : (
               <div className="overflow-x-auto">
@@ -854,9 +858,162 @@ export function GradebookView({
                   <thead>
                     <tr className="bg-slate-50 border-b border-slate-200 text-xs font-semibold text-slate-600">
                       <th className="text-left py-2.5 px-4">Student</th>
-                      <th className="text-left py-2.5 px-4">Opis aktivnosti</th>
+                      <th className="text-left py-2.5 px-4 whitespace-nowrap">Broj indeksa</th>
+                      <th className="text-left py-2.5 px-4">Evidentirani plusevi (+)</th>
+                      <th className="text-left py-2.5 px-4">Zadnja evidencija</th>
+                      <th className="text-right py-2.5 px-4 whitespace-nowrap">Brza akcija</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {filteredActivityRoster.map((stu) => {
+                      const stuAwards = awardsByStudentMap[stu.studentId] || [];
+                      const plusCount = stuAwards.length;
+                      const ptsSum = stuAwards.reduce((acc, a) => acc + a.points, 0);
+                      const latestAward = stuAwards[0] || null;
+                      const isAdding = addingPlusStudentId === stu.studentId;
+                      const isUndoing = undoingStudentId === stu.studentId;
+
+                      return (
+                        <tr key={stu.studentId} className="hover:bg-slate-50/70 transition-colors">
+                          <td className="py-2.5 px-4">
+                            <div className="font-medium text-slate-900">{stu.studentName}</div>
+                            <div className="text-xs text-slate-500">{stu.studentDepartment}</div>
+                          </td>
+                          <td className="py-2.5 px-4 font-mono text-xs text-slate-700 whitespace-nowrap tabular-nums">
+                            {stu.studentIndex}
+                          </td>
+                          <td className="py-2.5 px-4">
+                            {plusCount === 0 ? (
+                              <span className="text-xs text-slate-400">Bez pluseva</span>
+                            ) : (
+                              <div className="flex flex-wrap items-center gap-2 font-mono tabular-nums">
+                                <span className="text-sm font-bold text-emerald-700 tracking-wider">
+                                  {Array.from({ length: Math.min(plusCount, 10) })
+                                    .map(() => '+')
+                                    .join(' ')}
+                                  {plusCount > 10 ? ` …` : ''}
+                                </span>
+                                <span className="text-xs font-semibold text-slate-700">
+                                  ({plusCount} × +
+                                  {ptsSum > 0 ? ` · +${formatPoints(ptsSum)} b` : ''})
+                                </span>
+                              </div>
+                            )}
+                          </td>
+                          <td className="py-2.5 px-4 text-xs text-slate-600">
+                            {latestAward ? (
+                              <button
+                                type="button"
+                                onClick={() => setActFilterStudentId(stu.studentId)}
+                                className="text-left hover:text-blue-700 transition-colors cursor-pointer"
+                              >
+                                <div className="truncate max-w-xs font-medium text-slate-800">
+                                  {latestAward.description}
+                                </div>
+                                <div className="font-mono text-[11px] text-slate-400 tabular-nums">
+                                  {formatBosnianDate(latestAward.date)}
+                                  {latestAward.points > 0
+                                    ? ` · +${formatPoints(latestAward.points)} b`
+                                    : ''}
+                                </div>
+                              </button>
+                            ) : (
+                              <span className="text-slate-400">—</span>
+                            )}
+                          </td>
+                          <td className="py-2.5 px-4 text-right whitespace-nowrap">
+                            <div className="inline-flex items-center gap-1.5">
+                              {plusCount > 0 && (
+                                <Button
+                                  type="button"
+                                  variant="ghost"
+                                  size="sm"
+                                  disabled={isAdding || isUndoing}
+                                  onClick={() => void handleQuickUndoLatestPlus(stu.studentId)}
+                                  className="h-8 px-2 text-xs text-slate-500 hover:text-red-700 hover:bg-red-50"
+                                  title="Poništi zadnji dodijeljeni plus (+)"
+                                >
+                                  <RotateCcw className="w-3.5 h-3.5" />
+                                  <span className="hidden sm:inline">Poništi</span>
+                                </Button>
+                              )}
+                              <Button
+                                type="button"
+                                size="sm"
+                                disabled={isAdding || isUndoing}
+                                onClick={() => void handleQuickAddPlus(stu.studentId)}
+                                className="h-8 px-3 font-medium"
+                              >
+                                <Plus className="w-3.5 h-3.5" />
+                                {isAdding
+                                  ? 'Upis...'
+                                  : parsedQuickPoints > 0
+                                    ? `Dodaj + (${formatPoints(parsedQuickPoints)} b)`
+                                    : 'Dodaj plus'}
+                              </Button>
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+
+          {/* Card 2: Chronological Log of Recorded (+) Marks & Activity Awards */}
+          <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
+            <div className="px-5 py-4 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div>
+                <h3 className="text-base font-semibold text-slate-900">
+                  Hronološki dnevnik evidentiranih pluseva ({visibleActivityAwards.length})
+                </h3>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Pregled, izmjena i brisanje pojedinačnih zapisa o urađenim vježbama i aktivnosti
+                </p>
+              </div>
+
+              {sortedStudents.length > 0 && (
+                <div className="flex items-center gap-2">
+                  {actFilterStudentId !== 'all' && (
+                    <button
+                      type="button"
+                      onClick={() => setActFilterStudentId('all')}
+                      className="text-xs text-blue-700 hover:underline cursor-pointer whitespace-nowrap"
+                    >
+                      Prikaži sve
+                    </button>
+                  )}
+                  <select
+                    value={actFilterStudentId}
+                    onChange={(e) => setActFilterStudentId(e.target.value)}
+                    className="h-8 rounded-lg border border-slate-300 bg-white px-2.5 text-xs text-slate-800"
+                  >
+                    <option value="all">Svi studenti ({sortedActivityAwards.length})</option>
+                    {sortedStudents.map((stu) => (
+                      <option key={stu.studentId} value={stu.studentId}>
+                        {stu.studentName} ({stu.studentIndex})
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
+            </div>
+
+            {visibleActivityAwards.length === 0 ? (
+              <div className="p-8 text-center text-sm text-slate-500">
+                Još nema evidentiranih pluseva za aktivnost za izabrani filter.
+              </div>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm border-collapse">
+                  <thead>
+                    <tr className="bg-slate-50 border-b border-slate-200 text-xs font-semibold text-slate-600">
+                      <th className="text-left py-2.5 px-4">Student</th>
+                      <th className="text-left py-2.5 px-4">Opis vježbe / aktivnosti</th>
                       <th className="text-left py-2.5 px-4 whitespace-nowrap">Datum</th>
-                      <th className="text-right py-2.5 px-4 whitespace-nowrap">Bodovi</th>
+                      <th className="text-right py-2.5 px-4 whitespace-nowrap">Evidencija</th>
                       <th className="text-right py-2.5 px-4">Akcija</th>
                     </tr>
                   </thead>
@@ -882,8 +1039,11 @@ export function GradebookView({
                             {formatBosnianDate(aw.date)}
                           </td>
                           <td className="py-2.5 px-4 text-right font-mono font-semibold text-emerald-700 whitespace-nowrap tabular-nums">
-                            +{formatPoints(aw.points)}
-                            {aw.maxPoints > 0 ? ` / ${formatPoints(aw.maxPoints)}` : ''} b
+                            {aw.points > 0
+                              ? `+ (${formatPoints(aw.points)}${
+                                  aw.maxPoints > 0 ? ` / ${formatPoints(aw.maxPoints)}` : ''
+                                } b)`
+                              : '+ (tačka)'}
                           </td>
                           <td className="py-2.5 px-4 text-right whitespace-nowrap">
                             <div className="inline-flex items-center gap-1">
@@ -1410,23 +1570,23 @@ export function GradebookView({
       <Dialog
         open={Boolean(editingAward)}
         onOpenChange={(o) => !o && setEditingAward(null)}
-        title="Uredi zapis o bodovima za aktivnost"
-        description="Izmijenite broj bodova, datum ili opis aktivnosti studenta."
+        title="Uredi zapis o aktivnosti (+)"
+        description="Izmijenite opis vježbe, datum ili opcione bodove uz plus."
       >
         <form onSubmit={handleSaveEditAward} className="space-y-4">
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
             <div>
-              <Label htmlFor="ed-act-pts">Osvojeni bodovi</Label>
+              <Label htmlFor="ed-act-pts">Bodovi (opciono)</Label>
               <Input
                 id="ed-act-pts"
                 type="number"
                 step="0.25"
-                min="0.25"
+                min="0"
                 max="100"
                 value={editAwardPoints}
                 onChange={(e) => setEditAwardPoints(e.target.value)}
+                placeholder="Samo + (0)"
                 className="font-mono tabular-nums"
-                required
               />
             </div>
             <div>
@@ -1457,13 +1617,13 @@ export function GradebookView({
           </div>
 
           <div>
-            <Label htmlFor="ed-act-desc">Kratak opis / razlog dodjele</Label>
+            <Label htmlFor="ed-act-desc">Opis vježbe / napomena (opciono)</Label>
             <Input
               id="ed-act-desc"
               value={editAwardDesc}
               onChange={(e) => setEditAwardDesc(e.target.value)}
+              placeholder="Urađena vježba (+)"
               maxLength={300}
-              required
             />
           </div>
 
@@ -1483,7 +1643,13 @@ export function GradebookView({
         open={Boolean(deletingAwardTarget)}
         onOpenChange={(o) => !o && setDeletingAwardTarget(null)}
         title="Brisanje zapisa o aktivnosti"
-        description={`Želite li ukloniti zapis „${deletingAwardTarget?.description}“ (+${deletingAwardTarget ? formatPoints(deletingAwardTarget.points) : 0} b)?`}
+        description={
+          deletingAwardTarget
+            ? deletingAwardTarget.points > 0
+              ? `Želite li ukloniti zapis „${deletingAwardTarget.description}“ (+${formatPoints(deletingAwardTarget.points)} b)?`
+              : `Želite li ukloniti evidentirani plus (+) „${deletingAwardTarget.description}“?`
+            : ''
+        }
       >
         <div className="flex justify-end gap-2 pt-2">
           <Button variant="outline" onClick={() => setDeletingAwardTarget(null)}>

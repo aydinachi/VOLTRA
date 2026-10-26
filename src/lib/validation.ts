@@ -224,8 +224,8 @@ export function validateActivityAwardInput(params: {
   if (typeof points !== 'number' || Number.isNaN(points) || !Number.isFinite(points)) {
     return { valid: false, error: 'Broj bodova za aktivnost mora biti ispravan broj.' };
   }
-  if (points <= 0) {
-    return { valid: false, error: 'Bodovi za aktivnost moraju biti veći od 0.' };
+  if (points < 0) {
+    return { valid: false, error: 'Bodovi za aktivnost ne mogu biti negativni.' };
   }
   if (points > 100) {
     return { valid: false, error: 'Pojedinačni unos aktivnosti ne može preći 100 bodova.' };

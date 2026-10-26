@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { Edit3, Link2, Plus, Save, Trash2, UserCheck, UserPlus, Users, X } from 'lucide-react';
 import { toast } from 'sonner';
 import { useAuth } from '../../context/AuthContext';
+import { isCourseActivityEnabled } from '../../lib/calculations';
 import {
   getSemesterPresetsForProgram,
   STUDY_PROGRAM_GROUPS,
@@ -62,6 +63,9 @@ export function CourseSettingsView({
     String(course.attendanceMaxPoints)
   );
   const [allowBonusPoints, setAllowBonusPoints] = useState(course.allowBonusPoints);
+  const [activityMarksEnabled, setActivityMarksEnabled] = useState(() =>
+    isCourseActivityEnabled(course)
+  );
   const [g6, setG6] = useState(String(course.grade6Threshold));
   const [g7, setG7] = useState(String(course.grade7Threshold));
   const [g8, setG8] = useState(String(course.grade8Threshold));
@@ -103,6 +107,7 @@ export function CourseSettingsView({
     setAttendanceEnabled(course.attendanceEnabled);
     setAttendanceMaxPoints(String(course.attendanceMaxPoints));
     setAllowBonusPoints(course.allowBonusPoints);
+    setActivityMarksEnabled(isCourseActivityEnabled(course));
     setG6(String(course.grade6Threshold));
     setG7(String(course.grade7Threshold));
     setG8(String(course.grade8Threshold));
@@ -261,6 +266,7 @@ export function CourseSettingsView({
         attendanceEnabled,
         attendanceMaxPoints: attendanceEnabled ? Number(attendanceMaxPoints) : 0,
         allowBonusPoints,
+        activityMarksEnabled,
         grade6Threshold: Number(g6),
         grade7Threshold: Number(g7),
         grade8Threshold: Number(g8),
@@ -673,9 +679,11 @@ export function CourseSettingsView({
             </div>
           </div>
 
-          {/* Attendance & Bonus Configuration */}
+          {/* Attendance, Activity (+) & Bonus Configuration */}
           <div className="pt-4 border-t border-slate-100 space-y-4">
-            <h3 className="text-sm font-semibold text-slate-900">Prisustvo i bonus bodovi</h3>
+            <h3 className="text-sm font-semibold text-slate-900">
+              Prisustvo, tačke za aktivnost (+) i bonus bodovi
+            </h3>
 
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-slate-50 border border-slate-200 rounded-lg p-3.5">
               <label className="flex items-center gap-2.5 text-sm text-slate-800 cursor-pointer">
@@ -707,6 +715,25 @@ export function CourseSettingsView({
                   />
                 </div>
               )}
+            </div>
+
+            <div className="bg-slate-50 border border-slate-200 rounded-lg p-3.5 space-y-1">
+              <label className="flex items-center gap-2.5 text-sm text-slate-800 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={activityMarksEnabled}
+                  onChange={(e) => setActivityMarksEnabled(e.target.checked)}
+                  className="rounded border-slate-300 text-blue-700"
+                />
+                <span className="font-medium">
+                  Koristi tačke / pluseve za aktivnost na predmetu (+)
+                </span>
+              </label>
+              <p className="text-xs text-slate-500 pl-6 leading-relaxed">
+                Omogućava brzu evidenciju pluseva (+) svim izlistanim studentima za urađene vježbe
+                bez obaveznog unosa bodova. Ako je isključeno, predmet nema sekciju za tačke
+                aktivnosti.
+              </p>
             </div>
 
             <label className="flex items-center gap-2.5 text-xs text-slate-700 cursor-pointer">

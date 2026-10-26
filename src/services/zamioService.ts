@@ -1327,6 +1327,7 @@ export async function createCourse(params: {
   ects: number;
   attendanceEnabled: boolean;
   attendanceMaxPoints: number;
+  activityMarksEnabled?: boolean;
 }): Promise<string> {
   const code = sanitizeText(
     params.code.toUpperCase().replace(/\s+/g, '-'),
@@ -1397,6 +1398,7 @@ export async function createCourse(params: {
         ? Math.max(0, Math.min(100, Number(params.attendanceMaxPoints ?? 10)))
         : 0,
       allowBonusPoints: false,
+      activityMarksEnabled: Boolean(params.activityMarksEnabled),
       grade6Threshold: 55,
       grade7Threshold: 65,
       grade8Threshold: 75,
@@ -1446,6 +1448,7 @@ export async function updateCourseSettings(
     attendanceEnabled: boolean;
     attendanceMaxPoints: number;
     allowBonusPoints: boolean;
+    activityMarksEnabled?: boolean;
     grade6Threshold: number;
     grade7Threshold: number;
     grade8Threshold: number;
@@ -1507,6 +1510,9 @@ export async function updateCourseSettings(
       updates.studyProgram,
       VALIDATION_CONSTRAINTS.STUDY_PROGRAM_MAX_LENGTH
     );
+  }
+  if (updates.activityMarksEnabled !== undefined) {
+    patch.activityMarksEnabled = Boolean(updates.activityMarksEnabled);
   }
 
   try {
@@ -3118,6 +3124,7 @@ async function seedDemoStudyProgramsIfMissing(params: {
       attendanceEnabled: true,
       attendanceMaxPoints: 10,
       allowBonusPoints: false,
+      activityMarksEnabled: false,
       grade6Threshold: 55,
       grade7Threshold: 65,
       grade8Threshold: 75,
@@ -3152,6 +3159,7 @@ async function seedDemoStudyProgramsIfMissing(params: {
       attendanceEnabled: true,
       attendanceMaxPoints: 10,
       allowBonusPoints: false,
+      activityMarksEnabled: false,
       grade6Threshold: 55,
       grade7Threshold: 65,
       grade8Threshold: 75,
@@ -3721,6 +3729,7 @@ export async function seedEtfDemoData(params: {
         attendanceEnabled: true,
         attendanceMaxPoints: 10,
         allowBonusPoints: false,
+        activityMarksEnabled: false,
         grade6Threshold: 55,
         grade7Threshold: 65,
         grade8Threshold: 75,
@@ -3756,6 +3765,7 @@ export async function seedEtfDemoData(params: {
         attendanceEnabled: true,
         attendanceMaxPoints: 10,
         allowBonusPoints: false,
+        activityMarksEnabled: false,
         grade6Threshold: 55,
         grade7Threshold: 65,
         grade8Threshold: 75,
@@ -3790,6 +3800,7 @@ export async function seedEtfDemoData(params: {
         attendanceEnabled: false,
         attendanceMaxPoints: 0,
         allowBonusPoints: false,
+        activityMarksEnabled: true,
         grade6Threshold: 50,
         grade7Threshold: 62,
         grade8Threshold: 74,
@@ -4454,6 +4465,7 @@ async function seedDemoPortalExtensionsIfMissing(params: {
           attendanceEnabled: false,
           attendanceMaxPoints: 0,
           allowBonusPoints: false,
+          activityMarksEnabled: false,
           grade6Threshold: 55,
           grade7Threshold: 65,
           grade8Threshold: 75,
@@ -4541,6 +4553,84 @@ async function seedDemoPortalExtensionsIfMissing(params: {
         // Non-blocking archived seed
       }
     }
+  }
+
+  // 5. Backfill activityMarksEnabled on existing seed courses & seed (+) marks on Operativni sistemi (doc. dr. Samir Ribić)
+  try {
+    const courseFlagSeeds: Array<{ id: string; enabled: boolean }> = [
+      { id: 'seed_crs_os', enabled: true },
+      { id: 'seed_crs_ar', enabled: false },
+      { id: 'seed_crs_tp', enabled: false },
+      { id: 'seed_crs_rs_web', enabled: false },
+      { id: 'seed_crs_ri_ass', enabled: false },
+    ];
+
+    await Promise.all(
+      courseFlagSeeds.map(async ({ id, enabled }) => {
+        const cRef = doc(db, 'courses', id);
+        const cSnap = await getDoc(cRef);
+        if (cSnap.exists() && cSnap.data().activityMarksEnabled === undefined) {
+          await updateDoc(cRef, {
+            activityMarksEnabled: enabled,
+            updatedAt: serverTimestamp(),
+          });
+        }
+      })
+    );
+
+    const firstOsPlusSnap = await getDoc(doc(db, 'activityAwards', 'seed_act_os_1'));
+    const osCourseSnap = await getDoc(doc(db, 'courses', 'seed_crs_os'));
+    if (!firstOsPlusSnap.exists() && osCourseSnap.exists()) {
+      const osProfIds = (osCourseSnap.data().professorIds as string[]) || [adminUid];
+      const osPlusSeeds = [
+        {
+          id: 'seed_act_os_1',
+          studentId: adminUid,
+          date: addDaysIso(today, -9),
+          description: 'Urađena vježba 1 — Sistemski pozivi i procesi (+)',
+        },
+        {
+          id: 'seed_act_os_2',
+          studentId: adminUid,
+          date: addDaysIso(today, -3),
+          description: 'Urađena vježba 2 — POSIX niti i semafori (+)',
+        },
+        {
+          id: 'seed_act_os_3',
+          studentId: 'seed_stu_haris',
+          date: addDaysIso(today, -9),
+          description: 'Urađena vježba 1 — Sistemski pozivi i procesi (+)',
+        },
+        {
+          id: 'seed_act_os_4',
+          studentId: 'seed_stu_amila',
+          date: addDaysIso(today, -3),
+          description: 'Urađena vježba 2 — POSIX niti i semafori (+)',
+        },
+      ];
+
+      await Promise.all(
+        osPlusSeeds.map(async (pl) => {
+          const enrSnap = await getDoc(doc(db, 'enrollments', `seed_crs_os_${pl.studentId}`));
+          if (!enrSnap.exists()) return;
+          await setDoc(doc(db, 'activityAwards', pl.id), {
+            courseId: 'seed_crs_os',
+            studentId: pl.studentId,
+            points: 0,
+            maxPoints: 0,
+            date: pl.date,
+            description: pl.description,
+            awardedBy: adminUid,
+            professorIds: osProfIds,
+            isSeed: true,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+        })
+      );
+    }
+  } catch {
+    // Non-blocking activity (+) seed
   }
 }
 
@@ -5027,6 +5117,7 @@ export async function archiveSemesterAndOpenNew(params: {
         attendanceEnabled: crs.attendanceEnabled,
         attendanceMaxPoints: crs.attendanceMaxPoints,
         allowBonusPoints: crs.allowBonusPoints,
+        activityMarksEnabled: Boolean(crs.activityMarksEnabled),
         grade6Threshold: crs.grade6Threshold,
         grade7Threshold: crs.grade7Threshold,
         grade8Threshold: crs.grade8Threshold,
@@ -5614,7 +5705,9 @@ export async function createActivityAward(params: {
     throw new Error('Odaberite ispravnog studenta sa predmeta.');
   }
 
-  const cleanDesc = sanitizeText(description, VALIDATION_CONSTRAINTS.ACTIVITY_DESC_MAX_LENGTH);
+  const cleanDesc =
+    sanitizeText(description, VALIDATION_CONSTRAINTS.ACTIVITY_DESC_MAX_LENGTH) ||
+    'Urađena vježba (+)';
   const roundedPts = Math.round((points + Number.EPSILON) * 100) / 100;
   const roundedMax = Math.round((Math.max(0, maxPoints) + Number.EPSILON) * 100) / 100;
 
@@ -5626,7 +5719,7 @@ export async function createActivityAward(params: {
     allowBonusPoints: course.allowBonusPoints,
   });
   if (!check.valid) {
-    throw new Error(check.error || 'Neispravni podaci za bodove aktivnosti.');
+    throw new Error(check.error || 'Neispravni podaci za evidenciju aktivnosti.');
   }
 
   const awardRef = doc(collection(db, 'activityAwards'));
@@ -5663,7 +5756,9 @@ export async function updateActivityAward(params: {
 }): Promise<void> {
   const { awardId, course, points, maxPoints = 0, date, description, professorUid } = params;
 
-  const cleanDesc = sanitizeText(description, VALIDATION_CONSTRAINTS.ACTIVITY_DESC_MAX_LENGTH);
+  const cleanDesc =
+    sanitizeText(description, VALIDATION_CONSTRAINTS.ACTIVITY_DESC_MAX_LENGTH) ||
+    'Urađena vježba (+)';
   const roundedPts = Math.round((points + Number.EPSILON) * 100) / 100;
   const roundedMax = Math.round((Math.max(0, maxPoints) + Number.EPSILON) * 100) / 100;
 
@@ -5675,7 +5770,7 @@ export async function updateActivityAward(params: {
     allowBonusPoints: course.allowBonusPoints,
   });
   if (!check.valid) {
-    throw new Error(check.error || 'Neispravni podaci za bodove aktivnosti.');
+    throw new Error(check.error || 'Neispravni podaci za evidenciju aktivnosti.');
   }
 
   try {

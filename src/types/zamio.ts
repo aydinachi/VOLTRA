@@ -158,6 +158,7 @@ export interface Course {
   attendanceEnabled: boolean;
   attendanceMaxPoints: number;
   allowBonusPoints: boolean;
+  activityMarksEnabled?: boolean;
   grade6Threshold: number;
   grade7Threshold: number;
   grade8Threshold: number;
