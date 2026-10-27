@@ -39,14 +39,17 @@ import {
 } from '../../lib/utils';
 import { emailToProvisionId, generateInitialPassword } from '../../lib/validation';
 import {
+  adminAssignProfessorToCourse,
   adminCreateUserAccount,
   AdminCreatedAccountResult,
   adminEnrollStudentInCourse,
+  adminUnassignProfessorFromCourse,
   adminUpdateUserAccount,
   archiveSemesterAndOpenNew,
   clearEtfDemoData,
   createCourse,
   ensurePresentationLogins,
+  formatProfessorDisplayName,
   PRESENTATION_ACCOUNTS,
   PresentationAccountSpec,
   removeEnrollment,
@@ -158,6 +161,12 @@ export function AdminPortal({ activeNav }: AdminPortalProps) {
   const [enrollManageStudent, setEnrollManageStudent] = useState<UserProfile | null>(null);
   const [enrollBusyId, setEnrollBusyId] = useState<string | null>(null);
 
+  // Manage Professor Courses Modal
+  const [courseManageProf, setCourseManageProf] = useState<UserProfile | null>(null);
+  const [profCourseSearch, setProfCourseSearch] = useState('');
+  const [profCourseFilter, setProfCourseFilter] = useState<'active' | 'archived' | 'all'>('active');
+  const [profCourseBusyKey, setProfCourseBusyKey] = useState<string | null>(null);
+
   // Courses Management State
   const [courseSearch, setCourseSearch] = useState('');
   const [programFilter, setProgramFilter] = useState<StudyCycleKey>('all');
@@ -177,6 +186,8 @@ export function AdminPortal({ activeNav }: AdminPortalProps) {
 
   // Edit Course Staff Modal
   const [staffEditCourse, setStaffEditCourse] = useState<Course | null>(null);
+  const [staffSelectedProfUids, setStaffSelectedProfUids] = useState<string[]>([]);
+  const [staffLeadProfUid, setStaffLeadProfUid] = useState<string>('');
   const [staffProfsInput, setStaffProfsInput] = useState('');
   const [staffAsstsInput, setStaffAsstsInput] = useState('');
   const [savingStaff, setSavingStaff] = useState(false);
@@ -316,11 +327,14 @@ export function AdminPortal({ activeNav }: AdminPortalProps) {
     if (!adminUid) return;
     setCreatingAccount(true);
     try {
+      const isStaff = newRole === 'professor' || newRole === 'admin';
       const selectedCourses =
         newRole === 'student'
           ? activeCourses.filter((c) => selectedInitialCourseIds.includes(c.id))
           : [];
-      const isStaff = newRole === 'professor' || newRole === 'admin';
+      const selectedProfCourses = isStaff
+        ? activeCourses.filter((c) => selectedInitialCourseIds.includes(c.id))
+        : [];
 
       const res = await adminCreateUserAccount({
         adminUid,
@@ -338,6 +352,9 @@ export function AdminPortal({ activeNav }: AdminPortalProps) {
         consultationHours: isStaff ? newConsult : '',
         phone: newPhone,
         coursesToEnroll: selectedCourses,
+        coursesToAssign: selectedProfCourses,
+        allEnrollments: enrollments,
+        allScheduleEvents: scheduleEvents,
       });
 
       setCreatedCredentials(res);
@@ -498,6 +515,56 @@ export function AdminPortal({ activeNav }: AdminPortalProps) {
     }
   };
 
+  const handleAssignProfToCourse = async (
+    professor: UserProfile,
+    course: Course,
+    makeLead = false
+  ) => {
+    setProfCourseBusyKey(`${course.id}_${makeLead ? 'lead' : 'assign'}`);
+    try {
+      const crsEnrs = enrollments.filter((e) => e.courseId === course.id);
+      const crsSched = scheduleEvents.filter((ev) => ev.courseId === course.id);
+      await adminAssignProfessorToCourse({
+        course,
+        professor,
+        makeLead,
+        courseEnrollments: crsEnrs,
+        courseScheduleEvents: crsSched,
+      });
+      toast.success(
+        makeLead
+          ? `${formatProfessorDisplayName(professor)} je postavljen kao nosilac predmeta ${course.code}.`
+          : `Predmet ${course.code} je dodijeljen nalogu ${formatProfessorDisplayName(professor)}.`
+      );
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Greška pri dodjeli predmeta nastavniku.');
+    } finally {
+      setProfCourseBusyKey(null);
+    }
+  };
+
+  const handleUnassignProfFromCourse = async (professor: UserProfile, course: Course) => {
+    setProfCourseBusyKey(`${course.id}_remove`);
+    try {
+      const crsEnrs = enrollments.filter((e) => e.courseId === course.id);
+      const crsSched = scheduleEvents.filter((ev) => ev.courseId === course.id);
+      await adminUnassignProfessorFromCourse({
+        course,
+        professor,
+        allStaffProfiles: professorUsers,
+        courseEnrollments: crsEnrs,
+        courseScheduleEvents: crsSched,
+      });
+      toast.success(
+        `Predmet ${course.code} je uklonjen sa naloga ${formatProfessorDisplayName(professor)}.`
+      );
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Greška pri uklanjanju predmeta.');
+    } finally {
+      setProfCourseBusyKey(null);
+    }
+  };
+
   const handleAdminCreateCourse = async (e: React.FormEvent) => {
     e.preventDefault();
     const chosenProf =
@@ -554,8 +621,80 @@ export function AdminPortal({ activeNav }: AdminPortalProps) {
 
   const openStaffEditor = (course: Course) => {
     setStaffEditCourse(course);
+    const validLinkedUids = course.professorIds.filter((uid) =>
+      professorUsers.some((p) => p.uid === uid)
+    );
+    const initialUids =
+      validLinkedUids.length > 0 ? validLinkedUids : [...course.professorIds];
+    setStaffSelectedProfUids(initialUids);
+    setStaffLeadProfUid(
+      initialUids.includes(course.leadProfessorId)
+        ? course.leadProfessorId
+        : initialUids[0] || ''
+    );
     setStaffProfsInput(getCourseProfessors(course).join(', '));
     setStaffAsstsInput(getCourseAssistants(course).join(', '));
+  };
+
+  const handleToggleStaffProfAccount = (prof: UserProfile, checked: boolean) => {
+    const formatted = formatProfessorDisplayName(prof);
+    const existingNames = staffProfsInput
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    if (checked) {
+      const nextUids = Array.from(new Set([...staffSelectedProfUids, prof.uid]));
+      setStaffSelectedProfUids(nextUids);
+      if (!staffLeadProfUid) setStaffLeadProfUid(prof.uid);
+      const alreadyNamed = existingNames.some(
+        (n) =>
+          n.toLowerCase() === formatted.toLowerCase() ||
+          n.toLowerCase().includes(prof.fullName.toLowerCase())
+      );
+      if (!alreadyNamed) {
+        setStaffProfsInput([...existingNames, formatted].join(', '));
+      }
+    } else {
+      if (staffSelectedProfUids.length <= 1) {
+        toast.error('Predmet mora imati najmanje jedan povezan nastavnički nalog.');
+        return;
+      }
+      const nextUids = staffSelectedProfUids.filter((id) => id !== prof.uid);
+      setStaffSelectedProfUids(nextUids);
+      if (staffLeadProfUid === prof.uid) {
+        setStaffLeadProfUid(nextUids[0] || '');
+      }
+      const filteredNames = existingNames.filter(
+        (n) =>
+          n.toLowerCase() !== formatted.toLowerCase() &&
+          n.toLowerCase() !== prof.fullName.toLowerCase()
+      );
+      if (filteredNames.length > 0) {
+        setStaffProfsInput(filteredNames.join(', '));
+      }
+    }
+  };
+
+  const handleChangeStaffLeadUid = (nextLeadUid: string) => {
+    setStaffLeadProfUid(nextLeadUid);
+    if (!staffSelectedProfUids.includes(nextLeadUid)) {
+      setStaffSelectedProfUids((prev) => [nextLeadUid, ...prev]);
+    }
+    const leadProf = professorUsers.find((p) => p.uid === nextLeadUid);
+    if (leadProf) {
+      const leadName = formatProfessorDisplayName(leadProf);
+      const existingNames = staffProfsInput
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+      const rest = existingNames.filter(
+        (n) =>
+          n.toLowerCase() !== leadName.toLowerCase() &&
+          !n.toLowerCase().includes(leadProf.fullName.toLowerCase())
+      );
+      setStaffProfsInput([leadName, ...rest].join(', '));
+    }
   };
 
   const handleSaveCourseStaff = async (e: React.FormEvent) => {
@@ -572,15 +711,26 @@ export function AdminPortal({ activeNav }: AdminPortalProps) {
         .map((s) => s.trim())
         .filter(Boolean);
       const crsEnrs = enrollments.filter((enr) => enr.courseId === staffEditCourse.id);
+      const crsSched = scheduleEvents.filter((ev) => ev.courseId === staffEditCourse.id);
+
+      const orderedUids = staffLeadProfUid
+        ? [
+            staffLeadProfUid,
+            ...staffSelectedProfUids.filter((id) => id !== staffLeadProfUid),
+          ]
+        : staffSelectedProfUids;
 
       await updateCourseTeachingStaff({
         course: staffEditCourse,
         professorNames: profList,
         assistantNames: asstList,
         enrollments: crsEnrs,
+        professorIds: orderedUids.length > 0 ? orderedUids : undefined,
+        leadProfessorId: staffLeadProfUid || undefined,
+        courseScheduleEvents: crsSched,
       });
       setStaffEditCourse(null);
-      toast.success('Nastavno osoblje na predmetu je ažurirano.');
+      toast.success('Nastavno osoblje i pristup nalozima na predmetu su ažurirani.');
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Greška pri ažuriranju osoblja.');
     } finally {
@@ -1304,11 +1454,66 @@ export function AdminPortal({ activeNav }: AdminPortalProps) {
           open={Boolean(staffEditCourse)}
           onOpenChange={(o) => !o && setStaffEditCourse(null)}
           title={`Nastavno osoblje — ${staffEditCourse?.code || ''}`}
-          description="Unesite imena jednog ili više profesora i asistenata odvojena zarezom."
+          description="Povežite postojeće profesorske naloge (kako bi vidjeli predmet u svom portalu) i uredite prikazana imena profesora i asistenata."
         >
           <form onSubmit={handleSaveCourseStaff} className="space-y-4 text-left">
+            {professorUsers.length > 0 && (
+              <>
+                <div>
+                  <Label htmlFor="stf-lead-uid">Odgovorni nastavnik (nosilac naloga)</Label>
+                  <select
+                    id="stf-lead-uid"
+                    value={staffLeadProfUid}
+                    onChange={(e) => handleChangeStaffLeadUid(e.target.value)}
+                    className="flex h-9 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-900"
+                  >
+                    {professorUsers.map((p) => (
+                      <option key={p.uid} value={p.uid}>
+                        {formatProfessorDisplayName(p)} ({privatesByUid[p.uid]?.email || p.department})
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div>
+                  <Label>Profesorski nalozi sa pristupom portalu predmeta</Label>
+                  <div className="mt-1 max-h-40 overflow-y-auto border border-slate-200 rounded-lg divide-y divide-slate-100">
+                    {professorUsers.map((p) => {
+                      const checked = staffSelectedProfUids.includes(p.uid);
+                      const isLead = staffLeadProfUid === p.uid;
+                      return (
+                        <label
+                          key={p.uid}
+                          className="flex items-center justify-between gap-2 px-3 py-2 text-xs hover:bg-slate-50 cursor-pointer"
+                        >
+                          <div className="flex items-center gap-2.5 min-w-0">
+                            <input
+                              type="checkbox"
+                              checked={checked}
+                              onChange={(e) => handleToggleStaffProfAccount(p, e.target.checked)}
+                            />
+                            <span className="font-medium text-slate-900 truncate">
+                              {formatProfessorDisplayName(p)}
+                            </span>
+                            <span className="font-mono text-slate-500 truncate">
+                              {privatesByUid[p.uid]?.email || ''}
+                            </span>
+                          </div>
+                          {isLead && (
+                            <span className="text-[11px] font-medium text-blue-700 shrink-0">
+                              Nosilac
+                            </span>
+                          )}
+                        </label>
+                      );
+                    })}
+                  </div>
+                </div>
+              </>
+            )}
+
             <div>
-              <Label htmlFor="stf-profs">Profesori na predmetu</Label>
+              <Label htmlFor="stf-profs">Prikazana imena profesora na predmetu (odvojeno zarezom)</Label>
               <Input
                 id="stf-profs"
                 value={staffProfsInput}
@@ -1775,11 +1980,24 @@ export function AdminPortal({ activeNav }: AdminPortalProps) {
                       </td>
                       <td className="py-3 px-4 text-right whitespace-nowrap">
                         <div className="inline-flex items-center gap-1.5">
-                          {u.role === UserRole.STUDENT && (
+                          {u.role === UserRole.STUDENT ? (
                             <Button
                               variant="outline"
                               size="sm"
                               onClick={() => setEnrollManageStudent(u)}
+                            >
+                              <BookOpen className="w-3.5 h-3.5" />
+                              Predmeti
+                            </Button>
+                          ) : (
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              onClick={() => {
+                                setProfCourseSearch('');
+                                setProfCourseFilter('active');
+                                setCourseManageProf(u);
+                              }}
                             >
                               <BookOpen className="w-3.5 h-3.5" />
                               Predmeti
@@ -2089,6 +2307,39 @@ export function AdminPortal({ activeNav }: AdminPortalProps) {
                   placeholder="npr. Srijeda 11:00–13:00"
                 />
               </div>
+
+              {activeCourses.length > 0 && (
+                <div className="sm:col-span-2">
+                  <Label>Odmah dodijeli postojeće aktivne predmete nastavniku (opciono)</Label>
+                  <div className="mt-1 max-h-36 overflow-y-auto border border-slate-200 rounded-lg divide-y divide-slate-100">
+                    {activeCourses.map((crs) => {
+                      const sel = selectedInitialCourseIds.includes(crs.id);
+                      return (
+                        <label
+                          key={crs.id}
+                          className="flex items-center gap-2.5 px-3 py-2 text-xs hover:bg-slate-50 cursor-pointer"
+                        >
+                          <input
+                            type="checkbox"
+                            checked={sel}
+                            onChange={(e) => {
+                              if (e.target.checked) {
+                                setSelectedInitialCourseIds((prev) => [...prev, crs.id]);
+                              } else {
+                                setSelectedInitialCourseIds((prev) =>
+                                  prev.filter((id) => id !== crs.id)
+                                );
+                              }
+                            }}
+                          />
+                          <span className="font-mono font-semibold text-blue-700">{crs.code}</span>
+                          <span className="truncate text-slate-800">{crs.name}</span>
+                        </label>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
             </div>
           )}
 
@@ -2345,6 +2596,157 @@ export function AdminPortal({ activeNav }: AdminPortalProps) {
 
             <div className="flex justify-end pt-2">
               <Button variant="outline" onClick={() => setEnrollManageStudent(null)}>
+                Zatvori
+              </Button>
+            </div>
+          </div>
+        )}
+      </Dialog>
+
+      {/* Modal 4: Manage Existing Courses Assigned to a Professor Account */}
+      <Dialog
+        open={Boolean(courseManageProf)}
+        onOpenChange={(o) => !o && setCourseManageProf(null)}
+        title={`Dodjela postojećih predmeta — ${courseManageProf ? formatProfessorDisplayName(courseManageProf) : ''}`}
+        description="Jednim klikom povežite postojeće predmete sa nalogom nastavnika (bez potrebe da profesor kreira novi predmet). Svi postojeći bodovi, studenti i termini ostaju sačuvani."
+      >
+        {courseManageProf && (
+          <div className="space-y-3 text-left">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+              <div className="relative flex-1">
+                <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                <Input
+                  value={profCourseSearch}
+                  onChange={(e) => setProfCourseSearch(e.target.value)}
+                  placeholder="Pretraži po šifri ili nazivu predmeta..."
+                  className="pl-8 h-8 text-xs"
+                />
+              </div>
+              <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-lg shrink-0">
+                {(
+                  [
+                    { key: 'active', label: `Aktivni (${activeCourses.length})` },
+                    { key: 'archived', label: `Arhivirani (${archivedCourses.length})` },
+                    { key: 'all', label: `Svi (${courses.length})` },
+                  ] as const
+                ).map((tab) => (
+                  <button
+                    key={tab.key}
+                    type="button"
+                    onClick={() => setProfCourseFilter(tab.key)}
+                    className={cn(
+                      'px-2.5 py-1 text-xs font-medium rounded-md transition-colors cursor-pointer whitespace-nowrap tabular-nums',
+                      profCourseFilter === tab.key
+                        ? 'bg-white text-slate-900 shadow-xs'
+                        : 'text-slate-600 hover:text-slate-900'
+                    )}
+                  >
+                    {tab.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="max-h-80 overflow-y-auto divide-y divide-slate-100 border border-slate-200 rounded-lg">
+              {courses
+                .filter((crs) => {
+                  if (profCourseFilter === 'active' && crs.isArchived) return false;
+                  if (profCourseFilter === 'archived' && !crs.isArchived) return false;
+                  const q = profCourseSearch.trim().toLowerCase();
+                  if (!q) return true;
+                  return (
+                    crs.code.toLowerCase().includes(q) ||
+                    crs.name.toLowerCase().includes(q) ||
+                    (crs.studyProgram || '').toLowerCase().includes(q)
+                  );
+                })
+                .map((crs) => {
+                  const isAssigned = crs.professorIds.includes(courseManageProf.uid);
+                  const isLead = crs.leadProfessorId === courseManageProf.uid;
+                  const canRemove = isAssigned && crs.professorIds.length > 1;
+                  const busyAssign = profCourseBusyKey === `${crs.id}_assign`;
+                  const busyLead = profCourseBusyKey === `${crs.id}_lead`;
+                  const busyRemove = profCourseBusyKey === `${crs.id}_remove`;
+                  const anyBusy = busyAssign || busyLead || busyRemove;
+
+                  return (
+                    <div
+                      key={crs.id}
+                      className="px-3.5 py-2.5 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 text-xs hover:bg-slate-50/70"
+                    >
+                      <div className="min-w-0">
+                        <div className="font-semibold text-slate-900 truncate">
+                          <span className="font-mono text-blue-700 mr-1.5">{crs.code}</span>
+                          {crs.name}
+                        </div>
+                        <div className="text-slate-500 truncate mt-0.5">
+                          <span>{crs.studyProgram || 'Bachelor'}</span>
+                          <span aria-hidden="true" className="mx-1.5">
+                            ·
+                          </span>
+                          <span>Nosilac: {crs.leadProfessorName}</span>
+                          {isAssigned && (
+                            <>
+                              <span aria-hidden="true" className="mx-1.5">
+                                ·
+                              </span>
+                              <span className="text-emerald-700 font-medium">
+                                {isLead ? 'Odgovorni nastavnik' : 'Dodijeljen pristup'}
+                              </span>
+                            </>
+                          )}
+                        </div>
+                      </div>
+
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        {!isAssigned ? (
+                          <Button
+                            size="sm"
+                            disabled={anyBusy}
+                            onClick={() => handleAssignProfToCourse(courseManageProf, crs, false)}
+                            className="h-8 whitespace-nowrap"
+                          >
+                            {busyAssign ? 'Dodjela...' : 'Dodijeli predmet'}
+                          </Button>
+                        ) : (
+                          <>
+                            {!isLead && (
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                disabled={anyBusy}
+                                onClick={() =>
+                                  handleAssignProfToCourse(courseManageProf, crs, true)
+                                }
+                                className="h-8 whitespace-nowrap"
+                              >
+                                {busyLead ? 'Čuvanje...' : 'Postavi za nosioca'}
+                              </Button>
+                            )}
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              disabled={anyBusy || !canRemove}
+                              title={
+                                !canRemove
+                                  ? 'Predmet mora imati najmanje jednog dodijeljenog profesora.'
+                                  : undefined
+                              }
+                              onClick={() => handleUnassignProfFromCourse(courseManageProf, crs)}
+                              className="h-8 whitespace-nowrap text-slate-700"
+                            >
+                              {busyRemove ? 'Uklanjanje...' : 'Ukloni'}
+                            </Button>
+                          </>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+            </div>
+
+            <div className="flex justify-end pt-2">
+              <Button variant="outline" onClick={() => setCourseManageProf(null)}>
                 Zatvori
               </Button>
             </div>

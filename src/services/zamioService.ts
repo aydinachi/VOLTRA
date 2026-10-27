@@ -1727,13 +1727,345 @@ export async function updateCourseSettings(
   }
 }
 
+export function formatProfessorDisplayName(
+  prof: Pick<UserProfile, 'fullName' | 'academicTitle'>
+): string {
+  const titlePrefix = prof.academicTitle?.trim() || '';
+  const raw =
+    titlePrefix && !prof.fullName.toLowerCase().startsWith(titlePrefix.toLowerCase())
+      ? `${titlePrefix} ${prof.fullName}`
+      : prof.fullName;
+  return sanitizeText(raw, VALIDATION_CONSTRAINTS.STAFF_NAME_MAX_LENGTH) || 'Nastavnik';
+}
+
+async function syncCourseProfessorIdsForAdmin(params: {
+  course: Course;
+  nextProfessorIds: string[];
+  nextLeadProfessorName?: string;
+  courseEnrollments?: Enrollment[];
+  courseScheduleEvents?: ScheduleEvent[];
+}): Promise<void> {
+  const {
+    course,
+    nextProfessorIds,
+    nextLeadProfessorName,
+    courseEnrollments = [],
+    courseScheduleEvents = [],
+  } = params;
+
+  if (isCurrentSessionBootstrapAdmin()) {
+    const childCollections = [
+      'enrollments',
+      'gradingCategories',
+      'gradingItems',
+      'attendanceSessions',
+      'examTerms',
+      'scheduleEvents',
+      'scores',
+      'activityAwards',
+      'attendanceRecords',
+      'examRegistrations',
+      'finalGrades',
+    ] as const;
+
+    for (const colName of childCollections) {
+      try {
+        const snap = await getDocs(
+          query(collection(db, colName), where('courseId', '==', course.id))
+        );
+        await runParallelChunks(snap.docs, 15, async (d) => {
+          const patch: Record<string, unknown> = {
+            professorIds: nextProfessorIds,
+            updatedAt: serverTimestamp(),
+          };
+          if (colName === 'enrollments' && nextLeadProfessorName) {
+            patch.leadProfessorName = nextLeadProfessorName;
+          }
+          await updateDoc(d.ref, patch);
+        });
+      } catch {
+        // Non-blocking child sync
+      }
+    }
+    return;
+  }
+
+  // Delegated Admin path: update by known IDs (respects Pillar 8 list rules via allow get + allow update)
+  if (courseEnrollments.length > 0) {
+    await runParallelChunks(courseEnrollments, 15, async (enr) => {
+      try {
+        const patch: Record<string, unknown> = {
+          professorIds: nextProfessorIds,
+          updatedAt: serverTimestamp(),
+        };
+        if (nextLeadProfessorName) {
+          patch.leadProfessorName = nextLeadProfessorName;
+        }
+        await updateDoc(doc(db, 'enrollments', enr.id), patch);
+      } catch {
+        // Non-blocking sync
+      }
+    });
+  }
+
+  const directDocPairs: Array<[string, string[]]> = [
+    ['gradingCategories', course.categoryIds ?? []],
+    ['gradingItems', course.itemIds ?? []],
+    ['attendanceSessions', course.sessionIds ?? []],
+    ['examTerms', course.examTermIds ?? []],
+    [
+      'scheduleEvents',
+      Array.from(
+        new Set([
+          ...(course.scheduleEventIds ?? []),
+          ...courseScheduleEvents.filter((ev) => ev.courseId === course.id).map((ev) => ev.id),
+        ])
+      ),
+    ],
+  ];
+
+  for (const [colName, ids] of directDocPairs) {
+    if (ids.length === 0) continue;
+    await runParallelChunks(ids, 15, async (docId) => {
+      try {
+        const ref = doc(db, colName, docId);
+        if ((await getDoc(ref)).exists()) {
+          await updateDoc(ref, {
+            professorIds: nextProfessorIds,
+            updatedAt: serverTimestamp(),
+          });
+        }
+      } catch {
+        // Non-blocking sync
+      }
+    });
+  }
+
+  const studentIds = courseEnrollments.map((e) => e.studentId);
+  if (studentIds.length > 0) {
+    const candidateRefs: Array<[string, string]> = [];
+    for (const stuId of studentIds) {
+      candidateRefs.push(['finalGrades', `${course.id}_${stuId}`]);
+      for (const itemId of course.itemIds ?? []) {
+        candidateRefs.push(['scores', `${itemId}_${stuId}`]);
+      }
+      for (const sessId of course.sessionIds ?? []) {
+        candidateRefs.push(['attendanceRecords', `${sessId}_${stuId}`]);
+      }
+      for (const termId of course.examTermIds ?? []) {
+        candidateRefs.push(['examRegistrations', `${termId}_${stuId}`]);
+      }
+    }
+
+    await runParallelChunks(candidateRefs, 20, async ([colName, docId]) => {
+      try {
+        const ref = doc(db, colName, docId);
+        if ((await getDoc(ref)).exists()) {
+          await updateDoc(ref, {
+            professorIds: nextProfessorIds,
+            updatedAt: serverTimestamp(),
+          });
+        }
+      } catch {
+        // Non-blocking sync
+      }
+    });
+  }
+
+  const curUid = auth.currentUser?.uid;
+  if (curUid && course.professorIds.includes(curUid)) {
+    try {
+      const actSnap = await getDocs(
+        query(
+          collection(db, 'activityAwards'),
+          where('professorIds', 'array-contains', curUid),
+          where('courseId', '==', course.id)
+        )
+      );
+      await runParallelChunks(actSnap.docs, 15, async (d) => {
+        await updateDoc(d.ref, {
+          professorIds: nextProfessorIds,
+          updatedAt: serverTimestamp(),
+        });
+      });
+    } catch {
+      // Non-blocking sync
+    }
+  }
+}
+
+export async function adminAssignProfessorToCourse(params: {
+  course: Course;
+  professor: UserProfile;
+  makeLead?: boolean;
+  courseEnrollments?: Enrollment[];
+  courseScheduleEvents?: ScheduleEvent[];
+}): Promise<void> {
+  const {
+    course,
+    professor,
+    makeLead = false,
+    courseEnrollments = [],
+    courseScheduleEvents = [],
+  } = params;
+
+  if (!professor.uid || !isValidResourceId(professor.uid, 128)) {
+    throw new Error('Odabrani nalog nastavnika još nema aktivan Firebase ID.');
+  }
+  if (
+    !course.professorIds.includes(professor.uid) &&
+    course.professorIds.length >= VALIDATION_CONSTRAINTS.MAX_PROFESSORS_PER_COURSE
+  ) {
+    throw new Error('Dostignut je maksimalan broj profesora na jednom predmetu (10).');
+  }
+
+  const formattedName = formatProfessorDisplayName(professor);
+  const currentNames =
+    course.professorNames && course.professorNames.length > 0
+      ? course.professorNames
+      : [course.leadProfessorName];
+
+  const nextProfIds = makeLead
+    ? [professor.uid, ...course.professorIds.filter((id) => id !== professor.uid)]
+    : Array.from(new Set([...course.professorIds, professor.uid]));
+
+  const nextProfNames = sanitizeStaffList(
+    makeLead
+      ? [
+          formattedName,
+          ...currentNames.filter(
+            (n) =>
+              n.toLowerCase() !== formattedName.toLowerCase() &&
+              !n.toLowerCase().includes(professor.fullName.toLowerCase())
+          ),
+        ]
+      : [...currentNames, formattedName],
+    VALIDATION_CONSTRAINTS.MAX_PROFESSORS_PER_COURSE
+  );
+
+  const nextLeadId = makeLead ? professor.uid : course.leadProfessorId;
+  const nextLeadName = makeLead
+    ? formattedName
+    : nextProfNames[0] || course.leadProfessorName;
+
+  try {
+    await updateDoc(doc(db, 'courses', course.id), {
+      leadProfessorId: nextLeadId,
+      leadProfessorName: nextLeadName,
+      professorIds: nextProfIds,
+      professorNames: nextProfNames.length > 0 ? nextProfNames : [nextLeadName],
+      assistantNames: course.assistantNames ?? [],
+      updatedAt: serverTimestamp(),
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `courses/${course.id}`);
+  }
+
+  await syncCourseProfessorIdsForAdmin({
+    course,
+    nextProfessorIds: nextProfIds,
+    nextLeadProfessorName: nextLeadName !== course.leadProfessorName ? nextLeadName : undefined,
+    courseEnrollments,
+    courseScheduleEvents,
+  });
+
+  void mutateAdminIndex({});
+}
+
+export async function adminUnassignProfessorFromCourse(params: {
+  course: Course;
+  professor: UserProfile;
+  allStaffProfiles?: UserProfile[];
+  courseEnrollments?: Enrollment[];
+  courseScheduleEvents?: ScheduleEvent[];
+}): Promise<void> {
+  const {
+    course,
+    professor,
+    allStaffProfiles = [],
+    courseEnrollments = [],
+    courseScheduleEvents = [],
+  } = params;
+
+  const nextProfIds = course.professorIds.filter((id) => id !== professor.uid);
+  if (nextProfIds.length === 0) {
+    throw new Error(
+      'Predmet mora imati najmanje jednog dodijeljenog nastavnika. Prvo dodijelite drugog profesora prije uklanjanja.'
+    );
+  }
+
+  const formattedTarget = formatProfessorDisplayName(professor).toLowerCase();
+  const rawTarget = professor.fullName.trim().toLowerCase();
+  const currentNames =
+    course.professorNames && course.professorNames.length > 0
+      ? course.professorNames
+      : [course.leadProfessorName];
+
+  let filteredNames = currentNames.filter((n) => {
+    const low = n.trim().toLowerCase();
+    return low !== formattedTarget && low !== rawTarget;
+  });
+
+  const nextLeadId =
+    course.leadProfessorId === professor.uid ? nextProfIds[0] : course.leadProfessorId;
+  const fallbackProfile = allStaffProfiles.find((p) => p.uid === nextLeadId);
+
+  if (filteredNames.length === 0) {
+    filteredNames = [
+      fallbackProfile ? formatProfessorDisplayName(fallbackProfile) : course.leadProfessorName,
+    ];
+  } else if (course.leadProfessorId === professor.uid && fallbackProfile) {
+    const fbName = formatProfessorDisplayName(fallbackProfile);
+    filteredNames = sanitizeStaffList(
+      [fbName, ...filteredNames.filter((n) => n.toLowerCase() !== fbName.toLowerCase())],
+      VALIDATION_CONSTRAINTS.MAX_PROFESSORS_PER_COURSE
+    );
+  }
+
+  const nextLeadName = filteredNames[0] || course.leadProfessorName;
+
+  try {
+    await updateDoc(doc(db, 'courses', course.id), {
+      leadProfessorId: nextLeadId,
+      leadProfessorName: nextLeadName,
+      professorIds: nextProfIds,
+      professorNames: filteredNames,
+      assistantNames: course.assistantNames ?? [],
+      updatedAt: serverTimestamp(),
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `courses/${course.id}`);
+  }
+
+  await syncCourseProfessorIdsForAdmin({
+    course,
+    nextProfessorIds: nextProfIds,
+    nextLeadProfessorName: nextLeadName !== course.leadProfessorName ? nextLeadName : undefined,
+    courseEnrollments,
+    courseScheduleEvents,
+  });
+
+  void mutateAdminIndex({});
+}
+
 export async function updateCourseTeachingStaff(params: {
   course: Course;
   professorNames: string[];
   assistantNames: string[];
   enrollments?: Enrollment[];
+  professorIds?: string[];
+  leadProfessorId?: string;
+  courseScheduleEvents?: ScheduleEvent[];
 }): Promise<void> {
-  const { course, professorNames, assistantNames, enrollments = [] } = params;
+  const {
+    course,
+    professorNames,
+    assistantNames,
+    enrollments = [],
+    professorIds,
+    leadProfessorId,
+    courseScheduleEvents = [],
+  } = params;
 
   const cleanedProfessors = sanitizeStaffList(
     professorNames,
@@ -1749,19 +2081,49 @@ export async function updateCourseTeachingStaff(params: {
   );
 
   const nextLeadName = cleanedProfessors[0];
+  const nextProfIds =
+    professorIds && professorIds.length > 0
+      ? Array.from(new Set(professorIds)).slice(0, VALIDATION_CONSTRAINTS.MAX_PROFESSORS_PER_COURSE)
+      : course.professorIds;
+  const nextLeadId =
+    leadProfessorId && nextProfIds.includes(leadProfessorId)
+      ? leadProfessorId
+      : nextProfIds.includes(course.leadProfessorId)
+        ? course.leadProfessorId
+        : nextProfIds[0];
+
+  const patch: Record<string, unknown> = {
+    leadProfessorName: nextLeadName,
+    professorNames: cleanedProfessors,
+    assistantNames: cleanedAssistants,
+    updatedAt: serverTimestamp(),
+  };
+
+  const idsChanged =
+    nextProfIds.length !== course.professorIds.length ||
+    nextProfIds.some((id, idx) => course.professorIds[idx] !== id) ||
+    nextLeadId !== course.leadProfessorId;
+
+  if (professorIds && professorIds.length > 0) {
+    patch.professorIds = nextProfIds;
+    patch.leadProfessorId = nextLeadId;
+  }
 
   try {
-    await updateDoc(doc(db, 'courses', course.id), {
-      leadProfessorName: nextLeadName,
-      professorNames: cleanedProfessors,
-      assistantNames: cleanedAssistants,
-      updatedAt: serverTimestamp(),
-    });
+    await updateDoc(doc(db, 'courses', course.id), patch);
   } catch (error) {
     handleFirestoreError(error, OperationType.UPDATE, `courses/${course.id}`);
   }
 
-  if (enrollments.length > 0 && nextLeadName !== course.leadProfessorName) {
+  if (idsChanged) {
+    await syncCourseProfessorIdsForAdmin({
+      course,
+      nextProfessorIds: nextProfIds,
+      nextLeadProfessorName: nextLeadName !== course.leadProfessorName ? nextLeadName : undefined,
+      courseEnrollments: enrollments,
+      courseScheduleEvents,
+    });
+  } else if (enrollments.length > 0 && nextLeadName !== course.leadProfessorName) {
     await runParallelChunks(enrollments, 15, async (enr) => {
       try {
         await updateDoc(doc(db, 'enrollments', enr.id), {
@@ -5712,6 +6074,9 @@ export async function adminCreateUserAccount(params: {
   consultationHours?: string;
   phone?: string;
   coursesToEnroll?: Course[];
+  coursesToAssign?: Course[];
+  allEnrollments?: Enrollment[];
+  allScheduleEvents?: ScheduleEvent[];
 }): Promise<AdminCreatedAccountResult> {
   const cleanEmail = sanitizeText(
     params.email.toLowerCase(),
@@ -5921,6 +6286,35 @@ export async function adminCreateUserAccount(params: {
             updatedAt: serverTimestamp(),
           });
         });
+      }
+    } else if (isStaffRole && params.coursesToAssign && params.coursesToAssign.length > 0) {
+      const staffProfileStub: UserProfile = {
+        uid: createdAuthUid,
+        fullName: cleanName,
+        studentIndex: '',
+        department: cleanDept,
+        role: roleEnum,
+        academicYear: cleanAcadYear,
+        redeemedInviteId: provId,
+        academicTitle: cleanTitle,
+        officeLocation: cleanOffice,
+        consultationHours: cleanConsult,
+        isSeed: false,
+      };
+      for (const crs of params.coursesToAssign) {
+        try {
+          const crsEnrs = (params.allEnrollments ?? []).filter((e) => e.courseId === crs.id);
+          const crsSched = (params.allScheduleEvents ?? []).filter((ev) => ev.courseId === crs.id);
+          await adminAssignProfessorToCourse({
+            course: crs,
+            professor: staffProfileStub,
+            makeLead: false,
+            courseEnrollments: crsEnrs,
+            courseScheduleEvents: crsSched,
+          });
+        } catch {
+          // Non-blocking initial course assignment
+        }
       }
     }
   }
