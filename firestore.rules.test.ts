@@ -4,6 +4,7 @@ import { describe, expect, it, beforeAll, afterAll } from 'vitest';
 import {
   initializeTestEnvironment,
   assertFails,
+  assertSucceeds,
   RulesTestEnvironment,
 } from '@firebase/rules-unit-testing';
 import {
@@ -60,6 +61,10 @@ describe('Firestore Security Rules — Structural & Dirty Dozen Verification', (
     expect(rulesContent).toMatch(
       /existing\(\)\.role == 'student'[\s\S]*?affectedKeys\(\)\.hasOnly\(\[\s*'personalNote',\s*'notificationPrefs',\s*'updatedAt'\s*\]\)/
     );
+    // Verify Email/Password Admin RBAC helpers and null-safe Course validation
+    expect(rulesContent).toContain('function hasAdminDoc()');
+    expect(rulesContent).toContain('function hasAdminRoleProfile()');
+    expect(rulesContent).toContain('isAuthorizedUser() && (hasAdminDoc() || hasAdminRoleProfile())');
   });
 
   describe.runIf(hasEmulator)('Live Emulator Dirty Dozen Payloads', () => {
@@ -532,6 +537,93 @@ describe('Firestore Security Rules — Structural & Dirty Dozen Verification', (
           academicYear: '2026/2027',
           isSeed: false,
           createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        })
+      );
+    });
+
+    it('14. Allows admin-provisioned Email/Password Admin (email_verified: false) to update courses while rejecting unverified spoofing', async () => {
+      await testEnv.withSecurityRulesDisabled(async (ctx) => {
+        const now = Timestamp.now();
+        await setDoc(doc(ctx.firestore(), 'userProfiles', 'samir_admin_uid'), {
+          uid: 'samir_admin_uid',
+          fullName: 'Samir Ribić',
+          studentIndex: '',
+          department: 'Računarstvo i informatika',
+          role: 'admin',
+          academicYear: '2026/2027',
+          redeemedInviteId: 'prov_samir_admin',
+          isSeed: false,
+          createdAt: now,
+          updatedAt: now,
+        });
+        await setDoc(doc(ctx.firestore(), 'courses', 'seed_crs_os'), {
+          code: 'RI-OS',
+          name: 'Operativni sistemi',
+          semester: 'Zimski semestar · II godina',
+          academicYear: '2026/2027',
+          ects: 6,
+          leadProfessorId: 'prof_1',
+          leadProfessorName: 'doc. dr. Samir Ribić',
+          professorIds: ['prof_1'],
+          professorNames: [],
+          categoryIds: [],
+          itemIds: [],
+          sessionIds: [],
+          attendanceEnabled: false,
+          attendanceMaxPoints: 0,
+          allowBonusPoints: false,
+          activityMarksEnabled: true,
+          grade6Threshold: 55,
+          grade7Threshold: 65,
+          grade8Threshold: 75,
+          grade9Threshold: 85,
+          grade10Threshold: 95,
+          isSeed: true,
+          createdAt: now,
+          updatedAt: now,
+        });
+      });
+
+      const samirAdminDb = testEnv
+        .authenticatedContext('samir_admin_uid', {
+          email: 'samir.admin@etf.unsa.ba',
+          email_verified: false,
+        })
+        .firestore();
+
+      await assertSucceeds(
+        updateDoc(doc(samirAdminDb, 'courses', 'crs_ar'), {
+          leadProfessorId: 'prof_1',
+          leadProfessorName: 'doc. dr. Samir Ribić',
+          professorIds: ['prof_1', 'samir_prof_uid'],
+          professorNames: ['doc. dr. Samir Ribić'],
+          assistantNames: [],
+          updatedAt: serverTimestamp(),
+        })
+      );
+
+      await assertSucceeds(
+        updateDoc(doc(samirAdminDb, 'courses', 'seed_crs_os'), {
+          leadProfessorId: 'samir_prof_uid',
+          leadProfessorName: 'doc. dr. Samir Ribić',
+          professorIds: ['samir_prof_uid', 'prof_1'],
+          professorNames: ['doc. dr. Samir Ribić'],
+          assistantNames: ['mr. Damir Hasić, v. as.'],
+          updatedAt: serverTimestamp(),
+        })
+      );
+
+      const spoofUnverifiedDb = testEnv
+        .authenticatedContext('attacker_unverified', {
+          email: 'samir.admin@etf.unsa.ba',
+          email_verified: false,
+        })
+        .firestore();
+
+      await assertFails(
+        updateDoc(doc(spoofUnverifiedDb, 'courses', 'seed_crs_os'), {
+          leadProfessorName: 'Haker',
           updatedAt: serverTimestamp(),
         })
       );

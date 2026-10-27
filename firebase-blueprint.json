@@ -456,7 +456,7 @@
         },
         "professorNames": {
           "type": "array",
-          "description": "Optional bounded list (1 to 10, max 100 chars) of professor display names on the course."
+          "description": "Optional bounded list (0 to 10, max 100 chars) of professor display names on the course."
         },
         "assistantNames": {
           "type": "array",

@@ -42,11 +42,32 @@ service cloud.firestore {
       return isVerified() && request.auth.token.email == 'aydinachi@gmail.com';
     }
 
-    function isAdminProvisionedUser() {
+    function hasAdminDoc() {
+      return isSignedIn() &&
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid));
+    }
+
+    function hasAdminRoleProfile() {
       return isSignedIn() &&
         exists(/databases/$(database)/documents/userProfiles/$(request.auth.uid)) &&
-        'provisionedByAdmin' in get(/databases/$(database)/documents/userProfiles/$(request.auth.uid)).data &&
-        get(/databases/$(database)/documents/userProfiles/$(request.auth.uid)).data.provisionedByAdmin == true;
+        get(/databases/$(database)/documents/userProfiles/$(request.auth.uid)).data.isSeed == false &&
+        get(/databases/$(database)/documents/userProfiles/$(request.auth.uid)).data.role == 'admin';
+    }
+
+    function isAdminProvisionedUser() {
+      return isSignedIn() && (
+        hasAdminDoc() ||
+        (
+          exists(/databases/$(database)/documents/userProfiles/$(request.auth.uid)) &&
+          get(/databases/$(database)/documents/userProfiles/$(request.auth.uid)).data.isSeed == false && (
+            (
+              'provisionedByAdmin' in get(/databases/$(database)/documents/userProfiles/$(request.auth.uid)).data &&
+              get(/databases/$(database)/documents/userProfiles/$(request.auth.uid)).data.provisionedByAdmin == true
+            ) ||
+            get(/databases/$(database)/documents/userProfiles/$(request.auth.uid)).data.role in ['professor', 'admin']
+          )
+        )
+      );
     }
 
     function isAuthorizedUser() {
@@ -55,15 +76,14 @@ service cloud.firestore {
 
     function isAdmin() {
       return isBootstrapAdmin() || (
-        isAuthorizedUser() &&
-        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+        isAuthorizedUser() && (hasAdminDoc() || hasAdminRoleProfile())
       );
     }
 
     function isProfessorUser() {
       return isAuthorizedUser() &&
         exists(/databases/$(database)/documents/userProfiles/$(request.auth.uid)) &&
-        get(/databases/$(database)/documents/userProfiles/$(request.auth.uid)).data.role == 'professor';
+        get(/databases/$(database)/documents/userProfiles/$(request.auth.uid)).data.role in ['professor', 'admin'];
     }
 
     function isCourseProfessor(courseId) {
@@ -257,19 +277,19 @@ service cloud.firestore {
         isValidId(data.leadProfessorId) &&
         data.leadProfessorName is string && data.leadProfessorName.size() >= 1 && data.leadProfessorName.size() <= 100 &&
         isValidBoundedIdList(data.professorIds, 1, 10) &&
-        (!('professorNames' in data) || isValidBoundedStringList(data.professorNames, 1, 10, 100)) &&
-        (!('assistantNames' in data) || isValidBoundedStringList(data.assistantNames, 0, 15, 100)) &&
-        (!('studyProgram' in data) || (data.studyProgram is string && data.studyProgram.size() <= 100)) &&
+        (!('professorNames' in data) || data.professorNames == null || isValidBoundedStringList(data.professorNames, 0, 10, 100)) &&
+        (!('assistantNames' in data) || data.assistantNames == null || isValidBoundedStringList(data.assistantNames, 0, 15, 100)) &&
+        (!('studyProgram' in data) || data.studyProgram == null || (data.studyProgram is string && data.studyProgram.size() <= 100)) &&
         isValidBoundedIdList(data.categoryIds, 0, 20) &&
         isValidBoundedIdList(data.itemIds, 0, 60) &&
         isValidBoundedIdList(data.sessionIds, 0, 60) &&
-        (!('examTermIds' in data) || isValidBoundedIdList(data.examTermIds, 0, 40)) &&
-        (!('scheduleEventIds' in data) || isValidBoundedIdList(data.scheduleEventIds, 0, 80)) &&
-        (!('isArchived' in data) || data.isArchived is bool) &&
+        (!('examTermIds' in data) || data.examTermIds == null || isValidBoundedIdList(data.examTermIds, 0, 40)) &&
+        (!('scheduleEventIds' in data) || data.scheduleEventIds == null || isValidBoundedIdList(data.scheduleEventIds, 0, 80)) &&
+        (!('isArchived' in data) || data.isArchived == null || data.isArchived is bool) &&
         data.attendanceEnabled is bool &&
         data.attendanceMaxPoints is number && data.attendanceMaxPoints >= 0 && data.attendanceMaxPoints <= 100 &&
         data.allowBonusPoints is bool &&
-        (!('activityMarksEnabled' in data) || data.activityMarksEnabled is bool) &&
+        (!('activityMarksEnabled' in data) || data.activityMarksEnabled == null || data.activityMarksEnabled is bool) &&
         data.grade6Threshold is number && data.grade6Threshold >= 0 &&
         data.grade7Threshold is number && data.grade7Threshold > data.grade6Threshold &&
         data.grade8Threshold is number && data.grade8Threshold > data.grade7Threshold &&
@@ -697,7 +717,7 @@ service cloud.firestore {
           ) ||
           (
             request.auth.uid == userId &&
-            existing().role == 'professor' &&
+            existing().role in ['professor', 'admin'] &&
             incoming().role == existing().role &&
             incoming().redeemedInviteId == existing().redeemedInviteId &&
             incoming().diff(existing()).affectedKeys().hasOnly([
@@ -843,7 +863,7 @@ service cloud.firestore {
         incoming().createdBy == request.auth.uid &&
         incoming().createdAt == request.time &&
         incoming().updatedAt == request.time;
-      allow update: if isValidInvitation(incoming()) && isVerified() && isValidId(inviteId) &&
+      allow update: if isValidInvitation(incoming()) && isAuthorizedUser() && isValidId(inviteId) &&
         incoming().code == existing().code &&
         incoming().targetEmail == existing().targetEmail &&
         incoming().role == existing().role &&
@@ -856,6 +876,7 @@ service cloud.firestore {
             incoming().diff(existing()).affectedKeys().hasOnly(['status', 'acceptedBy', 'updatedAt'])
           ) ||
           (
+            isVerified() &&
             existing().status == 'pending' &&
             incoming().status == 'accepted' &&
             request.auth.token.email == existing().targetEmail &&

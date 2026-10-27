@@ -485,7 +485,7 @@ export async function ensureUserAccount(params: {
       const defaultIndex = isAdminUser ? '19001' : '';
       const initialRole = isAdminUser ? UserRole.ADMIN : UserRole.STUDENT;
 
-      const payload = {
+      const payload: Record<string, unknown> = {
         uid,
         fullName: cleanName,
         studentIndex: defaultIndex,
@@ -504,6 +504,9 @@ export async function ensureUserAccount(params: {
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       };
+      if (isAdminUser) {
+        payload.provisionedByAdmin = true;
+      }
 
       try {
         await setDoc(doc(db, 'userProfiles', uid), payload);
@@ -544,15 +547,48 @@ export async function ensureUserAccount(params: {
         studyYear: 'II godina · I ciklus (Bachelor)',
         studyTrack: 'Bachelor · Računarstvo i informatika',
         personalNote: '',
+        provisionedByAdmin: isAdminUser ? true : undefined,
         notificationPrefs: DEFAULT_NOTIFICATION_PREFS,
         isSeed: false,
       };
     }
   } else {
     const data = profileSnap.data() as UserProfile;
+    const effectiveRole = hasAdminDoc ? UserRole.ADMIN : data.role;
+
+    if (
+      (hasAdminDoc || data.role === UserRole.ADMIN) &&
+      (!data.provisionedByAdmin || data.role !== effectiveRole)
+    ) {
+      try {
+        await updateDoc(doc(db, 'userProfiles', uid), {
+          role: effectiveRole,
+          provisionedByAdmin: true,
+          updatedAt: serverTimestamp(),
+        });
+      } catch {
+        // Non-blocking profile flag sync
+      }
+    }
+
+    if (effectiveRole === UserRole.ADMIN && !hasAdminDoc && !isBootstrap) {
+      try {
+        await setDoc(doc(db, 'admins', uid), {
+          uid,
+          grantedBy: uid,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+        hasAdminDoc = true;
+      } catch {
+        // Non-blocking admin registry sync
+      }
+    }
+
     profile = {
       ...data,
       uid,
+      role: effectiveRole,
       studyTrack: data.studyTrack ? normalizeStudyTrack(data.studyTrack) : data.studyTrack,
       notificationPrefs: data.notificationPrefs
         ? { ...DEFAULT_NOTIFICATION_PREFS, ...data.notificationPrefs }
@@ -1944,17 +1980,23 @@ export async function adminAssignProfessorToCourse(params: {
   );
 
   const nextLeadId = makeLead ? professor.uid : course.leadProfessorId;
-  const nextLeadName = makeLead
-    ? formattedName
-    : nextProfNames[0] || course.leadProfessorName;
+  const nextLeadName =
+    sanitizeText(
+      makeLead ? formattedName : nextProfNames[0] || course.leadProfessorName,
+      VALIDATION_CONSTRAINTS.FULL_NAME_MAX_LENGTH
+    ) || formattedName;
+  const cleanAssistants = sanitizeStaffList(
+    course.assistantNames ?? [],
+    VALIDATION_CONSTRAINTS.MAX_ASSISTANTS_PER_COURSE
+  );
 
   try {
     await updateDoc(doc(db, 'courses', course.id), {
       leadProfessorId: nextLeadId,
       leadProfessorName: nextLeadName,
-      professorIds: nextProfIds,
+      professorIds: nextProfIds.slice(0, VALIDATION_CONSTRAINTS.MAX_PROFESSORS_PER_COURSE),
       professorNames: nextProfNames.length > 0 ? nextProfNames : [nextLeadName],
-      assistantNames: course.assistantNames ?? [],
+      assistantNames: cleanAssistants,
       updatedAt: serverTimestamp(),
     });
   } catch (error) {
@@ -2022,15 +2064,23 @@ export async function adminUnassignProfessorFromCourse(params: {
     );
   }
 
-  const nextLeadName = filteredNames[0] || course.leadProfessorName;
+  const nextLeadName =
+    sanitizeText(
+      filteredNames[0] || course.leadProfessorName,
+      VALIDATION_CONSTRAINTS.FULL_NAME_MAX_LENGTH
+    ) || 'Nastavnik';
+  const cleanAssistants = sanitizeStaffList(
+    course.assistantNames ?? [],
+    VALIDATION_CONSTRAINTS.MAX_ASSISTANTS_PER_COURSE
+  );
 
   try {
     await updateDoc(doc(db, 'courses', course.id), {
       leadProfessorId: nextLeadId,
       leadProfessorName: nextLeadName,
-      professorIds: nextProfIds,
+      professorIds: nextProfIds.slice(0, VALIDATION_CONSTRAINTS.MAX_PROFESSORS_PER_COURSE),
       professorNames: filteredNames,
-      assistantNames: course.assistantNames ?? [],
+      assistantNames: cleanAssistants,
       updatedAt: serverTimestamp(),
     });
   } catch (error) {
@@ -3332,23 +3382,35 @@ async function seedDemoExamDataIfMissing(params: {
   );
 
   // Attach examTermIds onto demo courses so students discover them immediately
+  const curArTermIds = arCourse.examTermIds ?? [];
+  const curOsTermIds = osCourse.examTermIds ?? [];
   const nextArTermIds = Array.from(
-    new Set([...(arCourse.examTermIds ?? []), 'seed_ext_ar_p2', 'seed_ext_ar_zav'])
-  );
+    new Set([...curArTermIds, 'seed_ext_ar_p2', 'seed_ext_ar_zav'])
+  ).slice(0, VALIDATION_CONSTRAINTS.MAX_EXAM_TERMS_PER_COURSE);
   const nextOsTermIds = Array.from(
-    new Set([...(osCourse.examTermIds ?? []), 'seed_ext_os_zav'])
-  );
+    new Set([...curOsTermIds, 'seed_ext_os_zav'])
+  ).slice(0, VALIDATION_CONSTRAINTS.MAX_EXAM_TERMS_PER_COURSE);
 
-  await Promise.all([
-    updateDoc(doc(db, 'courses', 'seed_crs_ar'), {
-      examTermIds: nextArTermIds,
-      updatedAt: serverTimestamp(),
-    }).catch((err) => handleFirestoreError(err, OperationType.UPDATE, 'courses/seed_crs_ar')),
-    updateDoc(doc(db, 'courses', 'seed_crs_os'), {
-      examTermIds: nextOsTermIds,
-      updatedAt: serverTimestamp(),
-    }).catch((err) => handleFirestoreError(err, OperationType.UPDATE, 'courses/seed_crs_os')),
-  ]);
+  const termAttachTasks: Promise<void>[] = [];
+  if (nextArTermIds.length !== curArTermIds.length) {
+    termAttachTasks.push(
+      updateDoc(doc(db, 'courses', 'seed_crs_ar'), {
+        examTermIds: nextArTermIds,
+        updatedAt: serverTimestamp(),
+      }).catch((err) => handleFirestoreError(err, OperationType.UPDATE, 'courses/seed_crs_ar'))
+    );
+  }
+  if (nextOsTermIds.length !== curOsTermIds.length) {
+    termAttachTasks.push(
+      updateDoc(doc(db, 'courses', 'seed_crs_os'), {
+        examTermIds: nextOsTermIds,
+        updatedAt: serverTimestamp(),
+      }).catch((err) => handleFirestoreError(err, OperationType.UPDATE, 'courses/seed_crs_os'))
+    );
+  }
+  if (termAttachTasks.length > 0) {
+    await Promise.all(termAttachTasks);
+  }
 
   // Seed realistic demo student exam registrations so professor turnout view is populated
   const demoRegSeeds = [
@@ -6770,7 +6832,11 @@ export async function ensurePresentationLogins(params: {
           });
         }
       }
+    } catch {
+      // Non-blocking profile sync
+    }
 
+    try {
       const privRef = doc(db, 'userPrivate', uid);
       const privSnap = await getDoc(privRef);
       if (!privSnap.exists()) {
@@ -6782,8 +6848,12 @@ export async function ensurePresentationLogins(params: {
           updatedAt: serverTimestamp(),
         });
       }
+    } catch {
+      // Non-blocking private record sync
+    }
 
-      if (spec.role === 'admin') {
+    if (spec.role === 'admin') {
+      try {
         const admRef = doc(db, 'admins', uid);
         if (!(await getDoc(admRef)).exists()) {
           await setDoc(admRef, {
@@ -6793,9 +6863,13 @@ export async function ensurePresentationLogins(params: {
             updatedAt: serverTimestamp(),
           });
         }
+      } catch {
+        // Non-blocking admin grant sync
       }
+    }
 
-      if (spec.role === 'student' && spec.studentIndex) {
+    if (spec.role === 'student' && spec.studentIndex) {
+      try {
         const dirRef = doc(db, 'studentDirectory', spec.studentIndex);
         const dirSnap = await getDoc(dirRef);
         const rosterDept =
@@ -6814,9 +6888,9 @@ export async function ensurePresentationLogins(params: {
             updatedAt: serverTimestamp(),
           });
         }
+      } catch {
+        // Non-blocking directory sync
       }
-    } catch {
-      // Non-blocking profile/admin/directory creation
     }
   }
 
