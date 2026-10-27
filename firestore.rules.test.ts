@@ -16,6 +16,7 @@ import {
   setDoc,
   Timestamp,
   updateDoc,
+  writeBatch,
 } from 'firebase/firestore';
 
 const rulesPath = path.resolve(process.cwd(), 'firestore.rules');
@@ -61,10 +62,18 @@ describe('Firestore Security Rules — Structural & Dirty Dozen Verification', (
     expect(rulesContent).toMatch(
       /existing\(\)\.role == 'student'[\s\S]*?affectedKeys\(\)\.hasOnly\(\[\s*'personalNote',\s*'notificationPrefs',\s*'updatedAt'\s*\]\)/
     );
-    // Verify Email/Password Admin RBAC helpers and null-safe Course validation
+    // Verify Email/Password Admin & Professor RBAC helpers stay within 10/20 rule call budget
     expect(rulesContent).toContain('function hasAdminDoc()');
     expect(rulesContent).toContain('function hasAdminRoleProfile()');
-    expect(rulesContent).toContain('isAuthorizedUser() && (hasAdminDoc() || hasAdminRoleProfile())');
+    expect(rulesContent).toContain(
+      'return isBootstrapAdmin() || hasAdminDoc() || hasAdminRoleProfile();'
+    );
+    expect(rulesContent).toMatch(
+      /function isCourseProfessor\(courseId\)\s*\{\s*return isSignedIn\(\) &&/
+    );
+    expect(rulesContent).toContain(
+      '(isCourseProfessor(incoming().courseId) || isCourseProfessorAfter(incoming().courseId) || isAdmin())'
+    );
   });
 
   describe.runIf(hasEmulator)('Live Emulator Dirty Dozen Payloads', () => {
@@ -624,6 +633,94 @@ describe('Firestore Security Rules — Structural & Dirty Dozen Verification', (
       await assertFails(
         updateDoc(doc(spoofUnverifiedDb, 'courses', 'seed_crs_os'), {
           leadProfessorName: 'Haker',
+          updatedAt: serverTimestamp(),
+        })
+      );
+    });
+
+    it('14. Allows Email/Password Professor (sribic@etf.unsa.ba, email_verified=false) to create gradingItems in an atomic writeBatch and record scores', async () => {
+      await testEnv.withSecurityRulesDisabled(async (ctx) => {
+        const now = Timestamp.now();
+        await setDoc(doc(ctx.firestore(), 'userProfiles', 'samir_prof_uid'), {
+          uid: 'samir_prof_uid',
+          fullName: 'Samir Ribić',
+          studentIndex: '',
+          department: 'Računarstvo i informatika',
+          role: 'professor',
+          academicYear: '2026/2027',
+          redeemedInviteId: 'prov_sribic',
+          provisionedByAdmin: true,
+          isSeed: false,
+          createdAt: now,
+          updatedAt: now,
+        });
+        await setDoc(doc(ctx.firestore(), 'gradingCategories', 'seed_cat_os_lab'), {
+          courseId: 'seed_crs_os',
+          name: 'Zadaci i vježbe',
+          maxPoints: 25,
+          order: 1,
+          professorIds: ['samir_prof_uid', 'prof_1'],
+          isSeed: true,
+          createdAt: now,
+          updatedAt: now,
+        });
+        await setDoc(doc(ctx.firestore(), 'enrollments', 'seed_crs_os_stu_1'), {
+          courseId: 'seed_crs_os',
+          courseCode: 'RI-OS',
+          courseName: 'Operativni sistemi',
+          leadProfessorName: 'doc. dr. Samir Ribić',
+          academicYear: '2026/2027',
+          studentId: 'stu_1',
+          studentName: 'Haris Begović',
+          studentIndex: '18942',
+          studentDepartment: 'RI',
+          professorIds: ['samir_prof_uid', 'prof_1'],
+          isSeed: false,
+          createdAt: now,
+          updatedAt: now,
+        });
+      });
+
+      const samirProfDb = testEnv
+        .authenticatedContext('samir_prof_uid', {
+          email: 'sribic@etf.unsa.ba',
+          email_verified: false,
+        })
+        .firestore();
+
+      const batch = writeBatch(samirProfDb);
+      batch.set(doc(samirProfDb, 'gradingItems', 'itm_os_new_1'), {
+        courseId: 'seed_crs_os',
+        categoryId: 'seed_cat_os_lab',
+        name: 'Zadaća 1 — Procesi i signali',
+        maxPoints: 10,
+        date: '2026-11-05',
+        description: 'Sistemski pozivi u Linuxu',
+        order: 1,
+        professorIds: ['samir_prof_uid', 'prof_1'],
+        isSeed: false,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+      batch.update(doc(samirProfDb, 'courses', 'seed_crs_os'), {
+        itemIds: ['itm_os_new_1'],
+        updatedAt: serverTimestamp(),
+      });
+
+      await assertSucceeds(batch.commit());
+
+      await assertSucceeds(
+        setDoc(doc(samirProfDb, 'scores', 'itm_os_new_1_stu_1'), {
+          courseId: 'seed_crs_os',
+          categoryId: 'seed_cat_os_lab',
+          itemId: 'itm_os_new_1',
+          studentId: 'stu_1',
+          points: 9.5,
+          feedback: 'Odlično rješenje',
+          gradedBy: 'samir_prof_uid',
+          professorIds: ['samir_prof_uid', 'prof_1'],
+          isSeed: false,
+          createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
         })
       );
