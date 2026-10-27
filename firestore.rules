@@ -954,52 +954,23 @@ service cloud.firestore {
         incoming().createdAt == existing().createdAt &&
         incoming().isSeed == existing().isSeed &&
         incoming().updatedAt == request.time &&
-        isAuthorizedUser() && (
-          (
-            (
-              existing().leadProfessorId == request.auth.uid ||
-              request.auth.uid in existing().professorIds ||
-              isProfessorUser() ||
-              isAdmin()
-            ) && (
-              incoming().diff(existing()).affectedKeys().hasOnly([
-                'name', 'semester', 'academicYear', 'ects', 'leadProfessorName',
-                'professorNames', 'assistantNames', 'studyProgram',
-                'attendanceEnabled', 'attendanceMaxPoints', 'allowBonusPoints', 'activityMarksEnabled',
-                'grade6Threshold', 'grade7Threshold', 'grade8Threshold', 'grade9Threshold', 'grade10Threshold',
-                'updatedAt'
-              ]) ||
-              incoming().diff(existing()).affectedKeys().hasOnly(['activityMarksEnabled', 'updatedAt']) ||
-              incoming().diff(existing()).affectedKeys().hasOnly([
-                'leadProfessorName', 'professorNames', 'assistantNames', 'updatedAt'
-              ]) ||
-              incoming().diff(existing()).affectedKeys().hasOnly(['professorNames', 'assistantNames', 'updatedAt']) ||
-              incoming().diff(existing()).affectedKeys().hasOnly(['categoryIds', 'updatedAt']) ||
-              incoming().diff(existing()).affectedKeys().hasOnly(['itemIds', 'updatedAt']) ||
-              incoming().diff(existing()).affectedKeys().hasOnly(['sessionIds', 'updatedAt']) ||
-              incoming().diff(existing()).affectedKeys().hasOnly(['examTermIds', 'updatedAt']) ||
-              incoming().diff(existing()).affectedKeys().hasOnly(['scheduleEventIds', 'updatedAt']) ||
-              incoming().diff(existing()).affectedKeys().hasOnly(['categoryIds', 'itemIds', 'updatedAt']) ||
-              incoming().diff(existing()).affectedKeys().hasOnly(['professorIds', 'updatedAt']) ||
-              incoming().diff(existing()).affectedKeys().hasOnly([
-                'leadProfessorId', 'leadProfessorName', 'professorIds', 'professorNames', 'assistantNames', 'updatedAt'
-              ])
-            )
-          ) ||
-          (
-            isAdmin() &&
-            incoming().diff(existing()).affectedKeys().hasOnly([
-              'name', 'semester', 'academicYear', 'ects',
-              'leadProfessorId', 'leadProfessorName', 'professorIds',
-              'professorNames', 'assistantNames', 'studyProgram',
-              'categoryIds', 'itemIds', 'sessionIds', 'examTermIds', 'scheduleEventIds',
-              'isArchived',
-              'attendanceEnabled', 'attendanceMaxPoints', 'allowBonusPoints', 'activityMarksEnabled',
-              'grade6Threshold', 'grade7Threshold', 'grade8Threshold', 'grade9Threshold', 'grade10Threshold',
-              'updatedAt'
-            ])
-          )
-        );
+        isAuthorizedUser() &&
+        (
+          existing().leadProfessorId == request.auth.uid ||
+          request.auth.uid in existing().professorIds ||
+          isProfessorUser() ||
+          isAdmin()
+        ) &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'name', 'semester', 'academicYear', 'ects',
+          'leadProfessorId', 'leadProfessorName', 'professorIds',
+          'professorNames', 'assistantNames', 'studyProgram',
+          'categoryIds', 'itemIds', 'sessionIds', 'examTermIds', 'scheduleEventIds',
+          'isArchived',
+          'attendanceEnabled', 'attendanceMaxPoints', 'allowBonusPoints', 'activityMarksEnabled',
+          'grade6Threshold', 'grade7Threshold', 'grade8Threshold', 'grade9Threshold', 'grade10Threshold',
+          'updatedAt'
+        ]);
       allow delete: if isSignedIn() && isValidId(courseId) && isAuthorizedUser() && (
         (resource != null && resource.data.leadProfessorId == request.auth.uid) || isAdmin()
       );
