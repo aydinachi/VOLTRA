@@ -877,6 +877,36 @@ describe('Firestore Security Rules — Structural & Dirty Dozen Verification', (
         })
       );
 
+      // Authenticated professor creates scheduleEvent (lecture, lab, exam) and links to course
+      await assertSucceeds(
+        setDoc(doc(holderDb, 'scheduleEvents', 'sch_holder_1'), {
+          courseId: 'crs_holder_test',
+          courseCode: 'RI-SP',
+          courseName: 'Sistemsko programiranje',
+          eventType: 'lecture',
+          title: 'Predavanje 1: Uvod u arhitekturu jezgre',
+          isRecurringWeekly: true,
+          dayOfWeek: 2,
+          date: '2026-11-10',
+          startTime: '09:00',
+          endTime: '11:00',
+          location: 'Amfiteatar A1',
+          description: 'Uvodno predavanje iz sistemskog programiranja',
+          createdBy: 'holder_only_uid',
+          professorIds: ['holder_only_uid', 'prof_1'],
+          isSeed: false,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        })
+      );
+
+      await assertSucceeds(
+        updateDoc(doc(holderDb, 'courses', 'crs_holder_test'), {
+          scheduleEventIds: ['sch_holder_1'],
+          updatedAt: serverTimestamp(),
+        })
+      );
+
       // Email/Password Admin (even without /admins/{uid} doc) creates examTerms and attendanceSessions both sequentially & in writeBatch
       const adminDb = testEnv
         .authenticatedContext('samir_admin_no_admindoc', {
