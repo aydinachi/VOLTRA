@@ -37,7 +37,7 @@ import {
   getCourseAssistants,
   getCourseProfessors,
 } from '../../lib/utils';
-import { generateInitialPassword } from '../../lib/validation';
+import { emailToProvisionId, generateInitialPassword } from '../../lib/validation';
 import {
   adminCreateUserAccount,
   AdminCreatedAccountResult,
@@ -46,6 +46,9 @@ import {
   archiveSemesterAndOpenNew,
   clearEtfDemoData,
   createCourse,
+  ensurePresentationLogins,
+  PRESENTATION_ACCOUNTS,
+  PresentationAccountSpec,
   removeEnrollment,
   seedEtfDemoData,
   setCourseArchiveStatus,
@@ -113,9 +116,9 @@ export function AdminPortal({ activeNav }: AdminPortalProps) {
   const [userSearch, setUserSearch] = useState('');
   const [roleFilter, setRoleFilter] = useState<'all' | 'professor' | 'student' | 'admin'>('all');
 
-  // Create Account Modal (Professor or Student)
+  // Create Account Modal (Professor, Student, or Admin)
   const [createUserOpen, setCreateUserOpen] = useState(false);
-  const [newRole, setNewRole] = useState<'student' | 'professor'>('student');
+  const [newRole, setNewRole] = useState<'student' | 'professor' | 'admin'>('student');
   const [newFullName, setNewFullName] = useState('');
   const [newEmail, setNewEmail] = useState('');
   const [newPassword, setNewPassword] = useState(() => generateInitialPassword());
@@ -188,6 +191,8 @@ export function AdminPortal({ activeNav }: AdminPortalProps) {
 
   // Demo seed busy
   const [seedBusy, setSeedBusy] = useState(false);
+  const [syncingPresentation, setSyncingPresentation] = useState(false);
+  const [copiedPresKey, setCopiedPresKey] = useState<string | null>(null);
 
   useEffect(() => {
     setLoading(true);
@@ -287,7 +292,7 @@ export function AdminPortal({ activeNav }: AdminPortalProps) {
   }
 
   // Handlers: Create User Account
-  const openCreateAccountModal = (defaultRole: 'student' | 'professor') => {
+  const openCreateAccountModal = (defaultRole: 'student' | 'professor' | 'admin') => {
     setNewRole(defaultRole);
     setNewFullName('');
     setNewEmail('');
@@ -315,6 +320,7 @@ export function AdminPortal({ activeNav }: AdminPortalProps) {
         newRole === 'student'
           ? activeCourses.filter((c) => selectedInitialCourseIds.includes(c.id))
           : [];
+      const isStaff = newRole === 'professor' || newRole === 'admin';
 
       const res = await adminCreateUserAccount({
         adminUid,
@@ -327,9 +333,9 @@ export function AdminPortal({ activeNav }: AdminPortalProps) {
         studyTrack: newRole === 'student' ? newStudyTrack : '',
         studyYear: newRole === 'student' ? newStudyYear : '',
         academicYear: newAcademicYear,
-        academicTitle: newRole === 'professor' ? newTitle : '',
-        officeLocation: newRole === 'professor' ? newOffice : '',
-        consultationHours: newRole === 'professor' ? newConsult : '',
+        academicTitle: isStaff ? newTitle : '',
+        officeLocation: isStaff ? newOffice : '',
+        consultationHours: isStaff ? newConsult : '',
         phone: newPhone,
         coursesToEnroll: selectedCourses,
       });
@@ -337,9 +343,11 @@ export function AdminPortal({ activeNav }: AdminPortalProps) {
       setCreatedCredentials(res);
       setCreateUserOpen(false);
       toast.success(
-        newRole === 'professor'
-          ? `Profesorski nalog za ${res.fullName} je spreman.`
-          : `Studentski nalog za ${res.fullName} (${res.studentIndex}) je spreman.`
+        newRole === 'admin'
+          ? `Administratorski nalog za ${res.fullName} je spreman.`
+          : newRole === 'professor'
+            ? `Profesorski nalog za ${res.fullName} je spreman.`
+            : `Studentski nalog za ${res.fullName} (${res.studentIndex}) je spreman.`
       );
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Greška pri kreiranju naloga.');
@@ -350,10 +358,16 @@ export function AdminPortal({ activeNav }: AdminPortalProps) {
 
   const handleCopyCredentials = async () => {
     if (!createdCredentials) return;
+    const roleLabel =
+      createdCredentials.role === 'admin'
+        ? 'Administrator'
+        : createdCredentials.role === 'professor'
+          ? 'Profesor'
+          : 'Student';
     const lines = [
       `VOLTRA — ETF Sarajevo Pristupni podaci`,
       `Ime i prezime: ${createdCredentials.fullName}`,
-      `Uloga: ${createdCredentials.role === 'professor' ? 'Profesor' : 'Student'}`,
+      `Uloga: ${roleLabel}`,
       ...(createdCredentials.role === 'student'
         ? [
             `Broj indeksa: ${createdCredentials.studentIndex}`,
@@ -369,6 +383,49 @@ export function AdminPortal({ activeNav }: AdminPortalProps) {
     setCopiedCreds(true);
     toast.success('Pristupni podaci su kopirani u međuspremnik.');
     setTimeout(() => setCopiedCreds(false), 2500);
+  };
+
+  const handleSyncPresentationLogins = async () => {
+    if (!adminUid) return;
+    setSyncingPresentation(true);
+    try {
+      const res = await ensurePresentationLogins({ adminUid });
+      if (res.emailPasswordAuthActive) {
+        toast.success(
+          'Sva 3 prezentacijska naloga (Admin, Profesor Samir Ribić i Student) su aktivna i povezana u bazi.'
+        );
+      } else {
+        toast.warning(
+          'Podaci naloga su sačuvani u Firestore bazi, ali je u Firebase konzoli potrebno uključiti Authentication → Sign-in method → Email/Password pa ponovo kliknuti ovo dugme.'
+        );
+      }
+    } catch (err) {
+      toast.error(
+        err instanceof Error ? err.message : 'Greška pri sinhronizaciji prezentacijskih naloga.'
+      );
+    } finally {
+      setSyncingPresentation(false);
+    }
+  };
+
+  const handleCopyPresentationAccount = async (spec: PresentationAccountSpec) => {
+    const text = `Uloga: ${spec.label}\nE-mail: ${spec.email}\nLozinka: ${spec.password}`;
+    await navigator.clipboard.writeText(text);
+    setCopiedPresKey(spec.key);
+    toast.success(`Kopirani podaci za: ${spec.email}`);
+    setTimeout(() => setCopiedPresKey(null), 2000);
+  };
+
+  const handleCopyAllPresentationAccounts = async () => {
+    const blocks = PRESENTATION_ACCOUNTS.map(
+      (s, idx) => `${idx + 1}. ${s.label}\n   E-mail: ${s.email}\n   Lozinka: ${s.password}`
+    );
+    await navigator.clipboard.writeText(
+      `VOLTRA — ETF Sarajevo Prezentacijski nalozi\n\n${blocks.join('\n\n')}`
+    );
+    setCopiedPresKey('all');
+    toast.success('Sva 3 prezentacijska naloga su kopirana.');
+    setTimeout(() => setCopiedPresKey(null), 2000);
   };
 
   const openEditUserModal = (u: UserProfile) => {
@@ -1372,6 +1429,116 @@ export function AdminPortal({ activeNav }: AdminPortalProps) {
         </div>
       </section>
 
+      {/* Dedicated Presentation Logins Card (Samir Ribić Admin, Samir Ribić Professor & Student) */}
+      <section className="bg-white border border-slate-200 rounded-xl overflow-hidden">
+        <div className="px-5 py-4 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div>
+            <h3 className="text-sm font-semibold text-slate-900">
+              Prezentacijski login nalozi u bazi (doc. dr. Samir Ribić &amp; Student)
+            </h3>
+            <p className="text-xs text-slate-500 mt-0.5">
+              Odvojeni login pristupi za Administratora, Profesora i Studenta sa povezanim predmetima,
+              bodovima i (+) tačkama za aktivnost.
+            </p>
+          </div>
+          <div className="flex flex-wrap items-center gap-2 shrink-0">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handleCopyAllPresentationAccounts}
+              className="whitespace-nowrap"
+            >
+              {copiedPresKey === 'all' ? (
+                <>
+                  <Check className="w-3.5 h-3.5" />
+                  Kopirano
+                </>
+              ) : (
+                <>
+                  <Copy className="w-3.5 h-3.5" />
+                  Kopiraj sva 3
+                </>
+              )}
+            </Button>
+            <Button
+              size="sm"
+              disabled={syncingPresentation}
+              onClick={handleSyncPresentationLogins}
+              className="whitespace-nowrap"
+            >
+              <RefreshCw className={cn('w-3.5 h-3.5', syncingPresentation && 'animate-spin')} />
+              {syncingPresentation ? 'Upisivanje u bazu...' : 'Sinhronizuj naloge u bazi'}
+            </Button>
+          </div>
+        </div>
+
+        <div className="divide-y divide-slate-100">
+          {PRESENTATION_ACCOUNTS.map((spec) => {
+            const provId = emailToProvisionId(spec.email);
+            const provRow = provisioned.find((p) => p.id === provId);
+            const isAuthReady = Boolean(provRow?.authUid) ||
+              privates.some((pr) => pr.email.toLowerCase() === spec.email.toLowerCase());
+
+            return (
+              <div
+                key={spec.key}
+                className="px-5 py-3.5 flex flex-col lg:flex-row lg:items-center justify-between gap-3 hover:bg-slate-50/60 transition-colors"
+              >
+                <div className="min-w-0 space-y-0.5">
+                  <div className="flex flex-wrap items-center gap-2 text-sm">
+                    <span className="font-semibold text-slate-900">{spec.label}</span>
+                    <span aria-hidden="true" className="text-slate-300">
+                      ·
+                    </span>
+                    <span
+                      className={cn(
+                        'text-xs font-medium',
+                        isAuthReady ? 'text-emerald-700' : 'text-amber-700'
+                      )}
+                    >
+                      {isAuthReady ? 'Aktivan u bazi' : 'Čeka Email/Password aktivaciju'}
+                    </span>
+                  </div>
+                  <div className="text-xs text-slate-500">{spec.summary}</div>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-3 shrink-0 text-xs">
+                  <div className="font-mono tabular-nums text-slate-800">
+                    <span className="text-slate-400 mr-1">E-mail:</span>
+                    <span className="font-semibold select-all">{spec.email}</span>
+                  </div>
+                  <span aria-hidden="true" className="text-slate-300 hidden sm:inline">
+                    ·
+                  </span>
+                  <div className="font-mono tabular-nums text-blue-700">
+                    <span className="text-slate-400 mr-1">Šifra:</span>
+                    <span className="font-semibold select-all">{spec.password}</span>
+                  </div>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => handleCopyPresentationAccount(spec)}
+                    className="h-8 whitespace-nowrap"
+                  >
+                    {copiedPresKey === spec.key ? (
+                      <>
+                        <Check className="w-3.5 h-3.5" />
+                        Kopirano
+                      </>
+                    ) : (
+                      <>
+                        <Copy className="w-3.5 h-3.5" />
+                        Kopiraj
+                      </>
+                    )}
+                  </Button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </section>
+
       {/* Newly Issued Credentials Card (Copyable Login Slip for Professor or Student) */}
       {createdCredentials && (
         <section className="bg-white border border-emerald-300 rounded-xl p-5 space-y-4">
@@ -1382,9 +1549,11 @@ export function AdminPortal({ activeNav }: AdminPortalProps) {
               </div>
               <h3 className="text-base font-bold text-slate-900 mt-0.5">
                 {createdCredentials.fullName} (
-                {createdCredentials.role === 'professor'
-                  ? 'Profesor'
-                  : `Student · Indeks ${createdCredentials.studentIndex}`}
+                {createdCredentials.role === 'admin'
+                  ? 'Administrator'
+                  : createdCredentials.role === 'professor'
+                    ? 'Profesor'
+                    : `Student · Indeks ${createdCredentials.studentIndex}`}
                 )
               </h3>
             </div>
@@ -1635,25 +1804,27 @@ export function AdminPortal({ activeNav }: AdminPortalProps) {
         )}
       </div>
 
-      {/* Modal 1: Create New Professor or Student Account with Credentials */}
+      {/* Modal 1: Create New Professor, Student, or Admin Account with Credentials */}
       <Dialog
         open={createUserOpen}
         onOpenChange={setCreateUserOpen}
         title={
-          newRole === 'professor'
-            ? 'Kreiraj novi profesorski nalog'
-            : 'Kreiraj novi studentski nalog'
+          newRole === 'admin'
+            ? 'Kreiraj novi administratorski nalog'
+            : newRole === 'professor'
+              ? 'Kreiraj novi profesorski nalog'
+              : 'Kreiraj novi studentski nalog'
         }
         description="Generišite pristupni e-mail i početnu šifru te dodijelite zvanične akademske podatke."
       >
         <form onSubmit={handleCreateUserSubmit} className="space-y-4 text-left">
           {/* Role Switcher */}
-          <div className="grid grid-cols-2 gap-1 p-1 bg-slate-100 rounded-lg">
+          <div className="grid grid-cols-3 gap-1 p-1 bg-slate-100 rounded-lg">
             <button
               type="button"
               onClick={() => setNewRole('student')}
               className={cn(
-                'py-1.5 text-xs font-semibold rounded-md transition-colors cursor-pointer',
+                'py-1.5 text-xs font-semibold rounded-md transition-colors cursor-pointer whitespace-nowrap',
                 newRole === 'student'
                   ? 'bg-white text-slate-900 shadow-xs'
                   : 'text-slate-600 hover:text-slate-900'
@@ -1665,13 +1836,25 @@ export function AdminPortal({ activeNav }: AdminPortalProps) {
               type="button"
               onClick={() => setNewRole('professor')}
               className={cn(
-                'py-1.5 text-xs font-semibold rounded-md transition-colors cursor-pointer',
+                'py-1.5 text-xs font-semibold rounded-md transition-colors cursor-pointer whitespace-nowrap',
                 newRole === 'professor'
                   ? 'bg-white text-slate-900 shadow-xs'
                   : 'text-slate-600 hover:text-slate-900'
               )}
             >
-              Profesor / Nastavnik
+              Profesor
+            </button>
+            <button
+              type="button"
+              onClick={() => setNewRole('admin')}
+              className={cn(
+                'py-1.5 text-xs font-semibold rounded-md transition-colors cursor-pointer whitespace-nowrap',
+                newRole === 'admin'
+                  ? 'bg-white text-slate-900 shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900'
+              )}
+            >
+              Administrator
             </button>
           </div>
 

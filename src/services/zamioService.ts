@@ -1,5 +1,6 @@
 import {
   createUserWithEmailAndPassword,
+  signInWithEmailAndPassword,
   signOut as firebaseSignOut,
 } from 'firebase/auth';
 import {
@@ -18,6 +19,7 @@ import {
   writeBatch,
 } from 'firebase/firestore';
 import {
+  auth,
   BOOTSTRAP_ADMIN_EMAIL,
   db,
   handleFirestoreError,
@@ -45,6 +47,7 @@ import {
 import {
   AcademicState,
   ActivityAward,
+  AdminIndex,
   Announcement,
   AnnouncementAudience,
   AnnouncementCategory,
@@ -111,6 +114,203 @@ async function runParallelChunks<T>(
   }
 }
 
+function isCurrentSessionBootstrapAdmin(): boolean {
+  const cur = auth.currentUser;
+  if (!cur || !cur.email || !cur.emailVerified) return false;
+  return cur.email.toLowerCase() === BOOTSTRAP_ADMIN_EMAIL.toLowerCase();
+}
+
+const adminIndexDraft: {
+  userIds: string[];
+  provisionedIds: string[];
+  courseIds: string[];
+  enrollmentIds: string[];
+  scheduleEventIds: string[];
+  announcementIds: string[];
+} = {
+  userIds: [],
+  provisionedIds: [],
+  courseIds: [],
+  enrollmentIds: [],
+  scheduleEventIds: [],
+  announcementIds: [],
+};
+
+const adminIndexLoadedSections = new Set<string>();
+let lastFlushedAdminIndexSig = '';
+let adminIndexFlushTimer: ReturnType<typeof setTimeout> | null = null;
+
+function sanitizeIndexIdArray(ids: string[], maxLen: number): string[] {
+  const unique = Array.from(
+    new Set(
+      ids.filter((id) => typeof id === 'string' && isValidResourceId(id, 128))
+    )
+  );
+  return unique.slice(0, maxLen);
+}
+
+function scheduleBootstrapAdminIndexFlush(): void {
+  if (!isCurrentSessionBootstrapAdmin()) return;
+  if (adminIndexFlushTimer) {
+    clearTimeout(adminIndexFlushTimer);
+  }
+  adminIndexFlushTimer = setTimeout(async () => {
+    adminIndexFlushTimer = null;
+    const cur = auth.currentUser;
+    if (!cur || !isCurrentSessionBootstrapAdmin()) return;
+
+    try {
+      const ref = doc(db, 'adminIndex', 'global');
+      const snap = await getDoc(ref);
+      const existing = snap.exists() ? (snap.data() as Partial<AdminIndex>) : {};
+
+      const nextPayload = {
+        userIds: sanitizeIndexIdArray(
+          adminIndexLoadedSections.has('userIds')
+            ? adminIndexDraft.userIds
+            : (existing.userIds ?? []),
+          500
+        ),
+        provisionedIds: sanitizeIndexIdArray(
+          adminIndexLoadedSections.has('provisionedIds')
+            ? adminIndexDraft.provisionedIds
+            : (existing.provisionedIds ?? []),
+          500
+        ),
+        courseIds: sanitizeIndexIdArray(
+          adminIndexLoadedSections.has('courseIds')
+            ? adminIndexDraft.courseIds
+            : (existing.courseIds ?? []),
+          200
+        ),
+        enrollmentIds: sanitizeIndexIdArray(
+          adminIndexLoadedSections.has('enrollmentIds')
+            ? adminIndexDraft.enrollmentIds
+            : (existing.enrollmentIds ?? []),
+          1000
+        ),
+        scheduleEventIds: sanitizeIndexIdArray(
+          adminIndexLoadedSections.has('scheduleEventIds')
+            ? adminIndexDraft.scheduleEventIds
+            : (existing.scheduleEventIds ?? []),
+          500
+        ),
+        announcementIds: sanitizeIndexIdArray(
+          adminIndexLoadedSections.has('announcementIds')
+            ? adminIndexDraft.announcementIds
+            : (existing.announcementIds ?? []),
+          200
+        ),
+      };
+
+      const sig = JSON.stringify(nextPayload);
+      if (snap.exists() && sig === lastFlushedAdminIndexSig) {
+        return;
+      }
+
+      if (snap.exists()) {
+        await updateDoc(ref, {
+          ...nextPayload,
+          updatedBy: cur.uid,
+          updatedAt: serverTimestamp(),
+        });
+      } else {
+        await setDoc(ref, {
+          ...nextPayload,
+          updatedBy: cur.uid,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      }
+      lastFlushedAdminIndexSig = sig;
+    } catch {
+      // Non-blocking admin index sync
+    }
+  }, 400);
+}
+
+async function mutateAdminIndex(delta: {
+  addUserIds?: string[];
+  removeUserIds?: string[];
+  addProvisionedIds?: string[];
+  removeProvisionedIds?: string[];
+  addCourseIds?: string[];
+  removeCourseIds?: string[];
+  addEnrollmentIds?: string[];
+  removeEnrollmentIds?: string[];
+  addScheduleEventIds?: string[];
+  removeScheduleEventIds?: string[];
+  addAnnouncementIds?: string[];
+  removeAnnouncementIds?: string[];
+}): Promise<void> {
+  const cur = auth.currentUser;
+  if (!cur) return;
+
+  try {
+    const ref = doc(db, 'adminIndex', 'global');
+    const snap = await getDoc(ref);
+    const existing = snap.exists() ? (snap.data() as Partial<AdminIndex>) : {};
+
+    const applyDelta = (
+      base: string[] | undefined,
+      add: string[] | undefined,
+      rem: string[] | undefined,
+      maxLen: number
+    ): string[] => {
+      const removeSet = new Set(rem ?? []);
+      const merged = [...(base ?? []), ...(add ?? [])].filter((id) => !removeSet.has(id));
+      return sanitizeIndexIdArray(merged, maxLen);
+    };
+
+    const nextPayload = {
+      userIds: applyDelta(existing.userIds, delta.addUserIds, delta.removeUserIds, 500),
+      provisionedIds: applyDelta(
+        existing.provisionedIds,
+        delta.addProvisionedIds,
+        delta.removeProvisionedIds,
+        500
+      ),
+      courseIds: applyDelta(existing.courseIds, delta.addCourseIds, delta.removeCourseIds, 200),
+      enrollmentIds: applyDelta(
+        existing.enrollmentIds,
+        delta.addEnrollmentIds,
+        delta.removeEnrollmentIds,
+        1000
+      ),
+      scheduleEventIds: applyDelta(
+        existing.scheduleEventIds,
+        delta.addScheduleEventIds,
+        delta.removeScheduleEventIds,
+        500
+      ),
+      announcementIds: applyDelta(
+        existing.announcementIds,
+        delta.addAnnouncementIds,
+        delta.removeAnnouncementIds,
+        200
+      ),
+    };
+
+    if (snap.exists()) {
+      await updateDoc(ref, {
+        ...nextPayload,
+        updatedBy: cur.uid,
+        updatedAt: serverTimestamp(),
+      });
+    } else {
+      await setDoc(ref, {
+        ...nextPayload,
+        updatedBy: cur.uid,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    }
+    lastFlushedAdminIndexSig = JSON.stringify(nextPayload);
+  } catch {
+    // Non-blocking for non-admin callers
+  }
+}
+
 export async function ensureUserAccount(params: {
   uid: string;
   email: string;
@@ -174,7 +374,11 @@ export async function ensureUserAccount(params: {
 
     if (claimedProvision && !isAdminUser) {
       const assignedRole =
-        claimedProvision.role === 'professor' ? UserRole.PROFESSOR : UserRole.STUDENT;
+        claimedProvision.role === 'admin'
+          ? UserRole.ADMIN
+          : claimedProvision.role === 'professor'
+            ? UserRole.PROFESSOR
+            : UserRole.STUDENT;
       const assignedTrack = normalizeStudyTrack(claimedProvision.studyTrack);
       const assignedIndex = sanitizeText(
         claimedProvision.studentIndex,
@@ -1431,6 +1635,7 @@ export async function createCourse(params: {
     })
   );
 
+  void mutateAdminIndex({ addCourseIds: [courseId] });
   return courseId;
 }
 
@@ -1568,6 +1773,7 @@ export async function updateCourseTeachingStaff(params: {
       }
     });
   }
+  void mutateAdminIndex({});
 }
 
 async function syncCourseProfessorIdsAcrossChildren(params: {
@@ -1576,7 +1782,7 @@ async function syncCourseProfessorIdsAcrossChildren(params: {
   nextProfessorIds: string[];
   isAdminUser?: boolean;
 }): Promise<void> {
-  const { courseId, actorUid, nextProfessorIds, isAdminUser = false } = params;
+  const { courseId, actorUid, nextProfessorIds } = params;
   const standardCollections = [
     'enrollments',
     'gradingCategories',
@@ -1616,13 +1822,9 @@ async function syncCourseProfessorIdsAcrossChildren(params: {
       where('courseId', '==', courseId)
     );
     const fgSnap = await getDocs(fgQ);
-    const editableFgDocs = fgSnap.docs.filter(
-      (d) => isAdminUser || d.data().status !== FinalGradeStatus.FINALIZED
-    );
-    await runParallelChunks(editableFgDocs, 15, async (d) => {
+    await runParallelChunks(fgSnap.docs, 15, async (d) => {
       await updateDoc(d.ref, {
         professorIds: nextProfessorIds,
-        finalizedBy: actorUid,
         updatedAt: serverTimestamp(),
       });
     });
@@ -1802,6 +2004,7 @@ export async function enrollStudentByIndex(params: {
 export async function removeEnrollment(enrollmentId: string): Promise<void> {
   try {
     await deleteDoc(doc(db, 'enrollments', enrollmentId));
+    void mutateAdminIndex({ removeEnrollmentIds: [enrollmentId] });
   } catch (error) {
     handleFirestoreError(error, OperationType.DELETE, `enrollments/${enrollmentId}`);
   }
@@ -3544,10 +3747,16 @@ export async function seedEtfDemoData(params: {
   const effectiveIndex =
     sanitizeText(adminIndex, VALIDATION_CONSTRAINTS.STUDENT_INDEX_MAX_LENGTH) || '19001';
 
-  // Completion marker written at the very end of Stage 5
+  // Completion marker written at the very end of Stage 5 (or existing core seed courses)
   const completionMarkerId = `seed_crs_tp_${adminUid}`;
-  const markerSnap = await getDoc(doc(db, 'finalGrades', completionMarkerId));
-  if (markerSnap.exists()) {
+  const [markerSnap, partialSnap, osSnapCheck, tpSnapCheck] = await Promise.all([
+    getDoc(doc(db, 'finalGrades', completionMarkerId)),
+    getDoc(doc(db, 'courses', 'seed_crs_ar')),
+    getDoc(doc(db, 'courses', 'seed_crs_os')),
+    getDoc(doc(db, 'courses', 'seed_crs_tp')),
+  ]);
+
+  if (markerSnap.exists() || (partialSnap.exists() && osSnapCheck.exists() && tpSnapCheck.exists())) {
     await Promise.all([
       seedDemoExamDataIfMissing({ adminUid }),
       seedDemoTeachingStaffIfMissing({ cleanLeadProfName }),
@@ -3564,11 +3773,11 @@ export async function seedEtfDemoData(params: {
       cleanLeadProfName,
       effectiveIndex,
     });
+    await ensurePresentationLogins({ adminUid });
     return;
   }
 
   // Detect whether a previous partial run already wrote some seed documents
-  const partialSnap = await getDoc(doc(db, 'courses', 'seed_crs_ar'));
   const checkBeforeCreate = partialSnap.exists();
 
   interface SeedDocTask {
@@ -4167,6 +4376,7 @@ export async function seedEtfDemoData(params: {
     cleanLeadProfName,
     effectiveIndex,
   });
+  await ensurePresentationLogins({ adminUid });
 }
 
 async function seedDemoPortalExtensionsIfMissing(params: {
@@ -4713,23 +4923,64 @@ export function subscribePublishedAnnouncements(
 export function subscribeAllAnnouncementsForAdmin(
   onData: (items: Announcement[]) => void
 ): Unsubscribe {
-  return onSnapshot(
-    collection(db, 'announcements'),
-    (snap) => {
-      const list = snap.docs.map((d) => ({
-        ...(d.data() as Omit<Announcement, 'id'>),
-        id: d.id,
-      }));
-      list.sort((a, b) => {
-        if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
-        const aSec = (a.createdAt as { seconds?: number })?.seconds ?? 0;
-        const bSec = (b.createdAt as { seconds?: number })?.seconds ?? 0;
-        return bSec - aSec;
+  const sortAnnouncements = (list: Announcement[]) => {
+    list.sort((a, b) => {
+      if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
+      const aSec = (a.createdAt as { seconds?: number })?.seconds ?? 0;
+      const bSec = (b.createdAt as { seconds?: number })?.seconds ?? 0;
+      return bSec - aSec;
+    });
+    return list;
+  };
+
+  if (isCurrentSessionBootstrapAdmin()) {
+    return onSnapshot(
+      collection(db, 'announcements'),
+      (snap) => {
+        adminIndexDraft.announcementIds = snap.docs.map((d) => d.id);
+        adminIndexLoadedSections.add('announcementIds');
+        scheduleBootstrapAdminIndexFlush();
+
+        const list = snap.docs.map((d) => ({
+          ...(d.data() as Omit<Announcement, 'id'>),
+          id: d.id,
+        }));
+        onData(sortAnnouncements(list));
+      },
+      (err) => handleFirestoreError(err, OperationType.LIST, 'announcements')
+    );
+  }
+
+  let active = true;
+  const unsub = onSnapshot(
+    doc(db, 'adminIndex', 'global'),
+    async (idxSnap) => {
+      if (!idxSnap.exists()) {
+        onData([]);
+        return;
+      }
+      const ids = (idxSnap.data() as AdminIndex).announcementIds ?? [];
+      const results: Announcement[] = [];
+      await runParallelChunks(ids, 20, async (id) => {
+        try {
+          const d = await getDoc(doc(db, 'announcements', id));
+          if (d.exists()) {
+            results.push({ ...(d.data() as Omit<Announcement, 'id'>), id: d.id });
+          }
+        } catch {
+          // Skip missing or inaccessible doc
+        }
       });
-      onData(list);
+      if (active) {
+        onData(sortAnnouncements(results));
+      }
     },
-    (err) => handleFirestoreError(err, OperationType.LIST, 'announcements')
+    (err) => handleFirestoreError(err, OperationType.GET, 'adminIndex/global')
   );
+  return () => {
+    active = false;
+    unsub();
+  };
 }
 
 export async function createAnnouncement(params: {
@@ -4771,6 +5022,7 @@ export async function createAnnouncement(params: {
       createdAt: serverTimestamp(),
       updatedAt: serverTimestamp(),
     });
+    void mutateAdminIndex({ addAnnouncementIds: [id] });
     return id;
   } catch (error) {
     handleFirestoreError(error, OperationType.CREATE, `announcements/${id}`);
@@ -4818,6 +5070,7 @@ export async function updateAnnouncement(
         '2026/2027',
       updatedAt: serverTimestamp(),
     });
+    void mutateAdminIndex({});
   } catch (error) {
     handleFirestoreError(error, OperationType.UPDATE, `announcements/${id}`);
   }
@@ -4826,6 +5079,7 @@ export async function updateAnnouncement(
 export async function deleteAnnouncement(id: string): Promise<void> {
   try {
     await deleteDoc(doc(db, 'announcements', id));
+    void mutateAdminIndex({ removeAnnouncementIds: [id] });
   } catch (error) {
     handleFirestoreError(error, OperationType.DELETE, `announcements/${id}`);
   }
@@ -4855,12 +5109,41 @@ export function subscribeProfessorScheduleEvents(
 export function subscribeAllScheduleEventsForAdmin(
   onData: (events: ScheduleEvent[]) => void
 ): Unsubscribe {
+  if (isCurrentSessionBootstrapAdmin()) {
+    return onSnapshot(
+      collection(db, 'scheduleEvents'),
+      (snap) => {
+        adminIndexDraft.scheduleEventIds = snap.docs.map((d) => d.id);
+        adminIndexLoadedSections.add('scheduleEventIds');
+        scheduleBootstrapAdminIndexFlush();
+        onData(snap.docs.map((d) => ({ ...(d.data() as Omit<ScheduleEvent, 'id'>), id: d.id })));
+      },
+      (err) => handleFirestoreError(err, OperationType.LIST, 'scheduleEvents')
+    );
+  }
+
   return onSnapshot(
-    collection(db, 'scheduleEvents'),
-    (snap) => {
-      onData(snap.docs.map((d) => ({ ...(d.data() as Omit<ScheduleEvent, 'id'>), id: d.id })));
+    doc(db, 'adminIndex', 'global'),
+    async (idxSnap) => {
+      if (!idxSnap.exists()) {
+        onData([]);
+        return;
+      }
+      const ids = (idxSnap.data() as AdminIndex).scheduleEventIds ?? [];
+      const results: ScheduleEvent[] = [];
+      await runParallelChunks(ids, 20, async (id) => {
+        try {
+          const d = await getDoc(doc(db, 'scheduleEvents', id));
+          if (d.exists()) {
+            results.push({ ...(d.data() as Omit<ScheduleEvent, 'id'>), id: d.id });
+          }
+        } catch {
+          // Skip missing doc
+        }
+      });
+      onData(results);
     },
-    (err) => handleFirestoreError(err, OperationType.LIST, 'scheduleEvents')
+    (err) => handleFirestoreError(err, OperationType.GET, 'adminIndex/global')
   );
 }
 
@@ -4927,6 +5210,7 @@ export async function createScheduleEvent(params: {
 
   try {
     await batch.commit();
+    void mutateAdminIndex({ addScheduleEventIds: [eventId] });
     return eventId;
   } catch (error) {
     handleFirestoreError(error, OperationType.CREATE, `scheduleEvents/${eventId}`);
@@ -4977,6 +5261,7 @@ export async function updateScheduleEvent(
       professorIds: course.professorIds,
       updatedAt: serverTimestamp(),
     });
+    void mutateAdminIndex({});
   } catch (error) {
     handleFirestoreError(error, OperationType.UPDATE, `scheduleEvents/${event.id}`);
   }
@@ -4995,6 +5280,7 @@ export async function deleteScheduleEvent(params: {
   });
   try {
     await batch.commit();
+    void mutateAdminIndex({ removeScheduleEventIds: [eventId] });
   } catch (error) {
     handleFirestoreError(error, OperationType.DELETE, `scheduleEvents/${eventId}`);
   }
@@ -5046,6 +5332,7 @@ export async function setCourseArchiveStatus(params: {
       // Best-effort enrollment archive flag sync
     }
   });
+  void mutateAdminIndex({});
 }
 
 export async function archiveSemesterAndOpenNew(params: {
@@ -5143,6 +5430,7 @@ export async function archiveSemesterAndOpenNew(params: {
         )
       );
       clonedCount += 1;
+      void mutateAdminIndex({ addCourseIds: [newCourseId] });
     }
   }
 
@@ -5183,80 +5471,215 @@ export function subscribeAllUsersForAdmin(callbacks: {
   onPrivates: (rows: UserPrivate[]) => void;
   onProvisioned: (rows: ProvisionedAccount[]) => void;
 }): Unsubscribe {
-  const u1 = onSnapshot(
-    collection(db, 'userProfiles'),
-    (snap) => {
-      callbacks.onProfiles(
-        snap.docs.map((d) => {
-          const data = d.data() as UserProfile;
-          return {
-            ...data,
-            uid: d.id,
-            studyTrack: data.studyTrack ? normalizeStudyTrack(data.studyTrack) : data.studyTrack,
-          };
-        })
-      );
-    },
-    (err) => handleFirestoreError(err, OperationType.LIST, 'userProfiles')
-  );
+  if (isCurrentSessionBootstrapAdmin()) {
+    const u1 = onSnapshot(
+      collection(db, 'userProfiles'),
+      (snap) => {
+        adminIndexDraft.userIds = snap.docs.map((d) => d.id);
+        adminIndexLoadedSections.add('userIds');
+        scheduleBootstrapAdminIndexFlush();
 
-  const u2 = onSnapshot(
-    collection(db, 'userPrivate'),
-    (snap) => {
-      callbacks.onPrivates(
-        snap.docs.map((d) => ({ ...(d.data() as Omit<UserPrivate, 'uid'>), uid: d.id }))
-      );
-    },
-    (err) => handleFirestoreError(err, OperationType.LIST, 'userPrivate')
-  );
+        callbacks.onProfiles(
+          snap.docs.map((d) => {
+            const data = d.data() as UserProfile;
+            return {
+              ...data,
+              uid: d.id,
+              studyTrack: data.studyTrack ? normalizeStudyTrack(data.studyTrack) : data.studyTrack,
+            };
+          })
+        );
+      },
+      (err) => handleFirestoreError(err, OperationType.LIST, 'userProfiles')
+    );
 
-  const u3 = onSnapshot(
-    collection(db, 'provisionedAccounts'),
-    (snap) => {
-      callbacks.onProvisioned(
-        snap.docs.map((d) => ({ ...(d.data() as Omit<ProvisionedAccount, 'id'>), id: d.id }))
-      );
-    },
-    (err) => handleFirestoreError(err, OperationType.LIST, 'provisionedAccounts')
-  );
+    const u2 = onSnapshot(
+      collection(db, 'userPrivate'),
+      (snap) => {
+        callbacks.onPrivates(
+          snap.docs.map((d) => ({ ...(d.data() as Omit<UserPrivate, 'uid'>), uid: d.id }))
+        );
+      },
+      (err) => handleFirestoreError(err, OperationType.LIST, 'userPrivate')
+    );
 
-  return () => {
-    u1();
-    u2();
-    u3();
-  };
+    const u3 = onSnapshot(
+      collection(db, 'provisionedAccounts'),
+      (snap) => {
+        adminIndexDraft.provisionedIds = snap.docs.map((d) => d.id);
+        adminIndexLoadedSections.add('provisionedIds');
+        scheduleBootstrapAdminIndexFlush();
+
+        callbacks.onProvisioned(
+          snap.docs.map((d) => ({ ...(d.data() as Omit<ProvisionedAccount, 'id'>), id: d.id }))
+        );
+      },
+      (err) => handleFirestoreError(err, OperationType.LIST, 'provisionedAccounts')
+    );
+
+    return () => {
+      u1();
+      u2();
+      u3();
+    };
+  }
+
+  return onSnapshot(
+    doc(db, 'adminIndex', 'global'),
+    async (idxSnap) => {
+      if (!idxSnap.exists()) {
+        callbacks.onProfiles([]);
+        callbacks.onPrivates([]);
+        callbacks.onProvisioned([]);
+        return;
+      }
+      const idx = idxSnap.data() as AdminIndex;
+      const userIds = idx.userIds ?? [];
+      const provisionedIds = idx.provisionedIds ?? [];
+
+      const profiles: UserProfile[] = [];
+      const privates: UserPrivate[] = [];
+      const provRows: ProvisionedAccount[] = [];
+
+      await runParallelChunks(userIds, 20, async (uid) => {
+        try {
+          const [pSnap, privSnap] = await Promise.all([
+            getDoc(doc(db, 'userProfiles', uid)),
+            getDoc(doc(db, 'userPrivate', uid)),
+          ]);
+          if (pSnap.exists()) {
+            const data = pSnap.data() as UserProfile;
+            profiles.push({
+              ...data,
+              uid: pSnap.id,
+              studyTrack: data.studyTrack ? normalizeStudyTrack(data.studyTrack) : data.studyTrack,
+            });
+          }
+          if (privSnap.exists()) {
+            privates.push({ ...(privSnap.data() as Omit<UserPrivate, 'uid'>), uid: privSnap.id });
+          }
+        } catch {
+          // Skip inaccessible doc
+        }
+      });
+
+      await runParallelChunks(provisionedIds, 20, async (pid) => {
+        try {
+          const pSnap = await getDoc(doc(db, 'provisionedAccounts', pid));
+          if (pSnap.exists()) {
+            provRows.push({
+              ...(pSnap.data() as Omit<ProvisionedAccount, 'id'>),
+              id: pSnap.id,
+            });
+          }
+        } catch {
+          // Skip inaccessible doc
+        }
+      });
+
+      callbacks.onProfiles(profiles);
+      callbacks.onPrivates(privates);
+      callbacks.onProvisioned(provRows);
+    },
+    (err) => handleFirestoreError(err, OperationType.GET, 'adminIndex/global')
+  );
 }
 
 export function subscribeAllCoursesForAdmin(
   onData: (courses: Course[]) => void
 ): Unsubscribe {
+  if (isCurrentSessionBootstrapAdmin()) {
+    return onSnapshot(
+      collection(db, 'courses'),
+      (snap) => {
+        adminIndexDraft.courseIds = snap.docs.map((d) => d.id);
+        adminIndexLoadedSections.add('courseIds');
+        scheduleBootstrapAdminIndexFlush();
+
+        onData(
+          snap.docs.map((d) => {
+            const raw = d.data() as Omit<Course, 'id'>;
+            return {
+              ...raw,
+              id: d.id,
+              studyProgram: raw.studyProgram ? normalizeStudyTrack(raw.studyProgram) : undefined,
+            };
+          })
+        );
+      },
+      (err) => handleFirestoreError(err, OperationType.LIST, 'courses')
+    );
+  }
+
   return onSnapshot(
-    collection(db, 'courses'),
-    (snap) => {
-      onData(
-        snap.docs.map((d) => {
-          const raw = d.data() as Omit<Course, 'id'>;
-          return {
-            ...raw,
-            id: d.id,
-            studyProgram: raw.studyProgram ? normalizeStudyTrack(raw.studyProgram) : undefined,
-          };
-        })
-      );
+    doc(db, 'adminIndex', 'global'),
+    async (idxSnap) => {
+      if (!idxSnap.exists()) {
+        onData([]);
+        return;
+      }
+      const ids = (idxSnap.data() as AdminIndex).courseIds ?? [];
+      const results: Course[] = [];
+      await runParallelChunks(ids, 20, async (id) => {
+        try {
+          const d = await getDoc(doc(db, 'courses', id));
+          if (d.exists()) {
+            const raw = d.data() as Omit<Course, 'id'>;
+            results.push({
+              ...raw,
+              id: d.id,
+              studyProgram: raw.studyProgram ? normalizeStudyTrack(raw.studyProgram) : undefined,
+            });
+          }
+        } catch {
+          // Skip missing doc
+        }
+      });
+      onData(results);
     },
-    (err) => handleFirestoreError(err, OperationType.LIST, 'courses')
+    (err) => handleFirestoreError(err, OperationType.GET, 'adminIndex/global')
   );
 }
 
 export function subscribeAllEnrollmentsForAdmin(
   onData: (rows: Enrollment[]) => void
 ): Unsubscribe {
+  if (isCurrentSessionBootstrapAdmin()) {
+    return onSnapshot(
+      collection(db, 'enrollments'),
+      (snap) => {
+        adminIndexDraft.enrollmentIds = snap.docs.map((d) => d.id);
+        adminIndexLoadedSections.add('enrollmentIds');
+        scheduleBootstrapAdminIndexFlush();
+
+        onData(snap.docs.map((d) => ({ ...(d.data() as Omit<Enrollment, 'id'>), id: d.id })));
+      },
+      (err) => handleFirestoreError(err, OperationType.LIST, 'enrollments')
+    );
+  }
+
   return onSnapshot(
-    collection(db, 'enrollments'),
-    (snap) => {
-      onData(snap.docs.map((d) => ({ ...(d.data() as Omit<Enrollment, 'id'>), id: d.id })));
+    doc(db, 'adminIndex', 'global'),
+    async (idxSnap) => {
+      if (!idxSnap.exists()) {
+        onData([]);
+        return;
+      }
+      const ids = (idxSnap.data() as AdminIndex).enrollmentIds ?? [];
+      const results: Enrollment[] = [];
+      await runParallelChunks(ids, 20, async (id) => {
+        try {
+          const d = await getDoc(doc(db, 'enrollments', id));
+          if (d.exists()) {
+            results.push({ ...(d.data() as Omit<Enrollment, 'id'>), id: d.id });
+          }
+        } catch {
+          // Skip missing doc
+        }
+      });
+      onData(results);
     },
-    (err) => handleFirestoreError(err, OperationType.LIST, 'enrollments')
+    (err) => handleFirestoreError(err, OperationType.GET, 'adminIndex/global')
   );
 }
 
@@ -5264,7 +5687,7 @@ export interface AdminCreatedAccountResult {
   uid: string;
   email: string;
   password: string;
-  role: 'student' | 'professor';
+  role: 'student' | 'professor' | 'admin';
   fullName: string;
   studentIndex: string;
   studyTrack: string;
@@ -5278,7 +5701,7 @@ export async function adminCreateUserAccount(params: {
   email: string;
   password: string;
   fullName: string;
-  role: 'student' | 'professor';
+  role: 'student' | 'professor' | 'admin';
   studentIndex?: string;
   department: string;
   studyTrack?: string;
@@ -5321,6 +5744,7 @@ export async function adminCreateUserAccount(params: {
     }
   }
 
+  const isStaffRole = params.role === 'professor' || params.role === 'admin';
   const cleanDept =
     sanitizeText(params.department, VALIDATION_CONSTRAINTS.DEPARTMENT_MAX_LENGTH) ||
     'Računarstvo i informatika';
@@ -5338,21 +5762,21 @@ export async function adminCreateUserAccount(params: {
   const cleanAcadYear =
     sanitizeText(params.academicYear, VALIDATION_CONSTRAINTS.ACADEMIC_YEAR_MAX_LENGTH) ||
     '2026/2027';
-  const cleanTitle =
-    params.role === 'professor'
-      ? sanitizeText(params.academicTitle || 'doc. dr.', VALIDATION_CONSTRAINTS.ACADEMIC_TITLE_MAX_LENGTH)
-      : '';
-  const cleanOffice =
-    params.role === 'professor'
-      ? sanitizeText(params.officeLocation || '', VALIDATION_CONSTRAINTS.OFFICE_LOCATION_MAX_LENGTH)
-      : '';
-  const cleanConsult =
-    params.role === 'professor'
-      ? sanitizeText(
-          params.consultationHours || '',
-          VALIDATION_CONSTRAINTS.CONSULTATION_HOURS_MAX_LENGTH
-        )
-      : '';
+  const cleanTitle = isStaffRole
+    ? sanitizeText(
+        params.academicTitle || 'doc. dr.',
+        VALIDATION_CONSTRAINTS.ACADEMIC_TITLE_MAX_LENGTH
+      )
+    : '';
+  const cleanOffice = isStaffRole
+    ? sanitizeText(params.officeLocation || '', VALIDATION_CONSTRAINTS.OFFICE_LOCATION_MAX_LENGTH)
+    : '';
+  const cleanConsult = isStaffRole
+    ? sanitizeText(
+        params.consultationHours || '',
+        VALIDATION_CONSTRAINTS.CONSULTATION_HOURS_MAX_LENGTH
+      )
+    : '';
   const cleanPhone = sanitizeText(params.phone || '', VALIDATION_CONSTRAINTS.PHONE_MAX_LENGTH);
 
   let createdAuthUid = '';
@@ -5403,8 +5827,15 @@ export async function adminCreateUserAccount(params: {
     handleFirestoreError(error, OperationType.CREATE, `provisionedAccounts/${provId}`);
   }
 
+  const createdEnrollmentIds: string[] = [];
+
   if (createdAuthUid) {
-    const roleEnum = params.role === 'professor' ? UserRole.PROFESSOR : UserRole.STUDENT;
+    const roleEnum =
+      params.role === 'admin'
+        ? UserRole.ADMIN
+        : params.role === 'professor'
+          ? UserRole.PROFESSOR
+          : UserRole.STUDENT;
     try {
       await setDoc(doc(db, 'userProfiles', createdAuthUid), {
         uid: createdAuthUid,
@@ -5434,6 +5865,15 @@ export async function adminCreateUserAccount(params: {
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       });
+
+      if (params.role === 'admin') {
+        await setDoc(doc(db, 'admins', createdAuthUid), {
+          uid: createdAuthUid,
+          grantedBy: params.adminUid,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      }
     } catch (error) {
       handleFirestoreError(error, OperationType.CREATE, `userProfiles/${createdAuthUid}`);
     }
@@ -5462,6 +5902,7 @@ export async function adminCreateUserAccount(params: {
       if (params.coursesToEnroll && params.coursesToEnroll.length > 0) {
         await runParallelChunks(params.coursesToEnroll, 10, async (crs) => {
           const enrId = `${crs.id}_${createdAuthUid}`;
+          createdEnrollmentIds.push(enrId);
           await setDoc(doc(db, 'enrollments', enrId), {
             courseId: crs.id,
             courseCode: crs.code,
@@ -5483,6 +5924,12 @@ export async function adminCreateUserAccount(params: {
       }
     }
   }
+
+  void mutateAdminIndex({
+    addUserIds: createdAuthUid ? [createdAuthUid] : [],
+    addProvisionedIds: [provId],
+    addEnrollmentIds: createdEnrollmentIds,
+  });
 
   return {
     uid: createdAuthUid,
@@ -5648,6 +6095,24 @@ export async function adminUpdateUserAccount(params: {
       }
     });
   }
+
+  if (params.role === UserRole.ADMIN) {
+    try {
+      const admRef = doc(db, 'admins', uid);
+      if (!(await getDoc(admRef)).exists()) {
+        await setDoc(admRef, {
+          uid,
+          grantedBy: auth.currentUser?.uid || uid,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      }
+    } catch {
+      // Non-blocking admin grant sync
+    }
+  }
+
+  void mutateAdminIndex({ addUserIds: [uid] });
 }
 
 export async function adminEnrollStudentInCourse(params: {
@@ -5681,9 +6146,768 @@ export async function adminEnrollStudentInCourse(params: {
       createdAt: serverTimestamp(),
       updatedAt: serverTimestamp(),
     });
+    void mutateAdminIndex({ addEnrollmentIds: [enrId] });
   } catch (error) {
     handleFirestoreError(error, OperationType.CREATE, `enrollments/${enrId}`);
   }
+}
+
+export interface PresentationAccountSpec {
+  key: 'samir_admin' | 'samir_prof' | 'student_demo';
+  label: string;
+  email: string;
+  password: string;
+  fullName: string;
+  role: 'admin' | 'professor' | 'student';
+  academicTitle: string;
+  department: string;
+  officeLocation: string;
+  consultationHours: string;
+  studentIndex: string;
+  studyTrack: string;
+  studyYear: string;
+  summary: string;
+}
+
+export const PRESENTATION_ACCOUNTS: readonly PresentationAccountSpec[] = [
+  {
+    key: 'samir_admin',
+    label: 'Administrator (prof. Samir Ribić)',
+    email: 'samir.admin@etf.unsa.ba',
+    password: 'RibicAdmin2026!',
+    fullName: 'Samir Ribić',
+    role: 'admin',
+    academicTitle: 'doc. dr.',
+    department: 'Računarstvo i informatika',
+    officeLocation: 'Kabinet 3-11, Kampus UNSA',
+    consultationHours: 'Utorak i četvrtak 11:00–13:00',
+    studentIndex: '',
+    studyTrack: '',
+    studyYear: '',
+    summary: 'Puni pristup Administratorskoj konzoli (korisnici, predmeti, raspored, semestri, obavještenja)',
+  },
+  {
+    key: 'samir_prof',
+    label: 'Profesor (doc. dr. Samir Ribić)',
+    email: 'sribic@etf.unsa.ba',
+    password: 'RibicProf2026!',
+    fullName: 'Samir Ribić',
+    role: 'professor',
+    academicTitle: 'doc. dr.',
+    department: 'Računarstvo i informatika',
+    officeLocation: 'Kabinet 3-11, Kampus UNSA',
+    consultationHours: 'Utorak i četvrtak 11:00–13:00',
+    studentIndex: '',
+    studyTrack: '',
+    studyYear: '',
+    summary: 'Poseban profesorski nalog povezan sa predmetima Operativni sistemi (+ tačke) i Arhitektura računara',
+  },
+  {
+    key: 'student_demo',
+    label: 'Student (Vedad Selimović · 19384)',
+    email: 'vselimovic1@etf.unsa.ba',
+    password: 'Student2026!',
+    fullName: 'Vedad Selimović',
+    role: 'student',
+    academicTitle: '',
+    department: 'Računarstvo i informatika',
+    officeLocation: '',
+    consultationHours: '',
+    studentIndex: '19384',
+    studyTrack: 'Bachelor · Računarstvo i informatika',
+    studyYear: 'II godina · I ciklus (Bachelor)',
+    summary: 'Upisan na Operativne sisteme (2+ tačke), Arhitekturu računara, Tehnike programiranja i stare semestre',
+  },
+] as const;
+
+export async function ensurePresentationLogins(params: {
+  adminUid: string;
+}): Promise<{
+  emailPasswordAuthActive: boolean;
+  resolvedUids: Record<string, string>;
+}> {
+  const { adminUid } = params;
+  if (!adminUid) {
+    return { emailPasswordAuthActive: false, resolvedUids: {} };
+  }
+
+  let emailPasswordAuthActive = true;
+  const resolvedUids: Record<string, string> = {};
+  const addedUserIds: string[] = [];
+  const addedProvisionedIds: string[] = [];
+  const addedEnrollmentIds: string[] = [];
+
+  for (const spec of PRESENTATION_ACCOUNTS) {
+    const provId = emailToProvisionId(spec.email);
+    addedProvisionedIds.push(provId);
+
+    let uid = '';
+    try {
+      const existingProvSnap = await getDoc(doc(db, 'provisionedAccounts', provId));
+      if (existingProvSnap.exists()) {
+        const pData = existingProvSnap.data() as ProvisionedAccount;
+        if (pData.authUid && isValidResourceId(pData.authUid, 128)) {
+          uid = pData.authUid;
+        }
+      }
+    } catch {
+      // Proceed to Auth resolution
+    }
+
+    if (!uid && emailPasswordAuthActive) {
+      try {
+        const cred = await createUserWithEmailAndPassword(
+          secondaryAuth,
+          spec.email,
+          spec.password
+        );
+        uid = cred.user.uid;
+      } catch (err: unknown) {
+        const code = (err as { code?: string })?.code;
+        if (code === 'auth/email-already-in-use') {
+          try {
+            const signInCred = await signInWithEmailAndPassword(
+              secondaryAuth,
+              spec.email,
+              spec.password
+            );
+            uid = signInCred.user.uid;
+          } catch {
+            // Existing account has custom changed password; keep existing profile if any
+          }
+        } else if (code === 'auth/operation-not-allowed') {
+          emailPasswordAuthActive = false;
+        }
+      } finally {
+        try {
+          await firebaseSignOut(secondaryAuth);
+        } catch {
+          // Ignore secondary signout errors
+        }
+      }
+    }
+
+    try {
+      const provRef = doc(db, 'provisionedAccounts', provId);
+      const provSnap = await getDoc(provRef);
+      if (!provSnap.exists()) {
+        await setDoc(provRef, {
+          targetEmail: spec.email,
+          fullName: spec.fullName,
+          role: spec.role,
+          studentIndex: spec.studentIndex,
+          department: spec.department,
+          studyTrack: spec.studyTrack,
+          studyYear: spec.studyYear,
+          academicYear: '2026/2027',
+          academicTitle: spec.academicTitle,
+          officeLocation: spec.officeLocation,
+          consultationHours: spec.consultationHours,
+          authUid: uid,
+          status: uid ? 'active' : 'pending',
+          createdBy: adminUid,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      } else if (uid && (provSnap.data().authUid !== uid || provSnap.data().status !== 'active')) {
+        await updateDoc(provRef, {
+          fullName: spec.fullName,
+          role: spec.role,
+          studentIndex: spec.studentIndex,
+          department: spec.department,
+          studyTrack: spec.studyTrack,
+          studyYear: spec.studyYear,
+          academicYear: '2026/2027',
+          academicTitle: spec.academicTitle,
+          officeLocation: spec.officeLocation,
+          consultationHours: spec.consultationHours,
+          authUid: uid,
+          status: 'active',
+          updatedAt: serverTimestamp(),
+        });
+      }
+    } catch {
+      // Non-blocking provisioned record sync
+    }
+
+    if (!uid) continue;
+
+    resolvedUids[spec.key] = uid;
+    addedUserIds.push(uid);
+
+    const roleEnum =
+      spec.role === 'admin'
+        ? UserRole.ADMIN
+        : spec.role === 'professor'
+          ? UserRole.PROFESSOR
+          : UserRole.STUDENT;
+
+    try {
+      const profRef = doc(db, 'userProfiles', uid);
+      const profSnap = await getDoc(profRef);
+      if (!profSnap.exists()) {
+        await setDoc(profRef, {
+          uid,
+          fullName: spec.fullName,
+          studentIndex: spec.studentIndex,
+          department: spec.department,
+          role: roleEnum,
+          academicYear: '2026/2027',
+          redeemedInviteId: provId,
+          academicTitle: spec.academicTitle,
+          officeLocation: spec.officeLocation,
+          consultationHours: spec.consultationHours,
+          studyYear: spec.studyYear,
+          studyTrack: spec.studyTrack,
+          personalNote: '',
+          provisionedByAdmin: true,
+          notificationPrefs: DEFAULT_NOTIFICATION_PREFS,
+          isSeed: false,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      } else {
+        const curProf = profSnap.data() as UserProfile;
+        if (!curProf.provisionedByAdmin || curProf.role !== roleEnum) {
+          await updateDoc(profRef, {
+            role: roleEnum,
+            provisionedByAdmin: true,
+            updatedAt: serverTimestamp(),
+          });
+        }
+      }
+
+      const privRef = doc(db, 'userPrivate', uid);
+      const privSnap = await getDoc(privRef);
+      if (!privSnap.exists()) {
+        await setDoc(privRef, {
+          uid,
+          email: spec.email,
+          phone: spec.role === 'student' ? '+387 61 482 910' : '+387 33 250 700',
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      }
+
+      if (spec.role === 'admin') {
+        const admRef = doc(db, 'admins', uid);
+        if (!(await getDoc(admRef)).exists()) {
+          await setDoc(admRef, {
+            uid,
+            grantedBy: adminUid,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+        }
+      }
+
+      if (spec.role === 'student' && spec.studentIndex) {
+        const dirRef = doc(db, 'studentDirectory', spec.studentIndex);
+        const dirSnap = await getDoc(dirRef);
+        const rosterDept =
+          sanitizeText(
+            formatStudentRosterProgramLabel(spec.department, spec.studyTrack),
+            VALIDATION_CONSTRAINTS.DEPARTMENT_MAX_LENGTH
+          ) || spec.department;
+        if (!dirSnap.exists()) {
+          await setDoc(dirRef, {
+            studentIndex: spec.studentIndex,
+            uid,
+            fullName: spec.fullName,
+            department: rosterDept,
+            isSeed: false,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+        }
+      }
+    } catch {
+      // Non-blocking profile/admin/directory creation
+    }
+  }
+
+  // Link Samir Ribić's Professor UID (and Admin UID on RI-OS) to ETF courses & child docs
+  const samirProfUid = resolvedUids.samir_prof;
+  const samirAdminUid = resolvedUids.samir_admin;
+  if (samirProfUid || samirAdminUid) {
+    const courseLinks: Array<{
+      courseId: string;
+      addProfUids: string[];
+      makeSamirLeadDisplay: boolean;
+      forceActivityMarks?: boolean;
+    }> = [
+      {
+        courseId: 'seed_crs_os',
+        addProfUids: [samirProfUid, samirAdminUid].filter(Boolean),
+        makeSamirLeadDisplay: true,
+        forceActivityMarks: true,
+      },
+      {
+        courseId: 'seed_crs_ar',
+        addProfUids: [samirProfUid].filter(Boolean),
+        makeSamirLeadDisplay: false,
+      },
+    ];
+
+    for (const link of courseLinks) {
+      if (link.addProfUids.length === 0) continue;
+      try {
+        const cRef = doc(db, 'courses', link.courseId);
+        const cSnap = await getDoc(cRef);
+        if (!cSnap.exists()) continue;
+        const cData = cSnap.data() as Course;
+        const nextProfIds = Array.from(
+          new Set([...(cData.professorIds ?? []), ...link.addProfUids])
+        ).slice(0, VALIDATION_CONSTRAINTS.MAX_PROFESSORS_PER_COURSE);
+
+        const baseProfNames =
+          cData.professorNames && cData.professorNames.length > 0
+            ? cData.professorNames
+            : [cData.leadProfessorName];
+        const nextProfNames = sanitizeStaffList(
+          link.makeSamirLeadDisplay
+            ? ['doc. dr. Samir Ribić', ...baseProfNames]
+            : [...baseProfNames, 'doc. dr. Samir Ribić'],
+          VALIDATION_CONSTRAINTS.MAX_PROFESSORS_PER_COURSE
+        );
+        const nextLeadName = link.makeSamirLeadDisplay
+          ? 'doc. dr. Samir Ribić'
+          : cData.leadProfessorName;
+
+        const idsChanged =
+          nextProfIds.length !== cData.professorIds.length ||
+          nextProfIds.some((id, idx) => cData.professorIds[idx] !== id);
+
+        if (
+          idsChanged ||
+          cData.leadProfessorName !== nextLeadName ||
+          (link.forceActivityMarks && !cData.activityMarksEnabled)
+        ) {
+          const patch: Record<string, unknown> = {
+            leadProfessorName: nextLeadName,
+            professorIds: nextProfIds,
+            professorNames: nextProfNames,
+            updatedAt: serverTimestamp(),
+          };
+          if (link.forceActivityMarks) {
+            patch.activityMarksEnabled = true;
+          }
+          await updateDoc(cRef, patch);
+        }
+
+        const queryProfUid = cData.professorIds.includes(adminUid)
+          ? adminUid
+          : cData.leadProfessorId;
+        if (queryProfUid) {
+          await syncCourseProfessorIdsAcrossChildren({
+            courseId: link.courseId,
+            actorUid: queryProfUid,
+            nextProfessorIds: nextProfIds,
+            isAdminUser: true,
+          });
+        }
+      } catch {
+        // Non-blocking course linkage
+      }
+    }
+  }
+
+  // Enroll student Vedad Selimović (19384) and seed realistic scores, attendance & (+) marks
+  const studentUid = resolvedUids.student_demo;
+  if (studentUid) {
+    const today = getTodayIsoLocal();
+    const rosterDept = 'Bachelor · Računarstvo i informatika';
+    const targetCourseIds = [
+      'seed_crs_os',
+      'seed_crs_ar',
+      'seed_crs_tp',
+      'seed_crs_im1',
+      'seed_crs_uup',
+    ];
+
+    const loadedCourses: Record<string, Course> = {};
+    await Promise.all(
+      targetCourseIds.map(async (cid) => {
+        try {
+          const s = await getDoc(doc(db, 'courses', cid));
+          if (s.exists()) {
+            loadedCourses[cid] = { ...(s.data() as Omit<Course, 'id'>), id: s.id };
+          }
+        } catch {
+          // Ignore missing seed course
+        }
+      })
+    );
+
+    // 1. Enrollments first (required by attendanceRecords, activityAwards, examRegistrations, finalGrades)
+    for (const cid of targetCourseIds) {
+      const crs = loadedCourses[cid];
+      if (!crs) continue;
+      const enrId = `${cid}_${studentUid}`;
+      addedEnrollmentIds.push(enrId);
+      try {
+        const enrRef = doc(db, 'enrollments', enrId);
+        if (!(await getDoc(enrRef)).exists()) {
+          await setDoc(enrRef, {
+            courseId: cid,
+            courseCode: crs.code,
+            courseName: crs.name,
+            leadProfessorName: crs.leadProfessorName,
+            academicYear: crs.academicYear,
+            semester: crs.semester,
+            isArchived: Boolean(crs.isArchived),
+            studentId: studentUid,
+            studentName: 'Vedad Selimović',
+            studentIndex: '19384',
+            studentDepartment: rosterDept,
+            professorIds: crs.professorIds,
+            isSeed: false,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+        }
+      } catch {
+        // Non-blocking enrollment seed
+      }
+    }
+
+    // 2. Scores, (+) Activity Marks on Operativni sistemi, Attendance & Final Grades
+    try {
+      const osCrs = loadedCourses.seed_crs_os;
+      if (osCrs) {
+        const osScores = [
+          {
+            itemId: 'seed_itm_os_1',
+            catId: 'seed_cat_os_lab',
+            pts: 22,
+            fb: 'Odlična sinhronizacija POSIX niti i rad sa semaforima.',
+          },
+          {
+            itemId: 'seed_itm_os_2',
+            catId: 'seed_cat_os_proj',
+            pts: 21,
+            fb: 'Uredan Linux kernel modul za znakovni uređaj.',
+          },
+        ];
+        for (const sc of osScores) {
+          const sRef = doc(db, 'scores', `${sc.itemId}_${studentUid}`);
+          if (
+            !(await getDoc(sRef)).exists() &&
+            (await getDoc(doc(db, 'gradingItems', sc.itemId))).exists()
+          ) {
+            await setDoc(sRef, {
+              courseId: 'seed_crs_os',
+              categoryId: sc.catId,
+              itemId: sc.itemId,
+              studentId: studentUid,
+              points: sc.pts,
+              feedback: sc.fb,
+              gradedBy: adminUid,
+              professorIds: osCrs.professorIds,
+              isSeed: false,
+              createdAt: serverTimestamp(),
+              updatedAt: serverTimestamp(),
+            });
+          }
+        }
+
+        const osPlusMarks = [
+          {
+            id: `pres_act_os_1_${studentUid}`,
+            date: addDaysIso(today, -8),
+            desc: 'Urađena vježba 1 — Sistemski pozivi i procesi (+)',
+          },
+          {
+            id: `pres_act_os_2_${studentUid}`,
+            date: addDaysIso(today, -2),
+            desc: 'Urađena vježba 2 — POSIX niti i semafori (+)',
+          },
+        ];
+        for (const pm of osPlusMarks) {
+          const aRef = doc(db, 'activityAwards', pm.id);
+          if (!(await getDoc(aRef)).exists()) {
+            await setDoc(aRef, {
+              courseId: 'seed_crs_os',
+              studentId: studentUid,
+              points: 0,
+              maxPoints: 0,
+              date: pm.date,
+              description: pm.desc,
+              awardedBy: adminUid,
+              professorIds: osCrs.professorIds,
+              isSeed: false,
+              createdAt: serverTimestamp(),
+              updatedAt: serverTimestamp(),
+            });
+          }
+        }
+      }
+
+      const arCrs = loadedCourses.seed_crs_ar;
+      if (arCrs) {
+        const arScores = [
+          { itemId: 'seed_itm_ar_1', catId: 'seed_cat_ar_zad', pts: 2 },
+          { itemId: 'seed_itm_ar_2', catId: 'seed_cat_ar_zad', pts: 2 },
+          { itemId: 'seed_itm_ar_3', catId: 'seed_cat_ar_zad', pts: 1.5 },
+          { itemId: 'seed_itm_ar_6', catId: 'seed_cat_ar_vje', pts: 4.5 },
+          { itemId: 'seed_itm_ar_7', catId: 'seed_cat_ar_vje', pts: 5 },
+          { itemId: 'seed_itm_ar_8', catId: 'seed_cat_ar_p1', pts: 17.5 },
+        ];
+        for (const sc of arScores) {
+          const sRef = doc(db, 'scores', `${sc.itemId}_${studentUid}`);
+          if (
+            !(await getDoc(sRef)).exists() &&
+            (await getDoc(doc(db, 'gradingItems', sc.itemId))).exists()
+          ) {
+            await setDoc(sRef, {
+              courseId: 'seed_crs_ar',
+              categoryId: sc.catId,
+              itemId: sc.itemId,
+              studentId: studentUid,
+              points: sc.pts,
+              feedback: '',
+              gradedBy: adminUid,
+              professorIds: arCrs.professorIds,
+              isSeed: false,
+              createdAt: serverTimestamp(),
+              updatedAt: serverTimestamp(),
+            });
+          }
+        }
+
+        const arSessionIds = [
+          'seed_ses_ar_1',
+          'seed_ses_ar_2',
+          'seed_ses_ar_3',
+          'seed_ses_ar_4',
+          'seed_ses_ar_6',
+          'seed_ses_ar_7',
+        ];
+        for (let i = 0; i < arSessionIds.length; i++) {
+          const sesId = arSessionIds[i];
+          const rRef = doc(db, 'attendanceRecords', `${sesId}_${studentUid}`);
+          if (
+            !(await getDoc(rRef)).exists() &&
+            (await getDoc(doc(db, 'attendanceSessions', sesId))).exists()
+          ) {
+            await setDoc(rRef, {
+              courseId: 'seed_crs_ar',
+              sessionId: sesId,
+              studentId: studentUid,
+              present: i !== 3,
+              note: '',
+              markedBy: adminUid,
+              professorIds: arCrs.professorIds,
+              isSeed: false,
+              createdAt: serverTimestamp(),
+              updatedAt: serverTimestamp(),
+            });
+          }
+        }
+
+        const arTermSnap = await getDoc(doc(db, 'examTerms', 'seed_ext_ar_p2'));
+        const arRegRef = doc(db, 'examRegistrations', `seed_ext_ar_p2_${studentUid}`);
+        if (arTermSnap.exists() && !(await getDoc(arRegRef)).exists()) {
+          const tData = arTermSnap.data() as ExamTerm;
+          await setDoc(arRegRef, {
+            termId: 'seed_ext_ar_p2',
+            courseId: 'seed_crs_ar',
+            courseCode: arCrs.code,
+            courseName: arCrs.name,
+            termTitle: tData.title,
+            examDate: tData.examDate,
+            studentId: studentUid,
+            studentName: 'Vedad Selimović',
+            studentIndex: '19384',
+            studentDepartment: rosterDept,
+            status: ExamRegistrationStatus.REGISTERED,
+            professorIds: arCrs.professorIds,
+            isSeed: false,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+        }
+      }
+
+      const tpCrs = loadedCourses.seed_crs_tp;
+      if (tpCrs) {
+        const tpScores = [
+          { itemId: 'seed_itm_tp_1', catId: 'seed_cat_tp_zad', pts: 9.5 },
+          { itemId: 'seed_itm_tp_2', catId: 'seed_cat_tp_zad', pts: 9 },
+          { itemId: 'seed_itm_tp_3', catId: 'seed_cat_tp_vje', pts: 9.5 },
+          { itemId: 'seed_itm_tp_4', catId: 'seed_cat_tp_p1', pts: 18 },
+          { itemId: 'seed_itm_tp_5', catId: 'seed_cat_tp_p2', pts: 16 },
+          { itemId: 'seed_itm_tp_6', catId: 'seed_cat_tp_zav', pts: 16 },
+        ];
+        for (const sc of tpScores) {
+          const sRef = doc(db, 'scores', `${sc.itemId}_${studentUid}`);
+          if (
+            !(await getDoc(sRef)).exists() &&
+            (await getDoc(doc(db, 'gradingItems', sc.itemId))).exists()
+          ) {
+            await setDoc(sRef, {
+              courseId: 'seed_crs_tp',
+              categoryId: sc.catId,
+              itemId: sc.itemId,
+              studentId: studentUid,
+              points: sc.pts,
+              feedback: '',
+              gradedBy: adminUid,
+              professorIds: tpCrs.professorIds,
+              isSeed: false,
+              createdAt: serverTimestamp(),
+              updatedAt: serverTimestamp(),
+            });
+          }
+        }
+
+        for (const sesId of [
+          'seed_ses_tp_1',
+          'seed_ses_tp_2',
+          'seed_ses_tp_3',
+          'seed_ses_tp_4',
+          'seed_ses_tp_5',
+        ]) {
+          const rRef = doc(db, 'attendanceRecords', `${sesId}_${studentUid}`);
+          if (
+            !(await getDoc(rRef)).exists() &&
+            (await getDoc(doc(db, 'attendanceSessions', sesId))).exists()
+          ) {
+            await setDoc(rRef, {
+              courseId: 'seed_crs_tp',
+              sessionId: sesId,
+              studentId: studentUid,
+              present: true,
+              note: '',
+              markedBy: adminUid,
+              professorIds: tpCrs.professorIds,
+              isSeed: false,
+              createdAt: serverTimestamp(),
+              updatedAt: serverTimestamp(),
+            });
+          }
+        }
+
+        const tpFgRef = doc(db, 'finalGrades', `seed_crs_tp_${studentUid}`);
+        if (!(await getDoc(tpFgRef)).exists()) {
+          await setDoc(tpFgRef, {
+            courseId: 'seed_crs_tp',
+            studentId: studentUid,
+            totalPoints: 88,
+            finalGrade: 9,
+            status: FinalGradeStatus.FINALIZED,
+            finalizedBy: adminUid,
+            comment: 'Uspješno položene sve predispitne obaveze i završni ispit.',
+            professorIds: tpCrs.professorIds,
+            isSeed: false,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+        }
+      }
+
+      // Archived 2025/2026 courses
+      const archSpecs = [
+        {
+          cid: 'seed_crs_im1',
+          catId: 'seed_cat_im1_isp',
+          itemId: 'seed_itm_im1_zav',
+          pts: 88,
+          grade: 9,
+        },
+        {
+          cid: 'seed_crs_uup',
+          catId: 'seed_cat_uup_isp',
+          itemId: 'seed_itm_uup_zav',
+          pts: 96,
+          grade: 10,
+        },
+      ];
+      for (const ac of archSpecs) {
+        const crs = loadedCourses[ac.cid];
+        if (!crs) continue;
+        const sRef = doc(db, 'scores', `${ac.itemId}_${studentUid}`);
+        if (
+          !(await getDoc(sRef)).exists() &&
+          (await getDoc(doc(db, 'gradingItems', ac.itemId))).exists()
+        ) {
+          await setDoc(sRef, {
+            courseId: ac.cid,
+            categoryId: ac.catId,
+            itemId: ac.itemId,
+            studentId: studentUid,
+            points: ac.pts,
+            feedback: 'Položeno u akademskoj 2025/2026. godini.',
+            gradedBy: adminUid,
+            professorIds: crs.professorIds,
+            isSeed: false,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+        }
+        const fgRef = doc(db, 'finalGrades', `${ac.cid}_${studentUid}`);
+        if (!(await getDoc(fgRef)).exists()) {
+          await setDoc(fgRef, {
+            courseId: ac.cid,
+            studentId: studentUid,
+            totalPoints: ac.pts,
+            finalGrade: ac.grade,
+            status: FinalGradeStatus.FINALIZED,
+            finalizedBy: adminUid,
+            comment: 'Zaključena ocjena iz akademske 2025/2026. godine.',
+            professorIds: crs.professorIds,
+            isSeed: false,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+        }
+      }
+    } catch {
+      // Non-blocking student seed data
+    }
+  }
+
+  // Ensure adminIndex/global includes all known IDs (and full collection IDs if Bootstrap Admin)
+  if (isCurrentSessionBootstrapAdmin()) {
+    try {
+      const [uSnap, pSnap, cSnap, eSnap, sSnap, aSnap] = await Promise.all([
+        getDocs(collection(db, 'userProfiles')),
+        getDocs(collection(db, 'provisionedAccounts')),
+        getDocs(collection(db, 'courses')),
+        getDocs(collection(db, 'enrollments')),
+        getDocs(collection(db, 'scheduleEvents')),
+        getDocs(collection(db, 'announcements')),
+      ]);
+      adminIndexDraft.userIds = uSnap.docs.map((d) => d.id);
+      adminIndexDraft.provisionedIds = pSnap.docs.map((d) => d.id);
+      adminIndexDraft.courseIds = cSnap.docs.map((d) => d.id);
+      adminIndexDraft.enrollmentIds = eSnap.docs.map((d) => d.id);
+      adminIndexDraft.scheduleEventIds = sSnap.docs.map((d) => d.id);
+      adminIndexDraft.announcementIds = aSnap.docs.map((d) => d.id);
+      adminIndexLoadedSections.add('userIds');
+      adminIndexLoadedSections.add('provisionedIds');
+      adminIndexLoadedSections.add('courseIds');
+      adminIndexLoadedSections.add('enrollmentIds');
+      adminIndexLoadedSections.add('scheduleEventIds');
+      adminIndexLoadedSections.add('announcementIds');
+      scheduleBootstrapAdminIndexFlush();
+    } catch {
+      // Fallback to delta mutation
+      await mutateAdminIndex({
+        addUserIds: addedUserIds,
+        addProvisionedIds: addedProvisionedIds,
+        addEnrollmentIds: addedEnrollmentIds,
+      });
+    }
+  } else {
+    await mutateAdminIndex({
+      addUserIds: addedUserIds,
+      addProvisionedIds: addedProvisionedIds,
+      addEnrollmentIds: addedEnrollmentIds,
+    });
+  }
+
+  return { emailPasswordAuthActive, resolvedUids };
 }
 
 // ============================================================================

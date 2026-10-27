@@ -98,7 +98,7 @@ export interface ProvisionedAccount {
   id: string;
   targetEmail: string;
   fullName: string;
-  role: 'student' | 'professor';
+  role: 'student' | 'professor' | 'admin';
   studentIndex: string;
   department: string;
   studyTrack: string;
@@ -389,4 +389,18 @@ export interface SmartNotificationItem {
   targetCourseId?: string;
   targetSubTab?: 'courses' | 'exams' | 'history';
 }
+
+export interface AdminIndex {
+  id: string;
+  userIds: string[];
+  provisionedIds: string[];
+  courseIds: string[];
+  enrollmentIds: string[];
+  scheduleEventIds: string[];
+  announcementIds: string[];
+  updatedBy: string;
+  createdAt?: unknown;
+  updatedAt?: unknown;
+}
+
 

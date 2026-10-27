@@ -181,7 +181,7 @@ service cloud.firestore {
         ]) &&
         data.targetEmail is string && data.targetEmail.size() >= 3 && data.targetEmail.size() <= 254 &&
         data.fullName is string && data.fullName.size() >= 1 && data.fullName.size() <= 100 &&
-        data.role is string && data.role in ['student', 'professor'] &&
+        data.role is string && data.role in ['student', 'professor', 'admin'] &&
         data.studentIndex is string && data.studentIndex.size() <= 20 && data.studentIndex.matches('^[a-zA-Z0-9_\\-]*$') &&
         data.department is string && data.department.size() >= 1 && data.department.size() <= 80 &&
         data.studyTrack is string && data.studyTrack.size() <= 100 &&
@@ -600,6 +600,26 @@ service cloud.firestore {
         data.updatedAt is timestamp;
     }
 
+    function isValidAdminIndex(data) {
+      return data.keys().hasAll([
+          'userIds', 'provisionedIds', 'courseIds', 'enrollmentIds',
+          'scheduleEventIds', 'announcementIds', 'updatedBy', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'userIds', 'provisionedIds', 'courseIds', 'enrollmentIds',
+          'scheduleEventIds', 'announcementIds', 'updatedBy', 'createdAt', 'updatedAt'
+        ]) &&
+        isValidBoundedIdList(data.userIds, 0, 500) &&
+        isValidBoundedIdList(data.provisionedIds, 0, 500) &&
+        isValidBoundedIdList(data.courseIds, 0, 200) &&
+        isValidBoundedIdList(data.enrollmentIds, 0, 1000) &&
+        isValidBoundedIdList(data.scheduleEventIds, 0, 500) &&
+        isValidBoundedIdList(data.announcementIds, 0, 200) &&
+        isValidId(data.updatedBy) &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
     // =========================================================================
     // Collection Match Blocks
     // =========================================================================
@@ -607,17 +627,17 @@ service cloud.firestore {
     match /admins/{adminId} {
       allow get: if isSignedIn() && isValidId(adminId) && (request.auth.uid == adminId || isAdmin());
       allow list: if isBootstrapAdmin();
-      allow create: if isBootstrapAdmin() && isValidId(adminId) && isValidAdmin(incoming()) &&
+      allow create: if isAdmin() && isValidId(adminId) && isValidAdmin(incoming()) &&
         incoming().uid == adminId &&
         incoming().grantedBy == request.auth.uid &&
         incoming().createdAt == request.time &&
         incoming().updatedAt == request.time;
-      allow update: if isValidAdmin(incoming()) && isBootstrapAdmin() && isValidId(adminId) &&
+      allow update: if isValidAdmin(incoming()) && isAdmin() && isValidId(adminId) &&
         incoming().uid == existing().uid &&
         incoming().createdAt == existing().createdAt &&
         incoming().updatedAt == request.time &&
         incoming().diff(existing()).affectedKeys().hasOnly(['grantedBy', 'updatedAt']);
-      allow delete: if isBootstrapAdmin() && isValidId(adminId);
+      allow delete: if isAdmin() && isValidId(adminId);
     }
 
     match /userProfiles/{userId} {
@@ -1176,13 +1196,24 @@ service cloud.firestore {
         incoming().studentId == existing().studentId &&
         incoming().createdAt == existing().createdAt &&
         incoming().isSeed == existing().isSeed &&
-        incoming().finalizedBy == request.auth.uid &&
         incoming().updatedAt == request.time &&
-        (existing().status != 'finalized' || isAdmin()) &&
-        (isAdmin() || isCourseProfessor(existing().courseId)) &&
-        incoming().diff(existing()).affectedKeys().hasOnly([
-          'totalPoints', 'finalGrade', 'status', 'finalizedBy', 'comment', 'professorIds', 'updatedAt'
-        ]);
+        (isAdmin() || isCourseProfessor(existing().courseId)) && (
+          (
+            incoming().finalizedBy == request.auth.uid &&
+            (existing().status != 'finalized' || isAdmin()) &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'totalPoints', 'finalGrade', 'status', 'finalizedBy', 'comment', 'professorIds', 'updatedAt'
+            ])
+          ) ||
+          (
+            incoming().totalPoints == existing().totalPoints &&
+            incoming().finalGrade == existing().finalGrade &&
+            incoming().status == existing().status &&
+            incoming().finalizedBy == existing().finalizedBy &&
+            incoming().comment == existing().comment &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['professorIds', 'updatedAt'])
+          )
+        );
       allow delete: if isAuthorizedUser() && isValidId(gradeId) && (
         (resource != null && request.auth.uid in resource.data.professorIds) || isAdmin()
       );
@@ -1391,18 +1422,48 @@ service cloud.firestore {
         incoming().createdAt == existing().createdAt &&
         incoming().isSeed == existing().isSeed &&
         incoming().updatedAt == request.time &&
-        (isAdmin() || (isCourseProfessor(existing().courseId) && incoming().awardedBy == request.auth.uid)) &&
-        (
-          incoming().maxPoints == 0 ||
-          get(/databases/$(database)/documents/courses/$(existing().courseId)).data.allowBonusPoints == true ||
-          incoming().points <= incoming().maxPoints
-        ) &&
-        incoming().diff(existing()).affectedKeys().hasOnly([
-          'points', 'maxPoints', 'date', 'description', 'awardedBy', 'professorIds', 'updatedAt'
-        ]);
+        (isAdmin() || isCourseProfessor(existing().courseId)) && (
+          (
+            (isAdmin() || incoming().awardedBy == request.auth.uid) &&
+            (
+              incoming().maxPoints == 0 ||
+              get(/databases/$(database)/documents/courses/$(existing().courseId)).data.allowBonusPoints == true ||
+              incoming().points <= incoming().maxPoints
+            ) &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'points', 'maxPoints', 'date', 'description', 'awardedBy', 'professorIds', 'updatedAt'
+            ])
+          ) ||
+          (
+            incoming().awardedBy == existing().awardedBy &&
+            incoming().points == existing().points &&
+            incoming().maxPoints == existing().maxPoints &&
+            incoming().date == existing().date &&
+            incoming().description == existing().description &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['professorIds', 'updatedAt'])
+          )
+        );
       allow delete: if isAuthorizedUser() && isValidId(awardId) && (
         (resource != null && request.auth.uid in resource.data.professorIds) || isAdmin()
       );
+    }
+
+    match /adminIndex/{indexId} {
+      allow get: if isSignedIn() && isValidId(indexId) && isAdmin();
+      allow list: if isBootstrapAdmin();
+      allow create: if isAdmin() && isValidId(indexId) && isValidAdminIndex(incoming()) &&
+        incoming().updatedBy == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+      allow update: if isValidAdminIndex(incoming()) && isAdmin() && isValidId(indexId) &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedBy == request.auth.uid &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'userIds', 'provisionedIds', 'courseIds', 'enrollmentIds',
+          'scheduleEventIds', 'announcementIds', 'updatedBy', 'updatedAt'
+        ]);
+      allow delete: if isAdmin() && isValidId(indexId);
     }
   }
 }

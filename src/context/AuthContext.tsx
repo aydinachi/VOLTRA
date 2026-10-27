@@ -10,8 +10,12 @@ import {
   updatePassword,
   User,
 } from 'firebase/auth';
-import { auth, googleProvider } from '../lib/firebase';
-import { ensureUserAccount, seedEtfDemoData } from '../services/zamioService';
+import { auth, BOOTSTRAP_ADMIN_EMAIL, googleProvider } from '../lib/firebase';
+import {
+  ensureUserAccount,
+  PRESENTATION_ACCOUNTS,
+  seedEtfDemoData,
+} from '../services/zamioService';
 import { UserPrivate, UserProfile, UserRole } from '../types/zamio';
 
 export type ActivePortalMode = 'student' | 'professor' | 'admin';
@@ -39,7 +43,8 @@ const AuthContext = createContext<AuthContextValue | undefined>(undefined);
 
 function translateFirebaseAuthError(
   err: unknown,
-  context: 'login' | 'reauth' = 'login'
+  context: 'login' | 'reauth' = 'login',
+  attemptedEmail = ''
 ): string {
   const code = (err as { code?: string })?.code || '';
   if (
@@ -50,6 +55,13 @@ function translateFirebaseAuthError(
   ) {
     if (context === 'reauth') {
       return 'Trenutna šifra nije tačna. Provjerite unos i pokušajte ponovo.';
+    }
+    const cleanAttempt = attemptedEmail.trim().toLowerCase();
+    const isPresentationAccount = PRESENTATION_ACCOUNTS.some(
+      (acc) => acc.email.toLowerCase() === cleanAttempt
+    );
+    if (isPresentationAccount) {
+      return 'Prezentacijski nalog još nije upisan u Firebase Auth. Prijavite se jednom putem Google računa (glavni administrator) kako bi se sva 3 prezentacijska naloga automatski upisala u bazu, te provjerite da je u Firebase konzoli uključen Email/Password način prijave.';
     }
     return 'Pogrešna e-mail adresa ili lozinka. Provjerite pristupne podatke koje vam je dodijelio administrator.';
   }
@@ -122,7 +134,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       return 'student';
     });
 
-    if (isFirstBootSeed && res.isAdminUser) {
+    const isBootstrapSession =
+      user.emailVerified &&
+      user.email?.toLowerCase() === BOOTSTRAP_ADMIN_EMAIL.toLowerCase();
+
+    if (isFirstBootSeed && res.isAdminUser && isBootstrapSession) {
       try {
         await seedEtfDemoData({
           adminUid: user.uid,
@@ -191,7 +207,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     try {
       await signInWithEmailAndPassword(auth, cleanEmail, password);
     } catch (err: unknown) {
-      setAuthError(translateFirebaseAuthError(err));
+      setAuthError(translateFirebaseAuthError(err, 'login', cleanEmail));
       throw err;
     } finally {
       setSigningIn(false);

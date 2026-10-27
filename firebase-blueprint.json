@@ -208,7 +208,7 @@
         },
         "role": {
           "type": "string",
-          "enum": ["student", "professor"]
+          "enum": ["student", "professor", "admin"]
         },
         "studentIndex": {
           "type": "string",
@@ -1517,6 +1517,62 @@
         "createdAt",
         "updatedAt"
       ]
+    },
+    "AdminIndex": {
+      "title": "AdminIndex",
+      "description": "Bounded directory index of entity IDs allowing delegated Administrators to resolve system records via getDoc without unbounded collection list reads.",
+      "type": "object",
+      "properties": {
+        "userIds": {
+          "type": "array",
+          "description": "Bounded list (max 500) of user UIDs."
+        },
+        "provisionedIds": {
+          "type": "array",
+          "description": "Bounded list (max 500) of provisioned account IDs."
+        },
+        "courseIds": {
+          "type": "array",
+          "description": "Bounded list (max 200) of course IDs."
+        },
+        "enrollmentIds": {
+          "type": "array",
+          "description": "Bounded list (max 1000) of enrollment IDs."
+        },
+        "scheduleEventIds": {
+          "type": "array",
+          "description": "Bounded list (max 500) of schedule event IDs."
+        },
+        "announcementIds": {
+          "type": "array",
+          "description": "Bounded list (max 200) of announcement IDs."
+        },
+        "updatedBy": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "userIds",
+        "provisionedIds",
+        "courseIds",
+        "enrollmentIds",
+        "scheduleEventIds",
+        "announcementIds",
+        "updatedBy",
+        "createdAt",
+        "updatedAt"
+      ]
     }
   },
   "firestore": {
@@ -1599,6 +1655,10 @@
     "/activityAwards/{awardId}": {
       "schema": "ActivityAward",
       "description": "Individual student activity point awards on courses."
+    },
+    "/adminIndex/{indexId}": {
+      "schema": "AdminIndex",
+      "description": "Bounded directory index of entity IDs for delegated Administrators."
     }
   }
 }
