@@ -1359,21 +1359,111 @@ export function subscribeStudentEnrolledCourseLive(
 // Professor Subscriptions & Mutations
 // ============================================================================
 
+export function buildCourseChildProfessorIds(course: Course, actorUid?: string): string[] {
+  const raw = [
+    course.leadProfessorId,
+    ...(course.professorIds ?? []),
+    ...(actorUid ? [actorUid] : []),
+    ...(auth.currentUser?.uid ? [auth.currentUser.uid] : []),
+  ].filter((id): id is string => Boolean(id && id.trim()));
+  return Array.from(new Set(raw)).slice(0, VALIDATION_CONSTRAINTS.MAX_PROFESSORS_PER_COURSE);
+}
+
+export async function ensureCourseChildrenSyncedForProfessor(
+  course: Course,
+  professorUid: string
+): Promise<void> {
+  if (!professorUid) return;
+  const isHolderOrMember =
+    course.leadProfessorId === professorUid || (course.professorIds ?? []).includes(professorUid);
+  if (!isHolderOrMember) return;
+
+  const targetProfIds = buildCourseChildProfessorIds(course, professorUid);
+
+  if (!(course.professorIds ?? []).includes(professorUid) && course.leadProfessorId === professorUid) {
+    try {
+      await updateDoc(doc(db, 'courses', course.id), {
+        professorIds: targetProfIds,
+        updatedAt: serverTimestamp(),
+      });
+    } catch {
+      // Non-blocking sync
+    }
+  }
+
+  const childTargets: Array<{ col: string; ids: string[] }> = [
+    { col: 'gradingCategories', ids: course.categoryIds ?? [] },
+    { col: 'gradingItems', ids: course.itemIds ?? [] },
+    { col: 'attendanceSessions', ids: course.sessionIds ?? [] },
+    { col: 'examTerms', ids: course.examTermIds ?? [] },
+    { col: 'scheduleEvents', ids: course.scheduleEventIds ?? [] },
+  ];
+
+  for (const group of childTargets) {
+    await runParallelChunks(group.ids, 10, async (id) => {
+      try {
+        const ref = doc(db, group.col, id);
+        const snap = await getDoc(ref);
+        if (!snap.exists()) return;
+        const currentIds = (snap.data().professorIds as string[] | undefined) ?? [];
+        if (!currentIds.includes(professorUid)) {
+          const merged = Array.from(new Set([...targetProfIds, ...currentIds])).slice(
+            0,
+            VALIDATION_CONSTRAINTS.MAX_PROFESSORS_PER_COURSE
+          );
+          await updateDoc(ref, {
+            professorIds: merged,
+            updatedAt: serverTimestamp(),
+          });
+        }
+      } catch {
+        // Non-blocking repair for legacy/unsynced child documents
+      }
+    });
+  }
+}
+
 export function subscribeProfessorCourses(
   professorUid: string,
   onData: (courses: Course[]) => void
 ): Unsubscribe {
-  const q = query(
-    collection(db, 'courses'),
-    where('professorIds', 'array-contains', professorUid)
-  );
-  return onSnapshot(
-    q,
+  let byMember: Course[] = [];
+  let byLead: Course[] = [];
+  let loadedMember = false;
+  let loadedLead = false;
+
+  const emitMerged = () => {
+    if (!loadedMember && !loadedLead) return;
+    const map = new Map<string, Course>();
+    for (const c of byMember) map.set(c.id, c);
+    for (const c of byLead) map.set(c.id, c);
+    onData(Array.from(map.values()));
+  };
+
+  const unsubMember = onSnapshot(
+    query(collection(db, 'courses'), where('professorIds', 'array-contains', professorUid)),
     (snap) => {
-      onData(snap.docs.map((d) => ({ ...(d.data() as Omit<Course, 'id'>), id: d.id })));
+      byMember = snap.docs.map((d) => ({ ...(d.data() as Omit<Course, 'id'>), id: d.id }));
+      loadedMember = true;
+      emitMerged();
     },
     (error) => handleFirestoreError(error, OperationType.LIST, 'courses')
   );
+
+  const unsubLead = onSnapshot(
+    query(collection(db, 'courses'), where('leadProfessorId', '==', professorUid)),
+    (snap) => {
+      byLead = snap.docs.map((d) => ({ ...(d.data() as Omit<Course, 'id'>), id: d.id }));
+      loadedLead = true;
+      emitMerged();
+    },
+    (error) => handleFirestoreError(error, OperationType.LIST, 'courses')
+  );
+
+  return () => {
+    unsubMember();
+    unsubLead();
+  };
 }
 
 export function subscribeProfessorAllExamData(
@@ -2402,7 +2492,7 @@ export async function enrollStudentByIndex(params: {
       studentName: entry.fullName,
       studentIndex: entry.studentIndex,
       studentDepartment: entry.department,
-      professorIds: params.course.professorIds,
+      professorIds: buildCourseChildProfessorIds(params.course),
       isSeed: false,
       createdAt: serverTimestamp(),
       updatedAt: serverTimestamp(),
@@ -2446,27 +2536,31 @@ export async function createGradingCategory(params: {
   }
 
   const categoryId = makeEntityId('cat');
-  const batch = writeBatch(db);
-  batch.set(doc(db, 'gradingCategories', categoryId), {
-    courseId: params.course.id,
-    name: cleanName,
-    maxPoints: Number(params.maxPoints),
-    order: Math.max(0, Math.min(50, Math.round(params.order))),
-    professorIds: params.course.professorIds,
-    isSeed: false,
-    createdAt: serverTimestamp(),
-    updatedAt: serverTimestamp(),
-  });
-  batch.update(doc(db, 'courses', params.course.id), {
-    categoryIds: [...params.course.categoryIds, categoryId],
-    updatedAt: serverTimestamp(),
-  });
+  const childProfessorIds = buildCourseChildProfessorIds(params.course);
 
   try {
-    await batch.commit();
-    return categoryId;
+    await setDoc(doc(db, 'gradingCategories', categoryId), {
+      courseId: params.course.id,
+      name: cleanName,
+      maxPoints: Number(params.maxPoints),
+      order: Math.max(0, Math.min(50, Math.round(params.order))),
+      professorIds: childProfessorIds,
+      isSeed: false,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
   } catch (error) {
     handleFirestoreError(error, OperationType.CREATE, `gradingCategories/${categoryId}`);
+  }
+
+  try {
+    await updateDoc(doc(db, 'courses', params.course.id), {
+      categoryIds: Array.from(new Set([...params.course.categoryIds, categoryId])),
+      updatedAt: serverTimestamp(),
+    });
+    return categoryId;
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `courses/${params.course.id}`);
   }
 }
 
@@ -2478,12 +2572,16 @@ export async function updateGradingCategory(
   const cleanName = sanitizeText(updates.name, VALIDATION_CONSTRAINTS.CATEGORY_NAME_MAX_LENGTH);
   if (!cleanName) throw new Error('Naziv kategorije je obavezan.');
 
+  const safeProfIds = Array.from(
+    new Set([...professorIds, ...(auth.currentUser?.uid ? [auth.currentUser.uid] : [])])
+  ).slice(0, VALIDATION_CONSTRAINTS.MAX_PROFESSORS_PER_COURSE);
+
   try {
     await updateDoc(doc(db, 'gradingCategories', categoryId), {
       name: cleanName,
       maxPoints: Math.max(0, Math.min(100, Number(updates.maxPoints))),
       order: Math.max(0, Math.min(50, Math.round(updates.order))),
-      professorIds,
+      professorIds: safeProfIds,
       updatedAt: serverTimestamp(),
     });
   } catch (error) {
@@ -2516,27 +2614,28 @@ export async function deleteGradingCategory(params: {
     }
   });
 
-  const batch = writeBatch(db);
-  batch.delete(doc(db, 'gradingCategories', categoryId));
-
   const nextCatIds = course.categoryIds.filter((id) => id !== categoryId);
   const nextItemIds = course.itemIds.filter((id) => !removedItemIds.has(id));
 
-  if (removedItemIds.size > 0) {
-    batch.update(doc(db, 'courses', course.id), {
-      categoryIds: nextCatIds,
-      itemIds: nextItemIds,
-      updatedAt: serverTimestamp(),
-    });
-  } else {
-    batch.update(doc(db, 'courses', course.id), {
-      categoryIds: nextCatIds,
-      updatedAt: serverTimestamp(),
-    });
+  try {
+    if (removedItemIds.size > 0) {
+      await updateDoc(doc(db, 'courses', course.id), {
+        categoryIds: nextCatIds,
+        itemIds: nextItemIds,
+        updatedAt: serverTimestamp(),
+      });
+    } else {
+      await updateDoc(doc(db, 'courses', course.id), {
+        categoryIds: nextCatIds,
+        updatedAt: serverTimestamp(),
+      });
+    }
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `courses/${course.id}`);
   }
 
   try {
-    await batch.commit();
+    await deleteDoc(doc(db, 'gradingCategories', categoryId));
   } catch (error) {
     handleFirestoreError(error, OperationType.DELETE, `gradingCategories/${categoryId}`);
   }
@@ -2564,30 +2663,34 @@ export async function createGradingItem(params: {
   }
 
   const itemId = makeEntityId('itm');
-  const batch = writeBatch(db);
-  batch.set(doc(db, 'gradingItems', itemId), {
-    courseId: params.course.id,
-    categoryId: params.categoryId,
-    name: cleanName,
-    maxPoints: Number(params.maxPoints),
-    date: params.date,
-    description: sanitizeText(params.description, VALIDATION_CONSTRAINTS.DESCRIPTION_MAX_LENGTH),
-    order: Math.max(0, Math.min(200, Math.round(params.order))),
-    professorIds: params.course.professorIds,
-    isSeed: false,
-    createdAt: serverTimestamp(),
-    updatedAt: serverTimestamp(),
-  });
-  batch.update(doc(db, 'courses', params.course.id), {
-    itemIds: [...params.course.itemIds, itemId],
-    updatedAt: serverTimestamp(),
-  });
+  const childProfessorIds = buildCourseChildProfessorIds(params.course);
 
   try {
-    await batch.commit();
-    return itemId;
+    await setDoc(doc(db, 'gradingItems', itemId), {
+      courseId: params.course.id,
+      categoryId: params.categoryId,
+      name: cleanName,
+      maxPoints: Number(params.maxPoints),
+      date: params.date,
+      description: sanitizeText(params.description, VALIDATION_CONSTRAINTS.DESCRIPTION_MAX_LENGTH),
+      order: Math.max(0, Math.min(200, Math.round(params.order))),
+      professorIds: childProfessorIds,
+      isSeed: false,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
   } catch (error) {
     handleFirestoreError(error, OperationType.CREATE, `gradingItems/${itemId}`);
+  }
+
+  try {
+    await updateDoc(doc(db, 'courses', params.course.id), {
+      itemIds: Array.from(new Set([...params.course.itemIds, itemId])),
+      updatedAt: serverTimestamp(),
+    });
+    return itemId;
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `courses/${params.course.id}`);
   }
 }
 
@@ -2612,6 +2715,10 @@ export async function updateGradingItem(
     throw new Error('Unesite ispravan datum.');
   }
 
+  const safeProfIds = Array.from(
+    new Set([...professorIds, ...(auth.currentUser?.uid ? [auth.currentUser.uid] : [])])
+  ).slice(0, VALIDATION_CONSTRAINTS.MAX_PROFESSORS_PER_COURSE);
+
   try {
     await updateDoc(doc(db, 'gradingItems', itemId), {
       categoryId: updates.categoryId,
@@ -2620,7 +2727,7 @@ export async function updateGradingItem(
       date: updates.date,
       description: sanitizeText(updates.description, VALIDATION_CONSTRAINTS.DESCRIPTION_MAX_LENGTH),
       order: Math.max(0, Math.min(200, Math.round(updates.order))),
-      professorIds,
+      professorIds: safeProfIds,
       updatedAt: serverTimestamp(),
     });
   } catch (error) {
@@ -2643,15 +2750,17 @@ export async function deleteGradingItem(params: {
     }
   });
 
-  const batch = writeBatch(db);
-  batch.delete(doc(db, 'gradingItems', itemId));
-  batch.update(doc(db, 'courses', course.id), {
-    itemIds: course.itemIds.filter((id) => id !== itemId),
-    updatedAt: serverTimestamp(),
-  });
+  try {
+    await updateDoc(doc(db, 'courses', course.id), {
+      itemIds: course.itemIds.filter((id) => id !== itemId),
+      updatedAt: serverTimestamp(),
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `courses/${course.id}`);
+  }
 
   try {
-    await batch.commit();
+    await deleteDoc(doc(db, 'gradingItems', itemId));
   } catch (error) {
     handleFirestoreError(error, OperationType.DELETE, `gradingItems/${itemId}`);
   }
@@ -2674,6 +2783,7 @@ export async function saveStudentScore(params: {
 
   const scoreId = `${item.id}_${studentId}`;
   const cleanFeedback = sanitizeText(feedback, VALIDATION_CONSTRAINTS.FEEDBACK_MAX_LENGTH);
+  const childProfessorIds = buildCourseChildProfessorIds(course, professorUid);
 
   if (existingScore) {
     try {
@@ -2681,7 +2791,7 @@ export async function saveStudentScore(params: {
         points: Number(points),
         feedback: cleanFeedback,
         gradedBy: professorUid,
-        professorIds: course.professorIds,
+        professorIds: childProfessorIds,
         updatedAt: serverTimestamp(),
       });
     } catch (error) {
@@ -2697,7 +2807,7 @@ export async function saveStudentScore(params: {
         points: Number(points),
         feedback: cleanFeedback,
         gradedBy: professorUid,
-        professorIds: course.professorIds,
+        professorIds: childProfessorIds,
         isSeed: false,
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
@@ -2726,29 +2836,31 @@ export async function createAttendanceSessionWithInitialMarks(params: {
   }
 
   const sessionId = makeEntityId('ses');
-  const batch = writeBatch(db);
-
-  batch.set(doc(db, 'attendanceSessions', sessionId), {
-    courseId: course.id,
-    date,
-    time: sanitizeText(time, VALIDATION_CONSTRAINTS.SESSION_TIME_MAX_LENGTH),
-    topic: sanitizeText(topic, VALIDATION_CONSTRAINTS.SESSION_TOPIC_MAX_LENGTH),
-    isCancelled: false,
-    professorIds: course.professorIds,
-    isSeed: false,
-    createdAt: serverTimestamp(),
-    updatedAt: serverTimestamp(),
-  });
-
-  batch.update(doc(db, 'courses', course.id), {
-    sessionIds: [...course.sessionIds, sessionId],
-    updatedAt: serverTimestamp(),
-  });
+  const childProfessorIds = buildCourseChildProfessorIds(course, professorUid);
 
   try {
-    await batch.commit();
+    await setDoc(doc(db, 'attendanceSessions', sessionId), {
+      courseId: course.id,
+      date,
+      time: sanitizeText(time, VALIDATION_CONSTRAINTS.SESSION_TIME_MAX_LENGTH),
+      topic: sanitizeText(topic, VALIDATION_CONSTRAINTS.SESSION_TOPIC_MAX_LENGTH),
+      isCancelled: false,
+      professorIds: childProfessorIds,
+      isSeed: false,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
   } catch (error) {
     handleFirestoreError(error, OperationType.CREATE, `attendanceSessions/${sessionId}`);
+  }
+
+  try {
+    await updateDoc(doc(db, 'courses', course.id), {
+      sessionIds: Array.from(new Set([...course.sessionIds, sessionId])),
+      updatedAt: serverTimestamp(),
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `courses/${course.id}`);
   }
 
   if (markAllPresent && enrolledStudents.length > 0) {
@@ -2762,7 +2874,7 @@ export async function createAttendanceSessionWithInitialMarks(params: {
           present: true,
           note: '',
           markedBy: professorUid,
-          professorIds: course.professorIds,
+          professorIds: childProfessorIds,
           isSeed: false,
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
@@ -2783,13 +2895,16 @@ export async function updateAttendanceSession(
   if (!isValidIsoDate(updates.date)) {
     throw new Error('Unesite ispravan datum termina.');
   }
+  const safeProfIds = Array.from(
+    new Set([...session.professorIds, ...(auth.currentUser?.uid ? [auth.currentUser.uid] : [])])
+  ).slice(0, VALIDATION_CONSTRAINTS.MAX_PROFESSORS_PER_COURSE);
   try {
     await updateDoc(doc(db, 'attendanceSessions', session.id), {
       date: updates.date,
       time: sanitizeText(updates.time, VALIDATION_CONSTRAINTS.SESSION_TIME_MAX_LENGTH),
       topic: sanitizeText(updates.topic, VALIDATION_CONSTRAINTS.SESSION_TOPIC_MAX_LENGTH),
       isCancelled: updates.isCancelled,
-      professorIds: session.professorIds,
+      professorIds: safeProfIds,
       updatedAt: serverTimestamp(),
     });
   } catch (error) {
@@ -2812,15 +2927,17 @@ export async function deleteAttendanceSession(params: {
     }
   });
 
-  const batch = writeBatch(db);
-  batch.delete(doc(db, 'attendanceSessions', sessionId));
-  batch.update(doc(db, 'courses', course.id), {
-    sessionIds: course.sessionIds.filter((id) => id !== sessionId),
-    updatedAt: serverTimestamp(),
-  });
+  try {
+    await updateDoc(doc(db, 'courses', course.id), {
+      sessionIds: course.sessionIds.filter((id) => id !== sessionId),
+      updatedAt: serverTimestamp(),
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `courses/${course.id}`);
+  }
 
   try {
-    await batch.commit();
+    await deleteDoc(doc(db, 'attendanceSessions', sessionId));
   } catch (error) {
     handleFirestoreError(error, OperationType.DELETE, `attendanceSessions/${sessionId}`);
   }
@@ -2846,6 +2963,7 @@ export async function setStudentAttendance(params: {
   } = params;
   const recordId = `${sessionId}_${studentId}`;
   const cleanNote = sanitizeText(note, VALIDATION_CONSTRAINTS.ATTENDANCE_NOTE_MAX_LENGTH);
+  const childProfessorIds = buildCourseChildProfessorIds(course, professorUid);
 
   if (existingRecord) {
     try {
@@ -2853,7 +2971,7 @@ export async function setStudentAttendance(params: {
         present,
         note: cleanNote,
         markedBy: professorUid,
-        professorIds: course.professorIds,
+        professorIds: childProfessorIds,
         updatedAt: serverTimestamp(),
       });
     } catch (error) {
@@ -2868,7 +2986,7 @@ export async function setStudentAttendance(params: {
         present,
         note: cleanNote,
         markedBy: professorUid,
-        professorIds: course.professorIds,
+        professorIds: childProfessorIds,
         isSeed: false,
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
@@ -2888,6 +3006,7 @@ export async function markAllStudentsPresentInSession(params: {
 }): Promise<void> {
   const { course, sessionId, enrolledStudents, existingRecords, professorUid } = params;
   const existingMap = new Map(existingRecords.map((r) => [r.studentId, r]));
+  const childProfessorIds = buildCourseChildProfessorIds(course, professorUid);
 
   await runParallelChunks(enrolledStudents, 15, async (enr) => {
     const recordId = `${sessionId}_${enr.studentId}`;
@@ -2899,7 +3018,7 @@ export async function markAllStudentsPresentInSession(params: {
           present: true,
           note: existing.note,
           markedBy: professorUid,
-          professorIds: course.professorIds,
+          professorIds: childProfessorIds,
           updatedAt: serverTimestamp(),
         });
       } catch (error) {
@@ -2914,7 +3033,7 @@ export async function markAllStudentsPresentInSession(params: {
           present: true,
           note: '',
           markedBy: professorUid,
-          professorIds: course.professorIds,
+          professorIds: childProfessorIds,
           isSeed: false,
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
@@ -2961,6 +3080,7 @@ export async function saveFinalGradeRecord(params: {
     comment,
     VALIDATION_CONSTRAINTS.FINAL_GRADE_COMMENT_MAX_LENGTH
   );
+  const childProfessorIds = buildCourseChildProfessorIds(course, professorUid);
 
   if (existingGrade) {
     try {
@@ -2970,7 +3090,7 @@ export async function saveFinalGradeRecord(params: {
         status,
         finalizedBy: professorUid,
         comment: cleanComment,
-        professorIds: course.professorIds,
+        professorIds: childProfessorIds,
         updatedAt: serverTimestamp(),
       });
     } catch (error) {
@@ -2986,7 +3106,7 @@ export async function saveFinalGradeRecord(params: {
         status,
         finalizedBy: professorUid,
         comment: cleanComment,
-        professorIds: course.professorIds,
+        professorIds: childProfessorIds,
         isSeed: false,
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
@@ -3044,37 +3164,39 @@ export async function createExamTerm(params: {
   }
 
   const termId = makeEntityId('ext');
-  const batch = writeBatch(db);
-
-  batch.set(doc(db, 'examTerms', termId), {
-    courseId: course.id,
-    courseCode: course.code,
-    courseName: course.name,
-    title: cleanTitle,
-    examDate,
-    examTime: sanitizeText(examTime, VALIDATION_CONSTRAINTS.SESSION_TIME_MAX_LENGTH),
-    classroom: sanitizeText(classroom, VALIDATION_CONSTRAINTS.CLASSROOM_MAX_LENGTH),
-    registrationOpenDate,
-    registrationCloseDate,
-    notes: sanitizeText(notes, VALIDATION_CONSTRAINTS.EXAM_NOTES_MAX_LENGTH),
-    isOpen: true,
-    createdBy: professorUid,
-    professorIds: course.professorIds,
-    isSeed: false,
-    createdAt: serverTimestamp(),
-    updatedAt: serverTimestamp(),
-  });
-
-  batch.update(doc(db, 'courses', course.id), {
-    examTermIds: [...existingIds, termId],
-    updatedAt: serverTimestamp(),
-  });
+  const childProfessorIds = buildCourseChildProfessorIds(course, professorUid);
 
   try {
-    await batch.commit();
-    return termId;
+    await setDoc(doc(db, 'examTerms', termId), {
+      courseId: course.id,
+      courseCode: course.code,
+      courseName: course.name,
+      title: cleanTitle,
+      examDate,
+      examTime: sanitizeText(examTime, VALIDATION_CONSTRAINTS.SESSION_TIME_MAX_LENGTH),
+      classroom: sanitizeText(classroom, VALIDATION_CONSTRAINTS.CLASSROOM_MAX_LENGTH),
+      registrationOpenDate,
+      registrationCloseDate,
+      notes: sanitizeText(notes, VALIDATION_CONSTRAINTS.EXAM_NOTES_MAX_LENGTH),
+      isOpen: true,
+      createdBy: professorUid,
+      professorIds: childProfessorIds,
+      isSeed: false,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
   } catch (error) {
     handleFirestoreError(error, OperationType.CREATE, `examTerms/${termId}`);
+  }
+
+  try {
+    await updateDoc(doc(db, 'courses', course.id), {
+      examTermIds: Array.from(new Set([...existingIds, termId])),
+      updatedAt: serverTimestamp(),
+    });
+    return termId;
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `courses/${course.id}`);
   }
 }
 
@@ -3118,7 +3240,7 @@ export async function updateExamTerm(
       registrationCloseDate: updates.registrationCloseDate,
       notes: sanitizeText(updates.notes, VALIDATION_CONSTRAINTS.EXAM_NOTES_MAX_LENGTH),
       isOpen: updates.isOpen,
-      professorIds: course.professorIds,
+      professorIds: buildCourseChildProfessorIds(course),
       updatedAt: serverTimestamp(),
     });
   } catch (error) {
@@ -3152,15 +3274,17 @@ export async function deleteExamTerm(params: {
     }
   });
 
-  const batch = writeBatch(db);
-  batch.delete(doc(db, 'examTerms', termId));
-  batch.update(doc(db, 'courses', course.id), {
-    examTermIds: (course.examTermIds ?? []).filter((id) => id !== termId),
-    updatedAt: serverTimestamp(),
-  });
+  try {
+    await updateDoc(doc(db, 'courses', course.id), {
+      examTermIds: (course.examTermIds ?? []).filter((id) => id !== termId),
+      updatedAt: serverTimestamp(),
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `courses/${course.id}`);
+  }
 
   try {
-    await batch.commit();
+    await deleteDoc(doc(db, 'examTerms', termId));
   } catch (error) {
     handleFirestoreError(error, OperationType.DELETE, `examTerms/${termId}`);
   }
@@ -5604,40 +5728,44 @@ export async function createScheduleEvent(params: {
   const dow = Math.max(1, Math.min(7, Math.round(params.dayOfWeek || 1)));
 
   const eventId = makeEntityId('sch');
-  const batch = writeBatch(db);
-  batch.set(doc(db, 'scheduleEvents', eventId), {
-    courseId: course.id,
-    courseCode: course.code,
-    courseName: course.name,
-    eventType: params.eventType,
-    title: cleanTitle,
-    isRecurringWeekly: Boolean(params.isRecurringWeekly),
-    dayOfWeek: dow,
-    date: cleanDate,
-    startTime: cleanStart,
-    endTime: cleanEnd,
-    location: sanitizeText(params.location, VALIDATION_CONSTRAINTS.SCHEDULE_LOCATION_MAX_LENGTH),
-    description: sanitizeText(
-      params.description,
-      VALIDATION_CONSTRAINTS.SCHEDULE_DESCRIPTION_MAX_LENGTH
-    ),
-    createdBy: actorUid,
-    professorIds: course.professorIds,
-    isSeed: false,
-    createdAt: serverTimestamp(),
-    updatedAt: serverTimestamp(),
-  });
-  batch.update(doc(db, 'courses', course.id), {
-    scheduleEventIds: [...existingIds, eventId],
-    updatedAt: serverTimestamp(),
-  });
+  const childProfessorIds = buildCourseChildProfessorIds(course, actorUid);
 
   try {
-    await batch.commit();
+    await setDoc(doc(db, 'scheduleEvents', eventId), {
+      courseId: course.id,
+      courseCode: course.code,
+      courseName: course.name,
+      eventType: params.eventType,
+      title: cleanTitle,
+      isRecurringWeekly: Boolean(params.isRecurringWeekly),
+      dayOfWeek: dow,
+      date: cleanDate,
+      startTime: cleanStart,
+      endTime: cleanEnd,
+      location: sanitizeText(params.location, VALIDATION_CONSTRAINTS.SCHEDULE_LOCATION_MAX_LENGTH),
+      description: sanitizeText(
+        params.description,
+        VALIDATION_CONSTRAINTS.SCHEDULE_DESCRIPTION_MAX_LENGTH
+      ),
+      createdBy: actorUid,
+      professorIds: childProfessorIds,
+      isSeed: false,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.CREATE, `scheduleEvents/${eventId}`);
+  }
+
+  try {
+    await updateDoc(doc(db, 'courses', course.id), {
+      scheduleEventIds: Array.from(new Set([...existingIds, eventId])),
+      updatedAt: serverTimestamp(),
+    });
     void mutateAdminIndex({ addScheduleEventIds: [eventId] });
     return eventId;
   } catch (error) {
-    handleFirestoreError(error, OperationType.CREATE, `scheduleEvents/${eventId}`);
+    handleFirestoreError(error, OperationType.UPDATE, `courses/${course.id}`);
   }
 }
 
@@ -5682,7 +5810,7 @@ export async function updateScheduleEvent(
         updates.description,
         VALIDATION_CONSTRAINTS.SCHEDULE_DESCRIPTION_MAX_LENGTH
       ),
-      professorIds: course.professorIds,
+      professorIds: buildCourseChildProfessorIds(course),
       updatedAt: serverTimestamp(),
     });
     void mutateAdminIndex({});
@@ -5696,14 +5824,17 @@ export async function deleteScheduleEvent(params: {
   eventId: string;
 }): Promise<void> {
   const { course, eventId } = params;
-  const batch = writeBatch(db);
-  batch.delete(doc(db, 'scheduleEvents', eventId));
-  batch.update(doc(db, 'courses', course.id), {
-    scheduleEventIds: (course.scheduleEventIds ?? []).filter((id) => id !== eventId),
-    updatedAt: serverTimestamp(),
-  });
   try {
-    await batch.commit();
+    await updateDoc(doc(db, 'courses', course.id), {
+      scheduleEventIds: (course.scheduleEventIds ?? []).filter((id) => id !== eventId),
+      updatedAt: serverTimestamp(),
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `courses/${course.id}`);
+  }
+
+  try {
+    await deleteDoc(doc(db, 'scheduleEvents', eventId));
     void mutateAdminIndex({ removeScheduleEventIds: [eventId] });
   } catch (error) {
     handleFirestoreError(error, OperationType.DELETE, `scheduleEvents/${eventId}`);
@@ -7426,7 +7557,7 @@ export async function createActivityAward(params: {
       date,
       description: cleanDesc,
       awardedBy: professorUid,
-      professorIds: course.professorIds,
+      professorIds: buildCourseChildProfessorIds(course, professorUid),
       isSeed: false,
       createdAt: serverTimestamp(),
       updatedAt: serverTimestamp(),
@@ -7472,7 +7603,7 @@ export async function updateActivityAward(params: {
       date,
       description: cleanDesc,
       awardedBy: professorUid,
-      professorIds: course.professorIds,
+      professorIds: buildCourseChildProfessorIds(course, professorUid),
       updatedAt: serverTimestamp(),
     });
   } catch (error) {

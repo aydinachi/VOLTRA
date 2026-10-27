@@ -68,12 +68,14 @@ describe('Firestore Security Rules — Structural & Dirty Dozen Verification', (
     expect(rulesContent).toContain(
       'return isBootstrapAdmin() || hasAdminDoc() || hasAdminRoleProfile();'
     );
+    expect(rulesContent).toContain('function isCourseHolder(courseId)');
     expect(rulesContent).toMatch(
       /function isCourseProfessor\(courseId\)\s*\{\s*return isSignedIn\(\) &&/
     );
     expect(rulesContent).toContain(
-      '(isCourseProfessor(incoming().courseId) || isCourseProfessorAfter(incoming().courseId) || isAdmin())'
+      '(isCourseHolder(incoming().courseId) || isCourseProfessor(incoming().courseId) || isAdmin())'
     );
+    expect(rulesContent).not.toContain('existsAfter(');
   });
 
   describe.runIf(hasEmulator)('Live Emulator Dirty Dozen Payloads', () => {
@@ -724,6 +726,190 @@ describe('Firestore Security Rules — Structural & Dirty Dozen Verification', (
           updatedAt: serverTimestamp(),
         })
       );
+    });
+
+    it('15. Allows designated course holder (leadProfessorId) and Email/Password Admin (without /admins doc) to create and write gradingItems, attendanceSessions, and examTerms', async () => {
+      await testEnv.withSecurityRulesDisabled(async (ctx) => {
+        const now = Timestamp.now();
+        await setDoc(doc(ctx.firestore(), 'userProfiles', 'holder_only_uid'), {
+          uid: 'holder_only_uid',
+          fullName: 'doc. dr. Samir Ribić',
+          studentIndex: '',
+          department: 'Računarstvo i informatika',
+          role: 'professor',
+          academicYear: '2026/2027',
+          redeemedInviteId: 'prov_holder',
+          provisionedByAdmin: true,
+          isSeed: false,
+          createdAt: now,
+          updatedAt: now,
+        });
+        await setDoc(doc(ctx.firestore(), 'userProfiles', 'samir_admin_no_admindoc'), {
+          uid: 'samir_admin_no_admindoc',
+          fullName: 'Samir Ribić (Admin)',
+          studentIndex: '',
+          department: 'Uprava fakulteta',
+          role: 'admin',
+          academicYear: '2026/2027',
+          redeemedInviteId: 'prov_admin_2',
+          provisionedByAdmin: true,
+          isSeed: false,
+          createdAt: now,
+          updatedAt: now,
+        });
+        await setDoc(doc(ctx.firestore(), 'courses', 'crs_holder_test'), {
+          code: 'RI-SP',
+          name: 'Sistemsko programiranje',
+          semester: 'Zimski semestar',
+          academicYear: '2026/2027',
+          ects: 6,
+          leadProfessorId: 'holder_only_uid',
+          leadProfessorName: 'doc. dr. Samir Ribić',
+          professorIds: ['prof_1'],
+          professorNames: ['doc. dr. Samir Ribić'],
+          assistantNames: [],
+          attendanceEnabled: true,
+          attendanceMaxPoints: 10,
+          allowBonusPoints: false,
+          activityMarksEnabled: true,
+          grade6Threshold: 55,
+          grade7Threshold: 65,
+          grade8Threshold: 75,
+          grade9Threshold: 85,
+          grade10Threshold: 95,
+          categoryIds: ['cat_holder_1'],
+          itemIds: [],
+          sessionIds: [],
+          examTermIds: [],
+          scheduleEventIds: [],
+          isSeed: false,
+          createdAt: now,
+          updatedAt: now,
+        });
+        await setDoc(doc(ctx.firestore(), 'gradingCategories', 'cat_holder_1'), {
+          courseId: 'crs_holder_test',
+          name: 'Zadaci',
+          maxPoints: 30,
+          order: 1,
+          professorIds: ['prof_1'],
+          isSeed: false,
+          createdAt: now,
+          updatedAt: now,
+        });
+      });
+
+      const holderDb = testEnv
+        .authenticatedContext('holder_only_uid', {
+          email: 'sribic@etf.unsa.ba',
+          email_verified: false,
+        })
+        .firestore();
+
+      // Designated course holder creates gradingItem, updates it, creates attendanceSession & examTerm
+      await assertSucceeds(
+        setDoc(doc(holderDb, 'gradingItems', 'itm_holder_1'), {
+          courseId: 'crs_holder_test',
+          categoryId: 'cat_holder_1',
+          name: 'Zadaća 1',
+          maxPoints: 10,
+          date: '2026-11-10',
+          description: 'Prva zadaća',
+          order: 1,
+          professorIds: ['holder_only_uid', 'prof_1'],
+          isSeed: false,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        })
+      );
+
+      await assertSucceeds(
+        updateDoc(doc(holderDb, 'courses', 'crs_holder_test'), {
+          itemIds: ['itm_holder_1'],
+          updatedAt: serverTimestamp(),
+        })
+      );
+
+      await assertSucceeds(
+        updateDoc(doc(holderDb, 'gradingItems', 'itm_holder_1'), {
+          categoryId: 'cat_holder_1',
+          name: 'Zadaća 1 (Ažurirano)',
+          maxPoints: 12,
+          date: '2026-11-12',
+          description: 'Prva zadaća revizija',
+          order: 1,
+          professorIds: ['holder_only_uid', 'prof_1'],
+          updatedAt: serverTimestamp(),
+        })
+      );
+
+      await assertSucceeds(
+        setDoc(doc(holderDb, 'attendanceSessions', 'ses_holder_1'), {
+          courseId: 'crs_holder_test',
+          date: '2026-11-11',
+          time: '09:00 - 11:00',
+          topic: 'Uvod u kernel module',
+          isCancelled: false,
+          professorIds: ['holder_only_uid', 'prof_1'],
+          isSeed: false,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        })
+      );
+
+      await assertSucceeds(
+        setDoc(doc(holderDb, 'examTerms', 'ext_holder_1'), {
+          courseId: 'crs_holder_test',
+          courseCode: 'RI-SP',
+          courseName: 'Sistemsko programiranje',
+          title: 'I parcijalni ispit',
+          examDate: '2026-11-25',
+          examTime: '10:00',
+          classroom: 'A1',
+          registrationOpenDate: '2026-11-10',
+          registrationCloseDate: '2026-11-23',
+          notes: 'Obavezna indeks knjižica',
+          isOpen: true,
+          createdBy: 'holder_only_uid',
+          professorIds: ['holder_only_uid', 'prof_1'],
+          isSeed: false,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        })
+      );
+
+      // Email/Password Admin (even without /admins/{uid} doc) creates examTerms and attendanceSessions both sequentially & in writeBatch
+      const adminDb = testEnv
+        .authenticatedContext('samir_admin_no_admindoc', {
+          email: 'samir.admin@etf.unsa.ba',
+          email_verified: false,
+        })
+        .firestore();
+
+      const adminBatch = writeBatch(adminDb);
+      adminBatch.set(doc(adminDb, 'examTerms', 'ext_admin_batch_1'), {
+        courseId: 'crs_holder_test',
+        courseCode: 'RI-SP',
+        courseName: 'Sistemsko programiranje',
+        title: 'Završni ispit',
+        examDate: '2027-01-20',
+        examTime: '12:00',
+        classroom: 'A2',
+        registrationOpenDate: '2027-01-05',
+        registrationCloseDate: '2027-01-18',
+        notes: 'Završni ispitni rok',
+        isOpen: true,
+        createdBy: 'samir_admin_no_admindoc',
+        professorIds: ['holder_only_uid', 'prof_1', 'samir_admin_no_admindoc'],
+        isSeed: false,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+      adminBatch.update(doc(adminDb, 'courses', 'crs_holder_test'), {
+        examTermIds: ['ext_holder_1', 'ext_admin_batch_1'],
+        updatedAt: serverTimestamp(),
+      });
+
+      await assertSucceeds(adminBatch.commit());
     });
   });
 });

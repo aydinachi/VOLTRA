@@ -38,6 +38,7 @@ import {
 import {
   createCourse,
   enrollStudentByIndex,
+  ensureCourseChildrenSyncedForProfessor,
   removeEnrollment,
   saveFinalGradeRecord,
   subscribeAcademicState,
@@ -218,6 +219,11 @@ export function ProfessorPortal({ activeNav, onNavigate }: ProfessorPortalProps)
   );
 
   const activeCourse = courses.find((c) => c.id === selectedCourseId) || null;
+
+  useEffect(() => {
+    if (!activeCourse || !professorUid) return;
+    void ensureCourseChildrenSyncedForProfessor(activeCourse, professorUid);
+  }, [activeCourse?.id, activeCourse?.leadProfessorId, professorUid]);
 
   const studentSummaries = useMemo(() => {
     if (!activeCourse) return {};
