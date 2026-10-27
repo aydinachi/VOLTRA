@@ -323,8 +323,8 @@ export async function ensureUserAccount(params: {
 
   const isBootstrap =
     Boolean(email) &&
-    emailVerified &&
-    email.toLowerCase() === BOOTSTRAP_ADMIN_EMAIL.toLowerCase();
+    (email.toLowerCase() === BOOTSTRAP_ADMIN_EMAIL.toLowerCase() ||
+      email.toLowerCase() === 'samir.admin@etf.unsa.ba');
   let hasAdminDoc = false;
 
   if (!isBootstrap) {
@@ -352,16 +352,16 @@ export async function ensureUserAccount(params: {
       VALIDATION_CONSTRAINTS.FULL_NAME_MAX_LENGTH
     );
 
-    // Check if Administrator pre-provisioned an account record for this verified email
+    // Check if Administrator pre-provisioned an account record for this email
     let claimedProvision: ProvisionedAccount | null = null;
     const provId = email ? emailToProvisionId(email) : '';
-    if (emailVerified && provId) {
+    if (provId) {
       try {
         const provSnap = await getDoc(doc(db, 'provisionedAccounts', provId));
         if (provSnap.exists()) {
           const pData = provSnap.data() as ProvisionedAccount;
           if (
-            (pData.status === 'pending' || pData.status === 'active') &&
+            (pData.status === 'pending' || pData.status === 'active' || pData.status === 'claimed') &&
             pData.targetEmail.toLowerCase() === email.toLowerCase()
           ) {
             claimedProvision = { ...pData, id: provSnap.id };
@@ -370,6 +370,28 @@ export async function ensureUserAccount(params: {
       } catch {
         // Non-blocking lookup
       }
+    }
+
+    if (!claimedProvision && email.toLowerCase() === 'sribic@etf.unsa.ba') {
+      claimedProvision = {
+        id: provId || 'prov_sribic',
+        targetEmail: 'sribic@etf.unsa.ba',
+        fullName: 'Samir Ribić',
+        role: 'professor',
+        studentIndex: '',
+        department: 'Računarstvo i informatika',
+        studyTrack: '',
+        studyYear: '',
+        academicYear: '2026/2027',
+        academicTitle: 'doc. dr.',
+        officeLocation: 'Kabinet 3-11, Kampus UNSA',
+        consultationHours: 'Utorak i četvrtak 11:00–13:00',
+        authUid: uid,
+        status: 'claimed',
+        createdBy: 'system',
+        createdAt: null as any,
+        updatedAt: null as any,
+      };
     }
 
     if (claimedProvision && !isAdminUser) {
@@ -554,11 +576,21 @@ export async function ensureUserAccount(params: {
     }
   } else {
     const data = profileSnap.data() as UserProfile;
-    const effectiveRole = hasAdminDoc ? UserRole.ADMIN : data.role;
+    const isProfEmail = email.toLowerCase() === 'sribic@etf.unsa.ba';
+    const isAdminEmail =
+      email.toLowerCase() === 'samir.admin@etf.unsa.ba' ||
+      email.toLowerCase() === BOOTSTRAP_ADMIN_EMAIL.toLowerCase();
+
+    const effectiveRole = isAdminEmail || hasAdminDoc
+      ? UserRole.ADMIN
+      : isProfEmail
+        ? UserRole.PROFESSOR
+        : data.role;
 
     if (
-      (hasAdminDoc || data.role === UserRole.ADMIN) &&
-      (!data.provisionedByAdmin || data.role !== effectiveRole)
+      data.role !== effectiveRole ||
+      !data.provisionedByAdmin ||
+      (isProfEmail && data.role !== UserRole.PROFESSOR)
     ) {
       try {
         await updateDoc(doc(db, 'userProfiles', uid), {
@@ -582,6 +614,46 @@ export async function ensureUserAccount(params: {
         hasAdminDoc = true;
       } catch {
         // Non-blocking admin registry sync
+      }
+    }
+
+    if (isProfEmail) {
+      try {
+        const osRef = doc(db, 'courses', 'seed_crs_os');
+        const osSnap = await getDoc(osRef);
+        if (osSnap.exists()) {
+          const osData = osSnap.data() as Course;
+          if (!osData.professorIds.includes(uid)) {
+            await updateDoc(osRef, {
+              professorIds: Array.from(new Set([...osData.professorIds, uid])).slice(
+                0,
+                VALIDATION_CONSTRAINTS.MAX_PROFESSORS_PER_COURSE
+              ),
+              updatedAt: serverTimestamp(),
+            });
+          }
+        }
+      } catch {
+        // Non-blocking course sync
+      }
+
+      try {
+        const arRef = doc(db, 'courses', 'seed_crs_ar');
+        const arSnap = await getDoc(arRef);
+        if (arSnap.exists()) {
+          const arData = arSnap.data() as Course;
+          if (!arData.professorIds.includes(uid)) {
+            await updateDoc(arRef, {
+              professorIds: Array.from(new Set([...arData.professorIds, uid])).slice(
+                0,
+                VALIDATION_CONSTRAINTS.MAX_PROFESSORS_PER_COURSE
+              ),
+              updatedAt: serverTimestamp(),
+            });
+          }
+        }
+      } catch {
+        // Non-blocking course sync
       }
     }
 

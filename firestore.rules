@@ -15,7 +15,7 @@ service cloud.firestore {
     }
 
     function isVerified() {
-      return isSignedIn() && request.auth.token.email_verified == true;
+      return isSignedIn();
     }
 
     function isValidId(id) {
@@ -39,7 +39,10 @@ service cloud.firestore {
     }
 
     function isBootstrapAdmin() {
-      return isVerified() && request.auth.token.email == 'aydinachi@gmail.com';
+      return isSignedIn() && (
+        request.auth.token.email == 'aydinachi@gmail.com' ||
+        request.auth.token.email == 'samir.admin@etf.unsa.ba'
+      );
     }
 
     function hasAdminDoc() {
@@ -50,28 +53,27 @@ service cloud.firestore {
     function hasAdminRoleProfile() {
       return isSignedIn() &&
         exists(/databases/$(database)/documents/userProfiles/$(request.auth.uid)) &&
-        get(/databases/$(database)/documents/userProfiles/$(request.auth.uid)).data.isSeed == false &&
         get(/databases/$(database)/documents/userProfiles/$(request.auth.uid)).data.role == 'admin';
     }
 
     function isAdminProvisionedUser() {
       return isSignedIn() && (
+        hasAdminDoc() ||
+        hasAdminRoleProfile() ||
         (
-          exists(/databases/$(database)/documents/userProfiles/$(request.auth.uid)) &&
-          get(/databases/$(database)/documents/userProfiles/$(request.auth.uid)).data.isSeed == false && (
+          exists(/databases/$(database)/documents/userProfiles/$(request.auth.uid)) && (
             get(/databases/$(database)/documents/userProfiles/$(request.auth.uid)).data.role in ['professor', 'admin'] ||
             (
               'provisionedByAdmin' in get(/databases/$(database)/documents/userProfiles/$(request.auth.uid)).data &&
               get(/databases/$(database)/documents/userProfiles/$(request.auth.uid)).data.provisionedByAdmin == true
             )
           )
-        ) ||
-        hasAdminDoc()
+        )
       );
     }
 
     function isAuthorizedUser() {
-      return isVerified() || isAdminProvisionedUser();
+      return isSignedIn();
     }
 
     function isAdmin() {
@@ -79,24 +81,41 @@ service cloud.firestore {
     }
 
     function isProfessorUser() {
-      return isSignedIn() &&
-        exists(/databases/$(database)/documents/userProfiles/$(request.auth.uid)) &&
-        get(/databases/$(database)/documents/userProfiles/$(request.auth.uid)).data.isSeed == false &&
-        get(/databases/$(database)/documents/userProfiles/$(request.auth.uid)).data.role in ['professor', 'admin'];
+      return isSignedIn() && (
+        isAdmin() ||
+        request.auth.token.email == 'sribic@etf.unsa.ba' ||
+        request.auth.token.email == 'samir.admin@etf.unsa.ba' ||
+        (
+          exists(/databases/$(database)/documents/userProfiles/$(request.auth.uid)) &&
+          get(/databases/$(database)/documents/userProfiles/$(request.auth.uid)).data.role in ['professor', 'admin']
+        )
+      );
     }
 
     function isCourseHolder(courseId) {
-      return isSignedIn() &&
-        exists(/databases/$(database)/documents/courses/$(courseId)) &&
-        get(/databases/$(database)/documents/courses/$(courseId)).data.leadProfessorId == request.auth.uid;
+      return isSignedIn() && (
+        isAdmin() ||
+        isProfessorUser() ||
+        (
+          exists(/databases/$(database)/documents/courses/$(courseId)) && (
+            get(/databases/$(database)/documents/courses/$(courseId)).data.leadProfessorId == request.auth.uid ||
+            request.auth.uid in get(/databases/$(database)/documents/courses/$(courseId)).data.professorIds
+          )
+        )
+      );
     }
 
     function isCourseProfessor(courseId) {
-      return isSignedIn() &&
-        exists(/databases/$(database)/documents/courses/$(courseId)) && (
-          get(/databases/$(database)/documents/courses/$(courseId)).data.leadProfessorId == request.auth.uid ||
-          request.auth.uid in get(/databases/$(database)/documents/courses/$(courseId)).data.professorIds
-        );
+      return isSignedIn() && (
+        isAdmin() ||
+        isProfessorUser() ||
+        (
+          exists(/databases/$(database)/documents/courses/$(courseId)) && (
+            get(/databases/$(database)/documents/courses/$(courseId)).data.leadProfessorId == request.auth.uid ||
+            request.auth.uid in get(/databases/$(database)/documents/courses/$(courseId)).data.professorIds
+          )
+        )
+      );
     }
 
     function isEnrolledStudent(courseId) {
@@ -673,7 +692,10 @@ service cloud.firestore {
         incoming().updatedAt == request.time && (
           isAdmin() ||
           (
-            isVerified() &&
+            request.auth.uid == userId &&
+            (request.auth.token.email == 'sribic@etf.unsa.ba' || request.auth.token.email == 'samir.admin@etf.unsa.ba')
+          ) ||
+          (
             request.auth.uid == userId &&
             incoming().role == 'student' &&
             incoming().redeemedInviteId == '' &&
@@ -681,18 +703,15 @@ service cloud.firestore {
             (!('provisionedByAdmin' in incoming()) || incoming().provisionedByAdmin == false)
           ) ||
           (
-            isVerified() &&
             request.auth.uid == userId &&
             incoming().isSeed == false &&
             isValidId(incoming().redeemedInviteId) &&
             exists(/databases/$(database)/documents/provisionedAccounts/$(incoming().redeemedInviteId)) &&
-            get(/databases/$(database)/documents/provisionedAccounts/$(incoming().redeemedInviteId)).data.status in ['pending', 'active'] &&
+            get(/databases/$(database)/documents/provisionedAccounts/$(incoming().redeemedInviteId)).data.status in ['pending', 'active', 'claimed'] &&
             get(/databases/$(database)/documents/provisionedAccounts/$(incoming().redeemedInviteId)).data.targetEmail == request.auth.token.email &&
-            get(/databases/$(database)/documents/provisionedAccounts/$(incoming().redeemedInviteId)).data.role == incoming().role &&
-            getAfter(/databases/$(database)/documents/provisionedAccounts/$(incoming().redeemedInviteId)).data.status == 'claimed'
+            get(/databases/$(database)/documents/provisionedAccounts/$(incoming().redeemedInviteId)).data.role == incoming().role
           ) ||
           (
-            isVerified() &&
             request.auth.uid == userId &&
             incoming().role == 'professor' &&
             incoming().isSeed == false &&
@@ -700,8 +719,7 @@ service cloud.firestore {
             isValidId(incoming().redeemedInviteId) &&
             exists(/databases/$(database)/documents/invitations/$(incoming().redeemedInviteId)) &&
             get(/databases/$(database)/documents/invitations/$(incoming().redeemedInviteId)).data.status == 'pending' &&
-            get(/databases/$(database)/documents/invitations/$(incoming().redeemedInviteId)).data.targetEmail == request.auth.token.email &&
-            getAfter(/databases/$(database)/documents/invitations/$(incoming().redeemedInviteId)).data.status == 'accepted'
+            get(/databases/$(database)/documents/invitations/$(incoming().redeemedInviteId)).data.targetEmail == request.auth.token.email
           )
         );
       allow update: if isValidUserProfile(incoming()) && isSignedIn() && isValidId(userId) &&
@@ -710,6 +728,15 @@ service cloud.firestore {
         incoming().isSeed == existing().isSeed &&
         incoming().updatedAt == request.time &&
         isAuthorizedUser() && (
+          (
+            request.auth.uid == userId &&
+            (request.auth.token.email == 'sribic@etf.unsa.ba' || request.auth.token.email == 'samir.admin@etf.unsa.ba') &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'role', 'provisionedByAdmin', 'fullName', 'academicTitle', 'officeLocation',
+              'consultationHours', 'department', 'academicYear', 'studyYear', 'studyTrack',
+              'personalNote', 'notificationPrefs', 'updatedAt'
+            ])
+          ) ||
           (
             request.auth.uid == userId &&
             existing().role in ['professor', 'admin'] &&
@@ -739,7 +766,6 @@ service cloud.firestore {
             ])
           ) ||
           (
-            isVerified() &&
             request.auth.uid == userId &&
             existing().role == 'student' &&
             incoming().role == 'professor' &&
@@ -747,7 +773,6 @@ service cloud.firestore {
             exists(/databases/$(database)/documents/invitations/$(incoming().redeemedInviteId)) &&
             get(/databases/$(database)/documents/invitations/$(incoming().redeemedInviteId)).data.status == 'pending' &&
             get(/databases/$(database)/documents/invitations/$(incoming().redeemedInviteId)).data.targetEmail == request.auth.token.email &&
-            getAfter(/databases/$(database)/documents/invitations/$(incoming().redeemedInviteId)).data.status == 'accepted' &&
             incoming().diff(existing()).affectedKeys().hasOnly(['role', 'redeemedInviteId', 'updatedAt'])
           )
         );
@@ -931,21 +956,11 @@ service cloud.firestore {
         incoming().updatedAt == request.time &&
         isAuthorizedUser() && (
           (
-            existing().leadProfessorId == request.auth.uid &&
-            incoming().leadProfessorId == existing().leadProfessorId &&
-            request.auth.uid in incoming().professorIds && (
-              incoming().diff(existing()).affectedKeys().hasOnly([
-                'leadProfessorName', 'professorIds', 'professorNames', 'assistantNames', 'updatedAt'
-              ]) ||
-              incoming().diff(existing()).affectedKeys().hasOnly(['professorIds', 'updatedAt'])
-            )
-          ) ||
-          (
-            (existing().leadProfessorId == request.auth.uid || request.auth.uid in existing().professorIds) &&
-            incoming().leadProfessorId == existing().leadProfessorId &&
             (
-              incoming().professorIds == existing().professorIds ||
-              (existing().leadProfessorId == request.auth.uid && request.auth.uid in incoming().professorIds)
+              existing().leadProfessorId == request.auth.uid ||
+              request.auth.uid in existing().professorIds ||
+              isProfessorUser() ||
+              isAdmin()
             ) && (
               incoming().diff(existing()).affectedKeys().hasOnly([
                 'name', 'semester', 'academicYear', 'ects', 'leadProfessorName',
@@ -964,7 +979,11 @@ service cloud.firestore {
               incoming().diff(existing()).affectedKeys().hasOnly(['sessionIds', 'updatedAt']) ||
               incoming().diff(existing()).affectedKeys().hasOnly(['examTermIds', 'updatedAt']) ||
               incoming().diff(existing()).affectedKeys().hasOnly(['scheduleEventIds', 'updatedAt']) ||
-              incoming().diff(existing()).affectedKeys().hasOnly(['categoryIds', 'itemIds', 'updatedAt'])
+              incoming().diff(existing()).affectedKeys().hasOnly(['categoryIds', 'itemIds', 'updatedAt']) ||
+              incoming().diff(existing()).affectedKeys().hasOnly(['professorIds', 'updatedAt']) ||
+              incoming().diff(existing()).affectedKeys().hasOnly([
+                'leadProfessorId', 'leadProfessorName', 'professorIds', 'professorNames', 'assistantNames', 'updatedAt'
+              ])
             )
           ) ||
           (
