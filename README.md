@@ -1,106 +1,188 @@
-# VOLTRA — ETF Student Portal
+# VOLTRA --- ETF Student Portal
 
-**VOLTRA** je moderna akademska web platforma za evidenciju ocjena, bodova, prisustva i prijave ispita na **Elektrotehničkom fakultetu Univerziteta u Sarajevu (ETF Sarajevo)**, inspirisana prepoznatljivom strukturom klasičnog **Zamger** sistema.
+**VOLTRA** is a modern academic web platform for managing grades,
+points, attendance, and exam registrations at the **Faculty of
+Electrical Engineering, University of Sarajevo (ETF Sarajevo)**. Its
+design is inspired by the familiar structure of the classic **Zamger**
+system.
 
-Cilj aplikacije je zadržati preglednu akademsku strukturu informacija (prisustvo na vrhu, zatim zadaci, laboratorijske vježbe, parcijalni i završni ispiti, ukupni zbir bodova i kartica konačne ocjene), uz savremen, brz i intuitivan korisnički interfejs za studente i nastavnike te strogu kontrolu pristupa.
+The goal of the application is to preserve a clear and intuitive
+academic information structure (attendance at the top, followed by
+assignments, laboratory exercises, midterm and final exams, total
+points, and a final grade card), while providing students and professors
+with a modern, fast, and intuitive user interface backed by strict
+access control.
 
----
+------------------------------------------------------------------------
 
-## 1. Pregled funkcionalnosti
+## 1. Feature Overview
 
-### Studentski portal
-- **Pregled i bodovi**: Brzo prebacivanje između upisanih predmeta jednim klikom, pregled nastavnika, osvojenih i maksimalnih bodova, procenta, skale ocjena (`6–10`) i zaključene ocjene.
-- **Prijava ispita**:
-  - Pregled svih objavljenih parcijalnih i završnih ispitnih rokova na upisanim predmetima (termin ispita, sala, datum početka prijave i datum isteka prijave).
-  - Prijava izlaska na ispit (*Prijavi ispit*) ili odjava izlaska (*Ne izlazim* / *Odjavi prijavu*) jednim klikom dok je rok za prijavu otvoren.
-- **Prisustvo po datumima**: Automatski obračun bodova za prisustvo na osnovu održanih termina bez pogrešnog oduzimanja bodova za buduće ili otkazane časove.
-- **Zadaci i vježbe**: Filtrirani pregled svih pojedinačnih stavki ocjenjivanja i komentara predmetnog nastavnika.
+### Student Portal
 
-### Profesorski portal
-- **Predmeti**: Kreiranje novih predmeta i trenutni uvid u broj upisanih studenata, izlaznost na predstojeći ispit i prolaznost.
-- **Prijava ispita**:
-  - Objavljivanje termina ispita (naziv roka, datum i vrijeme ispita, sala/amfiteatar, datum početka prijave i datum isteka prijave).
-  - Praćenje izlaznosti uživo (*Izlaze na ispit*, *Odjavili izlazak*, *Bez odgovora*), ručno zaključavanje/otključavanje prijava i **CSV eksport spiska za ispitnu salu**.
-- **Unos bodova**: Brzi tabelarni unos bodova i komentara direktno u redovima tabele uz validaciju negativnih i prekoračenih bodova.
-- **Prisustvo**: Kreiranje termina, opcija *"Označi sve prisutnim"*, brza pojedinačna korekcija i otkazivanje termina.
-- **Studenti i ocjene**: Pretraga, filtriranje i sortiranje studenata, upis po broju indeksa, zaključivanje ocjena (*Nacrt* / *Zaključena*) i **CSV eksport ocjena**.
-- **Postavke predmeta**: Konfiguracija maksimalnih bodova za prisustvo (podrazumijevano `10`), kategorija ocjenjivanja i pragova za ocjene `6–10`.
+-   **Grades and Points Overview**: Quickly switch between enrolled
+    courses with a single click and view course instructors, earned and
+    maximum points, percentages, the grading scale (`6–10`), and final
+    grades.
+-   **Exam Registration**:
+    -   View all published midterm and final exam sessions for enrolled
+        courses, including exam time, room, registration start date, and
+        registration deadline.
+    -   Register for an exam (*Register for Exam*) or cancel a
+        registration (*Not Attending* / *Cancel Registration*) with a
+        single click while the registration period is open.
+-   **Attendance Tracking by Date**: Automatically calculates attendance
+    points based on completed class sessions, without incorrectly
+    deducting points for future or cancelled sessions.
+-   **Assignments and Exercises**: Filtered overview of individual
+    grading items and comments provided by course instructors.
 
----
+### Professor Portal
 
-## 2. Instalacija i lokalni razvoj
+-   **Course Management**: Create new courses and instantly view the
+    number of enrolled students, upcoming exam attendance, and pass
+    rates.
+-   **Exam Registration**:
+    -   Publish exam sessions, including the exam name, date and time,
+        room/amphitheater, registration start date, and registration
+        deadline.
+    -   Monitor exam attendance in real time (*Registered*, *Cancelled*,
+        *No Response*), manually open or close registrations, and
+        **export exam attendance lists as CSV files**.
+-   **Grade Management**: Quickly enter points and comments directly
+    into table rows, with validation to prevent negative scores and
+    scores exceeding the maximum allowed points.
+-   **Attendance Management**: Create attendance sessions, use the *Mark
+    All as Present* option, make individual attendance corrections, and
+    cancel sessions.
+-   **Student and Grade Management**: Search, filter, and sort students,
+    enroll students using their student ID numbers, finalize grades
+    (*Draft* / *Finalized*), and **export grades as CSV files**.
+-   **Course Settings**: Configure maximum attendance points (default:
+    `10`), grading categories, and grade thresholds for grades `6–10`.
 
-### Preduslovi
-- **Node.js** `v20+`
-- **npm** ili **bun**
+------------------------------------------------------------------------
 
-### Koraci za pokretanje
-1. Klonirajte repozitorij i instalirajte zavisnosti:
-   ```bash
-   npm install
-   ```
-2. Kopirajte `.env.example` u `.env`:
-   ```bash
-   cp .env.example .env
-   ```
-3. Pokrenite razvojni server (port `3000`):
-   ```bash
-   npm run dev
-   ```
-4. Pokrenite automatske testove (obračun bodova, prisustva, rokova za prijavu ispita i sigurnosnih pravila) te provjeru tipova:
-   ```bash
-   npm test
-   npm run lint
-   npm run lint:rules
-   ```
+## 2. Installation and Local Development
 
----
+### Prerequisites
 
-## 3. Postavljanje baze podataka i autentifikacije
+-   **Node.js** `v20+`
+-   **npm** or **bun**
 
-Aplikacija koristi **Firebase Authentication (Google prijava)** i **Cloud Firestore** sa strogo tipiziranim pravilima pristupa (`firestore.rules`) i definicijom modela u `firebase-blueprint.json`:
+### Getting Started
 
-1. Kreirajte Firebase projekat i omogućite **Google Sign-In** u sekciji *Authentication -> Sign-in method*.
-2. Kreirajte **Cloud Firestore** bazu podataka i upišite konfiguraciju klijenta u `firebase-applet-config.json`.
-3. Objavite sigurnosna pravila iz `firestore.rules` (provjera sintakse se vrši putem `npm run lint:rules`).
+1.  Clone the repository and install dependencies:
 
-### Struktura kolekcija i sigurnost
-- `/userProfiles/{userId}` — Akademski profil bez ličnih kontakt podataka (ime, odsjek, broj indeksa, uloga).
-- `/userPrivate/{userId}` — Strogo izolovani privatni podaci (`email`), čitljivi isključivo vlasniku naloga i administratoru.
-- `/studentDirectory/{studentIndex}` — Imenik brojeva indeksa za siguran upis studenata na predmete.
-- `/invitations/{inviteId}` — Kontrolisane jednokratne pozivnice za profesore.
-- `/courses/{courseId}`, `/enrollments/{enrollmentId}`, `/gradingCategories/{categoryId}`, `/gradingItems/{itemId}`, `/scores/{scoreId}`, `/attendanceSessions/{sessionId}`, `/attendanceRecords/{recordId}`, `/finalGrades/{gradeId}`.
-- `/examTerms/{termId}` — Objavljeni ispitni rokovi sa datumom početka i isteka prijave.
-- `/examRegistrations/{registrationId}` — Pojedinačne prijave i odjave izlaska studenata na ispite (`${termId}_${studentId}`).
+    ``` bash
+    npm install
+    ```
 
----
+2.  Copy `.env.example` to `.env`:
 
-## 4. Kreiranje prvog administratora, profesora i studenata
+    ``` bash
+    cp .env.example .env
+    ```
 
-1. **Prvi administrator**:
-   - Inicijalni administrator je definisan u `firestore.rules` (`isBootstrapAdmin()`) i u `src/lib/firebase.ts` (`BOOTSTRAP_ADMIN_EMAIL`) uz obaveznu provjeru `email_verified == true`.
-   - Dodatni administratori se mogu evidentirati u kolekciji `/admins/{uid}`.
-2. **Dodjela profesorske uloge (Kontrolisane pozivnice)**:
-   - Korisnici **ne mogu** sami sebi dodijeliti ulogu profesora niti administratora.
-   - Administrator na stranici **Profil** unosi e-mail adresu nastavnika i generiše jednokratni kod pozivnice (npr. `INV-ETF-XXXXXX`).
-   - Nastavnik se prijavljuje svojim verifikovanim Google računom i na stranici **Profil** unosi kod pozivnice, čime se atomskom transakcijom (`writeBatch` + `getAfter` pravilo) njegov nalog unapređuje u ulogu `professor`.
-3. **Kreiranje studentskih naloga i upis na predmete**:
-   - Svaki novi korisnik pri prvoj prijavi dobija ulogu `student`.
-   - Student na stranici **Profil** upisuje svoj **Broj indeksa** (npr. `18942`).
-   - Predmetni profesor u sekciji **Studenti i ocjene -> Upiši studenta** unosi broj indeksa i upisuje studenta na predmet.
-4. **Razvojni (seed) podaci**:
-   - Svi razvojni demo zapisi nose oznaku `isSeed: true` i potpuno su odvojeni od produkcijskih podataka. Administrator ih može jednim klikom učitati ili obrisati na stranici **Profil**.
+3.  Start the development server (port `3000`):
 
----
+    ``` bash
+    npm run dev
+    ```
 
-## 5. Produkcijska objava (Vercel / Cloud Run)
+4.  Run the automated tests (covering point calculations, attendance,
+    exam registration periods, and security rules) and type checks:
 
-1. Provjerite da projekat prolazi build bez TypeScript grešaka:
-   ```bash
-   npm run build
-   ```
-2. Na **Vercel** platformi:
-   - Povežite Git repozitorij.
-   - Build komanda: `npm run build`
-   - Output direktorij: `dist`
-   - Dodajte produkcijsku domenu (npr. `voltra-etf.vercel.app`) u *Firebase Console -> Authentication -> Settings -> Authorized domains*.
+    ``` bash
+    npm test
+    npm run lint
+    npm run lint:rules
+    ```
+
+------------------------------------------------------------------------
+
+## 3. Database and Authentication Setup
+
+The application uses **Firebase Authentication (Google Sign-In)** and
+**Cloud Firestore**, with strictly typed access control rules
+(`firestore.rules`) and a data model definition in
+`firebase-blueprint.json`.
+
+1.  Create a Firebase project and enable **Google Sign-In** under
+    *Authentication -\> Sign-in method*.
+2.  Create a **Cloud Firestore** database and add the client
+    configuration to `firebase-applet-config.json`.
+3.  Deploy the security rules from `firestore.rules` (syntax validation
+    is performed using `npm run lint:rules`).
+
+### Collection Structure and Security
+
+-   `/userProfiles/{userId}` --- Academic profile without personal
+    contact information (name, department, student ID, role).
+-   `/userPrivate/{userId}` --- Strictly isolated private data
+    (`email`), accessible only to the account owner and administrators.
+-   `/studentDirectory/{studentIndex}` --- Directory of student ID
+    numbers used for secure course enrollment.
+-   `/invitations/{inviteId}` --- Controlled, single-use invitations for
+    professors.
+-   `/courses/{courseId}`, `/enrollments/{enrollmentId}`,
+    `/gradingCategories/{categoryId}`, `/gradingItems/{itemId}`,
+    `/scores/{scoreId}`, `/attendanceSessions/{sessionId}`,
+    `/attendanceRecords/{recordId}`, `/finalGrades/{gradeId}`.
+-   `/examTerms/{termId}` --- Published exam sessions with registration
+    start dates and deadlines.
+-   `/examRegistrations/{registrationId}` --- Individual student exam
+    registrations and cancellations (`${termId}_${studentId}`).
+
+------------------------------------------------------------------------
+
+## 4. Setting Up the First Administrator, Professors, and Students
+
+1.  **Initial Administrator**:
+    -   The initial administrator is defined in `firestore.rules`
+        (`isBootstrapAdmin()`) and `src/lib/firebase.ts`
+        (`BOOTSTRAP_ADMIN_EMAIL`), with a mandatory
+        `email_verified == true` check.
+    -   Additional administrators can be registered in the
+        `/admins/{uid}` collection.
+2.  **Assigning Professor Roles (Controlled Invitations)**:
+    -   Users **cannot** assign themselves the professor or
+        administrator role.
+    -   On the **Profile** page, an administrator enters the professor's
+        email address and generates a single-use invitation code
+        (e.g. `INV-ETF-XXXXXX`).
+    -   The professor signs in using their verified Google account and
+        enters the invitation code on the **Profile** page. Their
+        account is then upgraded to the `professor` role through an
+        atomic transaction (`writeBatch` + `getAfter` rule).
+3.  **Creating Student Accounts and Enrolling in Courses**:
+    -   Every new user is automatically assigned the `student` role upon
+        their first sign-in.
+    -   Students enter their **Student ID Number** (e.g. `18942`) on the
+        **Profile** page.
+    -   The course professor enters the student's ID number under
+        **Students and Grades -\> Enroll Student** to enroll them in the
+        course.
+4.  **Development (Seed) Data**:
+    -   All development demo records are marked with `isSeed: true` and
+        are completely separated from production data. Administrators
+        can load or delete them with a single click on the **Profile**
+        page.
+
+------------------------------------------------------------------------
+
+## 5. Production Deployment (Vercel / Cloud Run)
+
+1.  Make sure the project builds successfully without TypeScript errors:
+
+    ``` bash
+    npm run build
+    ```
+
+2.  On the **Vercel** platform:
+
+    -   Connect your Git repository.
+    -   Build command: `npm run build`
+    -   Output directory: `dist`
+    -   Add your production domain (e.g. `voltra-etf.vercel.app`) under
+        *Firebase Console -\> Authentication -\> Settings -\> Authorized
+        domains*.
